@@ -497,16 +497,17 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
 }
 
 fn write_gauge(body: &mut String, name: &str, help: &str, value: u64) {
-    use std::fmt::Write;
-    let _ = writeln!(body, "# HELP {name} {help}");
-    let _ = writeln!(body, "# TYPE {name} gauge");
-    let _ = writeln!(body, "{name} {value}");
+    write_metric(body, name, help, "gauge", value);
 }
 
 fn write_counter(body: &mut String, name: &str, help: &str, value: u64) {
+    write_metric(body, name, help, "counter", value);
+}
+
+fn write_metric(body: &mut String, name: &str, help: &str, metric_type: &str, value: u64) {
     use std::fmt::Write;
     let _ = writeln!(body, "# HELP {name} {help}");
-    let _ = writeln!(body, "# TYPE {name} counter");
+    let _ = writeln!(body, "# TYPE {name} {metric_type}");
     let _ = writeln!(body, "{name} {value}");
 }
 

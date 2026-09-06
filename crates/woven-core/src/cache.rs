@@ -4,9 +4,12 @@
 //! for the same reason (ADR-0008): it lets a future `CloudCacheService` (Redis, later replicated to
 //! a `NoSQL` store) replace [`InMemoryCacheService`] without touching routing or authority code. Like
 //! `JournalSink`/`JournalOutbox`, `WovenCore`'s actual hot path talks to `InMemoryCacheService`'s
-//! concrete, synchronous inherent methods directly (no futures to poll, no executor needed inside
-//! core) — the trait exists to define the contract a real backend would have to satisfy, not because
-//! anything awaits it today.
+//! concrete, synchronous inherent methods directly (`put`, `get`, `sweep_expired`; no futures to
+//! poll, no executor needed inside core) — the trait, and `get_fresh` specifically, exist to define
+//! the contract a real backend would have to satisfy, not because anything on the hot path calls
+//! them today. Reads that must not see a not-yet-swept expired entry (there is exactly one: the
+//! per-session sweep `validate_state_capacity` runs before counting) use `sweep_expired` directly
+//! rather than `get_fresh`, since core needs to actually reclaim the space, not just hide it.
 
 use std::collections::BTreeMap;
 use std::future::{Future, Ready, ready};

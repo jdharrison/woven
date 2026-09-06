@@ -1322,7 +1322,7 @@ impl<A: Authenticator> WovenCore<A> {
             planned_sequences.insert(sequence_key(request.connection, message), message.sequence);
         }
         self.validate_sequence_capacity(request.session, &planned_sequences)?;
-        self.validate_state_capacity(request.session, &messages)?;
+        self.validate_state_capacity(request.session, &messages, now)?;
 
         let durable_count = messages
             .iter()
@@ -1514,14 +1514,22 @@ impl<A: Authenticator> WovenCore<A> {
     }
 
     fn validate_state_capacity(
-        &self,
+        &mut self,
         session_key: SessionKey,
         messages: &[AuthorizedMessage],
+        now: Instant,
     ) -> Result<(), CoreError> {
+        // Reclaim this session's TTL-expired entries before counting: otherwise a burst of
+        // short-lived Stateful writes that has since gone quiet can occupy capacity forever
+        // (until the next global sweep), spuriously rejecting brand-new, unrelated publishes.
         let session = self
             .sessions
-            .get(&session_key)
+            .get_mut(&session_key)
             .ok_or(CoreError::SessionNotFound(session_key))?;
+        if session.state.sweep_expired(now) > 0 {
+            session.recompute_state_bytes();
+        }
+        let session = &*session;
         let mut entries = session.state.len();
         let mut bytes = session.state_bytes;
         let mut projected = BTreeMap::new();
@@ -1682,8 +1690,11 @@ impl<A: Authenticator> WovenCore<A> {
     pub fn sweep_expired_state(&mut self, now: Instant) -> usize {
         let mut swept = 0;
         for session in self.sessions.values_mut() {
-            swept += session.state.sweep_expired(now);
-            session.recompute_state_bytes();
+            let removed = session.state.sweep_expired(now);
+            if removed > 0 {
+                session.recompute_state_bytes();
+                swept += removed;
+            }
         }
         swept
     }

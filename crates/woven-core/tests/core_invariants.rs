@@ -1446,3 +1446,102 @@ fn stateful_entries_expire_after_channel_ttl_and_free_bytes() {
     assert!(snapshot.state.is_empty(), "expired entry must be wiped");
     assert_eq!(snapshot.state_bytes, 0);
 }
+
+#[test]
+fn republishing_a_stateful_entry_resets_its_ttl_clock() {
+    let mut core = make_core(CoreConfig::default());
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    let now = Instant::now();
+    core.publish_at(
+        publish_request(alice, ROOT, EPOCH_ONE, entity, TTL_CHANNEL, 1, 0, b"v1"),
+        now,
+    )
+    .expect("initial publish");
+
+    // Re-publish just before the original TTL would have elapsed: this must push expiry back
+    // out, not just extend from the original write.
+    let touch = now + TTL_CHANNEL_TTL * 9 / 10;
+    core.publish_at(
+        publish_request(alice, ROOT, EPOCH_ONE, entity, TTL_CHANNEL, 2, 0, b"v2"),
+        touch,
+    )
+    .expect("republish before expiry");
+
+    // Past the *original* deadline, but well within a fresh TTL window measured from `touch`:
+    // the entry must still be alive, proving the clock actually reset.
+    let past_original_deadline = now + TTL_CHANNEL_TTL * 3 / 2;
+    assert_eq!(
+        core.sweep_expired_state(past_original_deadline),
+        0,
+        "republishing must reset the TTL clock, not just extend the original deadline"
+    );
+    let snapshot = core
+        .snapshot(alice, session_a())
+        .expect("snapshot after republish");
+    assert_eq!(snapshot.state.len(), 1);
+    assert_eq!(snapshot.state[0].payload, b"v2", "latest value must win");
+
+    // Past the *new* deadline (measured from `touch`): now it actually expires.
+    let past_new_deadline = touch + TTL_CHANNEL_TTL * 2;
+    assert_eq!(core.sweep_expired_state(past_new_deadline), 1);
+}
+
+#[test]
+fn expired_unswept_entries_do_not_occupy_capacity() {
+    let mut core = make_core(CoreConfig {
+        max_state_entries_per_session: 1,
+        ..CoreConfig::default()
+    });
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity_a = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity a spawn");
+    let entity_b = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity b spawn");
+    let now = Instant::now();
+    core.publish_at(
+        publish_request(
+            alice,
+            ROOT,
+            EPOCH_ONE,
+            entity_a,
+            TTL_CHANNEL,
+            1,
+            0,
+            b"first",
+        ),
+        now,
+    )
+    .expect("first entry fits within the configured limit");
+
+    // Past the TTL, but no sweep has run yet: without the fix, this second, unrelated entity's
+    // publish would be spuriously rejected because the capacity check still counts the dead
+    // first entry.
+    let after_expiry = now + TTL_CHANNEL_TTL * 2;
+    core.publish_at(
+        publish_request(
+            alice,
+            ROOT,
+            EPOCH_ONE,
+            entity_b,
+            TTL_CHANNEL,
+            1,
+            0,
+            b"second",
+        ),
+        after_expiry,
+    )
+    .expect("expired-but-unswept entries must not occupy capacity");
+
+    let snapshot = core
+        .snapshot(alice, session_a())
+        .expect("snapshot after second publish");
+    assert_eq!(snapshot.state.len(), 1, "only the live entry should remain");
+    assert_eq!(snapshot.state[0].payload, b"second");
+}
