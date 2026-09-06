@@ -6,7 +6,12 @@ pub mod admission;
 
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode, header},
+    routing::get,
+};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
@@ -403,7 +408,9 @@ async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
 /// connection/session counts are read directly from core state and the rest are relaxed
 /// atomic counters maintained on the hot path regardless of build profile — unlike the
 /// debug-only activity log, this is meant to run in production.
-async fn metrics(State(state): State<Arc<AppState>>) -> String {
+async fn metrics(
+    State(state): State<Arc<AppState>>,
+) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
     let live = state.worker.live_counts().await.unwrap_or_default();
     let counters = state.worker.metrics().snapshot();
     let mut body = String::new();
@@ -493,7 +500,13 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
         counters.queue_evicted_total,
     );
 
-    body
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 fn write_gauge(body: &mut String, name: &str, help: &str, value: u64) {
@@ -699,6 +712,36 @@ mod tests {
         assert_eq!(health["layers"]["quic"], "active");
         assert_eq!(health["layers"]["webtransport"], "active");
         assert_eq!(health["layers"]["inference"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn metrics_use_prometheus_text_exposition() {
+        let app = router_with_transports(true, true, None, false, test_worker());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request is valid"),
+            )
+            .await
+            .expect("metrics response is available");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics response body is readable");
+        let body = String::from_utf8(body.to_vec()).expect("metrics response is UTF-8");
+        assert!(body.contains("# TYPE woven_connections_active gauge"));
+        assert!(body.contains("# TYPE woven_publishes_total counter"));
+        assert!(body.contains("# TYPE woven_queue_dropped_total counter"));
     }
 
     #[tokio::test]
