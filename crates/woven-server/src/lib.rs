@@ -623,13 +623,13 @@ fn development_core() -> Result<WovenCore<DevAuthenticator>, woven_core::CoreErr
     core.register_channel(ChannelDefinition::relay_owned(
         ChannelId::new(2),
         woven_core::DeliveryClass::LatestValue,
-        PersistenceClass::Stateful,
+        PersistenceClass::Stateful { ttl: None },
         64 * 1024,
     ))?;
     core.register_channel(ChannelDefinition::relay_owned(
         ChannelId::new(AI_STATUS_CHANNEL_ID),
         woven_core::DeliveryClass::LatestValue,
-        PersistenceClass::Stateful,
+        PersistenceClass::Stateful { ttl: None },
         64 * 1024,
     ))?;
     core.provision_session(session)?;

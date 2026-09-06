@@ -22,6 +22,8 @@ const SECONDARY: SpaceId = SpaceId::new(2);
 const EVENT_CHANNEL: ChannelId = ChannelId::new(7);
 const STATE_CHANNEL: ChannelId = ChannelId::new(8);
 const DURABLE_CHANNEL: ChannelId = ChannelId::new(9);
+const TTL_CHANNEL: ChannelId = ChannelId::new(10);
+const TTL_CHANNEL_TTL: Duration = Duration::from_secs(1);
 const EPOCH_ONE: SpaceEpoch = SpaceEpoch::new(1);
 
 fn session_a() -> SessionKey {
@@ -43,7 +45,7 @@ fn grants_for(session: SessionKey) -> AuthorizationGrants {
     for space in [ROOT, SECONDARY] {
         grants.grant_space(SpaceKey::new(session, space), AccessGrant::ReadWrite);
     }
-    for channel in [EVENT_CHANNEL, STATE_CHANNEL, DURABLE_CHANNEL] {
+    for channel in [EVENT_CHANNEL, STATE_CHANNEL, DURABLE_CHANNEL, TTL_CHANNEL] {
         grants.grant_channel(ChannelScope::new(session, channel), AccessGrant::ReadWrite);
     }
     grants
@@ -111,13 +113,21 @@ fn register_channels(core: &mut WovenCore<DevAuthenticator>) {
         ChannelDefinition::relay_owned(
             STATE_CHANNEL,
             DeliveryClass::LatestValue,
-            PersistenceClass::Stateful,
+            PersistenceClass::Stateful { ttl: None },
             1_024,
         ),
         ChannelDefinition::relay_owned(
             DURABLE_CHANNEL,
             DeliveryClass::ReliableOrdered,
             PersistenceClass::Durable,
+            1_024,
+        ),
+        ChannelDefinition::relay_owned(
+            TTL_CHANNEL,
+            DeliveryClass::LatestValue,
+            PersistenceClass::Stateful {
+                ttl: Some(TTL_CHANNEL_TTL),
+            },
             1_024,
         ),
     ] {
@@ -157,11 +167,28 @@ fn join_and_subscribe(
         .expect("space subscription");
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "STATE_CHANNEL and TTL_CHANNEL intentionally return the same message-side value \
+              (ttl: None) even though the channels themselves are registered with different \
+              TTLs — that's the point being tested, not an oversight"
+)]
 fn channel_policy(channel: ChannelId) -> (DeliveryClass, PersistenceClass) {
     match channel {
         EVENT_CHANNEL => (DeliveryClass::ReliableOrdered, PersistenceClass::Ephemeral),
-        STATE_CHANNEL => (DeliveryClass::LatestValue, PersistenceClass::Stateful),
+        STATE_CHANNEL => (
+            DeliveryClass::LatestValue,
+            PersistenceClass::Stateful { ttl: None },
+        ),
         DURABLE_CHANNEL => (DeliveryClass::ReliableOrdered, PersistenceClass::Durable),
+        // Deliberately `ttl: None` here even though the registered channel (see
+        // `register_channels`) carries `Some(TTL_CHANNEL_TTL)` — a real publisher never knows
+        // or declares the channel's TTL; the channel's registered value is authoritative
+        // (`PersistenceClass::same_kind` is what lets this pass channel-policy validation).
+        TTL_CHANNEL => (
+            DeliveryClass::LatestValue,
+            PersistenceClass::Stateful { ttl: None },
+        ),
         _ => panic!("test channel must have a registered policy"),
     }
 }
@@ -1330,4 +1357,92 @@ fn no_op_journal_and_bounded_worker_harness_are_runtime_independent() {
             .expect("worker result"),
         CommandResult::Connected(_)
     ));
+}
+
+#[test]
+fn stateful_entries_without_ttl_never_expire() {
+    let mut core = make_core(CoreConfig::default());
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    let now = Instant::now();
+    core.publish_at(
+        publish_request(
+            alice,
+            ROOT,
+            EPOCH_ONE,
+            entity,
+            STATE_CHANNEL,
+            1,
+            0,
+            b"forever",
+        ),
+        now,
+    )
+    .expect("stateful publish");
+
+    // Advance far past any plausible TTL and sweep: an untouched `ttl: None` entry must survive.
+    let far_future = now + Duration::from_secs(365 * 24 * 60 * 60);
+    let swept = core.sweep_expired_state(far_future);
+    assert_eq!(swept, 0, "ttl: None entries must never be swept");
+
+    let snapshot = core
+        .snapshot(alice, session_a())
+        .expect("snapshot after sweep");
+    assert_eq!(snapshot.state.len(), 1);
+    assert_eq!(snapshot.state[0].payload, b"forever");
+    assert_eq!(snapshot.state_bytes, "forever".len());
+}
+
+#[test]
+fn stateful_entries_expire_after_channel_ttl_and_free_bytes() {
+    let mut core = make_core(CoreConfig::default());
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    let now = Instant::now();
+    // TTL_CHANNEL's registered policy carries `ttl: Some(TTL_CHANNEL_TTL)`, even though (like a
+    // real publisher) `publish_request` declares `ttl: None` on the message itself — the
+    // channel's registered TTL is what actually governs storage.
+    core.publish_at(
+        publish_request(
+            alice,
+            ROOT,
+            EPOCH_ONE,
+            entity,
+            TTL_CHANNEL,
+            1,
+            0,
+            b"expires",
+        ),
+        now,
+    )
+    .expect("stateful publish onto a TTL-bearing channel");
+
+    let snapshot = core
+        .snapshot(alice, session_a())
+        .expect("snapshot before expiry");
+    assert_eq!(
+        snapshot.state.len(),
+        1,
+        "entry visible before its TTL elapses"
+    );
+
+    // Before the TTL elapses: sweeping does nothing.
+    let still_fresh = now + TTL_CHANNEL_TTL / 2;
+    assert_eq!(core.sweep_expired_state(still_fresh), 0);
+
+    // Past the TTL: an active sweep reclaims it and the byte count comes back down.
+    let expired = now + TTL_CHANNEL_TTL * 2;
+    assert_eq!(core.sweep_expired_state(expired), 1);
+
+    let snapshot = core
+        .snapshot(alice, session_a())
+        .expect("snapshot after expiry");
+    assert!(snapshot.state.is_empty(), "expired entry must be wiped");
+    assert_eq!(snapshot.state_bytes, 0);
 }

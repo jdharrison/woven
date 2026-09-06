@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{
     ChannelId, ConnectionId, EntityId, NamespaceId, PrincipalId, SessionId, SessionKey, SpaceEpoch,
     SpaceId,
@@ -27,8 +29,28 @@ impl DeliveryClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PersistenceClass {
     Ephemeral,
-    Stateful,
+    /// Persists in the cache layer while touched. `ttl: None` never expires (survives for the
+    /// session's lifetime, matching the original behavior); `Some(duration)` wipes the value
+    /// after that long without a write, freeing memory even if nobody ever touches it again.
+    Stateful {
+        ttl: Option<Duration>,
+    },
     Durable,
+}
+
+impl PersistenceClass {
+    /// Compares by variant only, ignoring `Stateful`'s `ttl`. TTL is a channel-level config
+    /// choice (set once at registration), not something a publisher declares per message, so
+    /// channel-policy checks must not require an incoming message's `ttl` to match exactly.
+    #[must_use]
+    pub const fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Ephemeral, Self::Ephemeral)
+                | (Self::Stateful { .. }, Self::Stateful { .. })
+                | (Self::Durable, Self::Durable)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

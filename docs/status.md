@@ -11,7 +11,9 @@ dependency on any hosted control plane or console.
 **Core** (`woven-core`) — validated typed IDs, explicit namespace/session/space/channel
 grants, server-provisioned bounded sessions, nested anchored spaces with epoch tombstones,
 entities and ownership, subscriptions, server-controlled delivery/persistence policy,
-monotonic sequencing, bounded in-memory state, rate and payload limits, priority-aware
+monotonic sequencing, bounded in-memory state with optional per-channel TTL (actively
+swept, not just lazily hidden, once expired) behind a `CacheService` seam (ADR-0015) for
+a future Redis/NoSQL backend, rate and payload limits, priority-aware
 bounded/coalescing queues, stale-queue purging, immediate slow-consumer cleanup, a bounded
 journal outbox with a no-op sink, a deterministic worker harness, and per-session
 admission control: capacity allocation, FIFO queueing with offers, reconnect grace,

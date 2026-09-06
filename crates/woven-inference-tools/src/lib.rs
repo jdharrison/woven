@@ -141,7 +141,7 @@ async fn publish_latest_value(
         channel,
         sequence,
         delivery: woven_core::DeliveryClass::LatestValue,
-        persistence: woven_core::PersistenceClass::Stateful,
+        persistence: woven_core::PersistenceClass::Stateful { ttl: None },
         coalesce_key: Some(CoalesceKey::new(channel, Some(context.entity), component)),
         payload,
     };

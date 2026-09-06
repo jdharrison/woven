@@ -812,14 +812,14 @@ mod tests {
         core.register_channel(ChannelDefinition::relay_owned(
             ChannelId::new(2),
             woven_core::DeliveryClass::LatestValue,
-            PersistenceClass::Stateful,
+            PersistenceClass::Stateful { ttl: None },
             64 * 1024,
         ))
         .expect("register channel 2");
         core.register_channel(ChannelDefinition::relay_owned(
             ChannelId::new(3),
             woven_core::DeliveryClass::UnreliableSequenced,
-            PersistenceClass::Stateful,
+            PersistenceClass::Stateful { ttl: None },
             64 * 1024,
         ))
         .expect("register channel 3");

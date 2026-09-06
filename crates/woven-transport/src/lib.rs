@@ -6,6 +6,7 @@ mod metrics;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use woven_core::{
     Authenticator, CleanupSummary, CoalesceKey, Command, CommandResult, ConnectionId, CoreError,
@@ -24,6 +25,9 @@ pub const COMMAND_CAPACITY: usize = 256;
 pub const MAX_FRAME_BYTES: u32 = 1_048_576;
 /// Maximum domain payload size advertised by the transport bridge.
 pub const MAX_PAYLOAD_BYTES: u32 = 262_144;
+/// How often the worker actively reclaims expired `Stateful` cache entries. TTLs are measured in
+/// hours, so this only needs to be coarse-grained enough that idle memory doesn't linger long.
+const STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Errors from the transport boundary.
 #[derive(Debug)]
@@ -279,7 +283,26 @@ where
         let mut worker = worker;
         let mut recipients = BTreeMap::new();
         let mut subscriptions = BTreeMap::new();
-        while let Some(request) = receiver.recv().await {
+        let mut sweep_interval = tokio::time::interval(STATE_SWEEP_INTERVAL);
+        sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let request = tokio::select! {
+                request = receiver.recv() => match request {
+                    Some(request) => request,
+                    None => break,
+                },
+                _ = sweep_interval.tick() => {
+                    let evicted = worker.core_mut().sweep_expired_state(Instant::now());
+                    if evicted > 0 {
+                        tracing::info!(
+                            target: "woven_relay",
+                            evicted_state_entries = evicted,
+                            "state_sweep_expired"
+                        );
+                    }
+                    continue;
+                }
+            };
             match request {
                 WorkerRequest::Command { command, reply } => {
                     #[cfg(debug_assertions)]
@@ -1279,7 +1302,7 @@ pub async fn handle_authenticated(
         MessagePayload::ReliableEvent(payload) | MessagePayload::EntityState(payload) => {
             let delivery = core_delivery(envelope.delivery_class).ok_or(())?;
             let persistence = if matches!(envelope.message, MessagePayload::EntityState(_)) {
-                PersistenceClass::Stateful
+                PersistenceClass::Stateful { ttl: None }
             } else {
                 PersistenceClass::Ephemeral
             };

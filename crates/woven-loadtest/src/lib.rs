@@ -174,7 +174,7 @@ pub fn run(config: LoadConfig) -> Result<Measurement, LoadError> {
     core.register_channel(ChannelDefinition::relay_owned(
         STATE_CHANNEL,
         DeliveryClass::LatestValue,
-        PersistenceClass::Stateful,
+        PersistenceClass::Stateful { ttl: None },
         PAYLOAD.len(),
     ))?;
     core.provision_session(session)?;
@@ -217,7 +217,7 @@ pub fn run(config: LoadConfig) -> Result<Measurement, LoadError> {
                 channel: STATE_CHANNEL,
                 sequence: u64::try_from(round).map_err(|_| LoadError::IdRange)?,
                 delivery: DeliveryClass::LatestValue,
-                persistence: PersistenceClass::Stateful,
+                persistence: PersistenceClass::Stateful { ttl: None },
                 coalesce_key: Some(CoalesceKey::new(STATE_CHANNEL, Some(participant.entity), 1)),
                 payload: PAYLOAD.to_vec(),
             })?;

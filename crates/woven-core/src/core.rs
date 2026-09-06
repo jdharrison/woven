@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 use crate::{
     AccessGrant, AdmissionController, AdmissionLease, AdmissionMetadata, AuthError,
     AuthenticatedPrincipal, Authenticator, AuthorityContext, AuthorityEmission, AuthorityOutcome,
-    AuthorityRejection, CapacityUpdate, ChannelDefinition, ChannelId, ChannelScope, CoalesceKey,
-    ConnectionId, Credentials, DeliveryClass, EntityId, EntityPosition, EntitySnapshot,
-    IdempotencyKey, JoinDecision, JournalOutbox, JournalRecord, NamespaceId, OutboundMessage,
-    OutboundQueue, OutboundQueueConfig, ParentAnchor, PersistenceClass, PositionValidationError,
-    PrincipalId, ProposedMessage, QueueConfigError, QueueError, QueueEviction, QueuePolicy,
-    QueuePush, RoutingPolicy, SessionKey, SessionSnapshot, SpaceDescriptor, SpaceEpoch, SpaceId,
-    SpaceKey, SpaceSnapshot, SpaceValidationError, StateSnapshot, UsageCounters,
+    AuthorityRejection, CacheEntry, CacheKey, CapacityUpdate, ChannelDefinition, ChannelId,
+    ChannelScope, CoalesceKey, ConnectionId, Credentials, DeliveryClass, EntityId, EntityPosition,
+    EntitySnapshot, IdempotencyKey, InMemoryCacheService, JoinDecision, JournalOutbox,
+    JournalRecord, NamespaceId, OutboundMessage, OutboundQueue, OutboundQueueConfig, ParentAnchor,
+    PersistenceClass, PositionValidationError, PrincipalId, ProposedMessage, QueueConfigError,
+    QueueError, QueueEviction, QueuePolicy, QueuePush, RoutingPolicy, SessionKey, SessionSnapshot,
+    SpaceDescriptor, SpaceEpoch, SpaceId, SpaceKey, SpaceSnapshot, SpaceValidationError,
+    StateSnapshot, UsageCounters,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,21 +369,6 @@ struct SequenceKey {
     component: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct StateKey {
-    space: SpaceId,
-    space_epoch: SpaceEpoch,
-    entity: Option<EntityId>,
-    channel: ChannelId,
-    component: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct StateRecord {
-    sequence: u64,
-    payload: Vec<u8>,
-}
-
 #[derive(Debug)]
 struct SessionState {
     members: BTreeSet<ConnectionId>,
@@ -393,7 +379,7 @@ struct SessionState {
     entity_cells: BTreeMap<EntityId, SpatialCellKey>,
     cell_entities: BTreeMap<SpatialCellKey, BTreeSet<EntityId>>,
     sequences: BTreeMap<SequenceKey, u64>,
-    state: BTreeMap<StateKey, StateRecord>,
+    state: InMemoryCacheService,
     state_bytes: usize,
 }
 
@@ -408,13 +394,13 @@ impl SessionState {
             entity_cells: BTreeMap::new(),
             cell_entities: BTreeMap::new(),
             sequences: BTreeMap::new(),
-            state: BTreeMap::new(),
+            state: InMemoryCacheService::new(),
             state_bytes: 0,
         }
     }
 
     fn recompute_state_bytes(&mut self) {
-        self.state_bytes = self.state.values().map(|record| record.payload.len()).sum();
+        self.state_bytes = self.state.byte_len();
     }
 
     fn remove_entity_from_cell(&mut self, entity: EntityId) {
@@ -738,7 +724,7 @@ impl<A: Authenticator> WovenCore<A> {
             .get_mut(&space)
             .ok_or(CoreError::SpaceNotFound(SpaceKey::new(session_key, space)))?;
         descriptor.epoch = proposed;
-        session.state.retain(|key, _| key.space != space);
+        session.state.retain(|key| key.space != space);
         session.recompute_state_bytes();
         session.sequences.retain(|key, _| key.space != space);
         Ok(summary)
@@ -1205,7 +1191,7 @@ impl<A: Authenticator> WovenCore<A> {
         record.space = request.destination_space;
         record.space_epoch = request.destination_epoch;
         record.position = None;
-        session.state.retain(|key, _| {
+        session.state.retain(|key| {
             key.space != request.source_space
                 || key.space_epoch != request.source_epoch
                 || key.entity != Some(request.entity)
@@ -1369,15 +1355,23 @@ impl<A: Authenticator> WovenCore<A> {
             session.sequences.insert(key, sequence);
         }
         for message in &messages {
-            if message.persistence == PersistenceClass::Stateful {
+            if matches!(message.persistence, PersistenceClass::Stateful { .. }) {
+                // TTL is a channel-level config choice, not something the publisher declares —
+                // `message.persistence`'s own `ttl` is a placeholder (always `None` from the
+                // transport layer, see `PersistenceClass::same_kind`); the channel's registered
+                // TTL is authoritative.
+                let ttl = self.channels.get(&message.channel).and_then(|channel| {
+                    match channel.persistence {
+                        PersistenceClass::Stateful { ttl } => ttl,
+                        _ => None,
+                    }
+                });
                 let key = state_key(message);
-                if let Some(previous) = session.state.insert(
-                    key,
-                    StateRecord {
-                        sequence: message.sequence,
-                        payload: message.payload.clone(),
-                    },
-                ) {
+                let entry = CacheEntry {
+                    sequence: message.sequence,
+                    payload: message.payload.clone(),
+                };
+                if let Some(previous) = session.state.put(key, entry, ttl, now) {
                     session.state_bytes =
                         session.state_bytes.saturating_sub(previous.payload.len());
                 }
@@ -1533,13 +1527,13 @@ impl<A: Authenticator> WovenCore<A> {
         let mut projected = BTreeMap::new();
         for message in messages
             .iter()
-            .filter(|message| message.persistence == PersistenceClass::Stateful)
+            .filter(|message| matches!(message.persistence, PersistenceClass::Stateful { .. }))
         {
             let key = state_key(message);
             let previous_len = projected
                 .get(&key)
                 .copied()
-                .or_else(|| session.state.get(&key).map(|record| record.payload.len()));
+                .or_else(|| session.state.get(&key).map(|entry| entry.payload.len()));
             if let Some(previous_len) = previous_len {
                 bytes = bytes.saturating_sub(previous_len);
             } else {
@@ -1678,6 +1672,20 @@ impl<A: Authenticator> WovenCore<A> {
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Actively reclaims every `Stateful` entry, across every session, past its configured TTL.
+    /// Entries with `ttl: None` are never touched. Returns the total number of entries removed.
+    /// Lazy expiry alone (hiding stale reads via `get_fresh`) isn't enough to actually free memory
+    /// for state nobody touches again, so callers (`woven-transport`'s worker loop) should run
+    /// this on a timer, not only in response to activity.
+    pub fn sweep_expired_state(&mut self, now: Instant) -> usize {
+        let mut swept = 0;
+        for session in self.sessions.values_mut() {
+            swept += session.state.sweep_expired(now);
+            session.recompute_state_bytes();
+        }
+        swept
     }
 
     #[must_use]
@@ -1927,7 +1935,7 @@ impl<A: Authenticator> WovenCore<A> {
                 }
             }
             summary.spaces_removed = removed_spaces.len();
-            session.state.retain(|key, _| {
+            session.state.retain(|key| {
                 !removed_spaces.contains(&key.space)
                     && key
                         .entity
@@ -2311,7 +2319,7 @@ fn validate_channel_policy(
     delivery: DeliveryClass,
     persistence: PersistenceClass,
 ) -> Result<(), CoreError> {
-    if channel.delivery == delivery && channel.persistence == persistence {
+    if channel.delivery == delivery && channel.persistence.same_kind(persistence) {
         Ok(())
     } else {
         Err(CoreError::ChannelPolicyMismatch {
@@ -2350,8 +2358,8 @@ fn sequence_key(connection: ConnectionId, message: &AuthorizedMessage) -> Sequen
     }
 }
 
-fn state_key(message: &AuthorizedMessage) -> StateKey {
-    StateKey {
+fn state_key(message: &AuthorizedMessage) -> CacheKey {
+    CacheKey {
         space: message.space,
         space_epoch: message.space_epoch,
         entity: message.entity,

@@ -3,6 +3,7 @@
 mod admission;
 mod auth;
 mod authority;
+mod cache;
 mod core;
 mod ids;
 mod journal;
@@ -24,6 +25,7 @@ pub use authority::{
     AuthorityContext, AuthorityEmission, AuthorityOutcome, AuthorityPolicy, AuthorityRejection,
     AuthorityTransform, ChannelDefinition, ProposedMessage, RelayOwned,
 };
+pub use cache::{CacheEntry, CacheError, CacheKey, CacheService, InMemoryCacheService};
 pub use core::{
     CleanupSummary, CoreConfig, CoreError, EntityTransition, EntityTransitionRequest, IdKind,
     PublishOutcome, PublishRateLimit, PublishRequest, QueueActivity, RemovedEntity, WovenCore,
