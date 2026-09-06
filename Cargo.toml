@@ -28,14 +28,14 @@ flatbuffers = "=25.12.19"
 flatbuffers-build = "=0.2.4"
 flatc-fork = "=0.6.0"
 # Internal crates
-woven-core = { path = "crates/woven-core", version = "0.1.3" }
+woven-core = { path = "crates/woven-core", version = "0.2.0" }
 woven-protocol = { path = "crates/woven-protocol", version = "0.1.2" }
-woven-transport = { path = "crates/woven-transport", version = "0.1.4" }
-woven-transport-quic = { path = "crates/woven-transport-quic", version = "0.1.4" }
-woven-inference-core = { path = "crates/woven-inference-core", version = "0.1.3" }
-woven-inference-tools = { path = "crates/woven-inference-tools", version = "0.1.4" }
-woven-inference-test-provider = { path = "crates/woven-inference-test-provider", version = "0.1.3" }
-woven-inference-coordinator = { path = "crates/woven-inference-coordinator", version = "0.1.4" }
+woven-transport = { path = "crates/woven-transport", version = "0.2.0" }
+woven-transport-quic = { path = "crates/woven-transport-quic", version = "0.2.0" }
+woven-inference-core = { path = "crates/woven-inference-core", version = "0.2.0" }
+woven-inference-tools = { path = "crates/woven-inference-tools", version = "0.2.0" }
+woven-inference-test-provider = { path = "crates/woven-inference-test-provider", version = "0.2.0" }
+woven-inference-coordinator = { path = "crates/woven-inference-coordinator", version = "0.2.0" }
 # Async runtime
 tokio = { version = "1.53", features = ["full"] }
 async-trait = "0.1"

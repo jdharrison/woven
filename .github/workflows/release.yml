@@ -72,7 +72,7 @@ jobs:
       - name: Confirm exact tag checkout
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
-        run: test "$(git describe --exact-match --tags HEAD)" = "$TAG"
+        run: test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$(git rev-parse HEAD)"
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt

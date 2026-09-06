@@ -1,6 +1,6 @@
 [package]
 name = "woven-inference-coordinator"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Adjacent-plane inference coordinator: AI-identity connections, bounded provider queue, lifecycle fan-out"

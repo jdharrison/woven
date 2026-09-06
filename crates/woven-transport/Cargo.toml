@@ -1,6 +1,6 @@
 [package]
 name = "woven-transport"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Transport-independent Woven worker and protocol bridge"

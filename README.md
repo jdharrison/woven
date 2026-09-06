@@ -38,6 +38,25 @@ npm install @signalweave/woven-client
 
 `woven-server` is the self-hosted server executable. `woven-client` is the native Rust library, and `@signalweave/woven-client` is the browser/WebTransport client.
 
+## Rust 0.2 migration
+
+The core, transport, inference, and server crates move together to `0.2.0` because
+`PersistenceClass::Stateful` is now `PersistenceClass::Stateful { ttl: None }`
+(or `ttl: Some(duration)` for expiry). Update constructors and pattern matches,
+and upgrade all dependencies that exchange core or inference types together;
+`0.1` and `0.2` types are not interchangeable. The minor-version boundary prevents
+existing `^0.1` consumers from resolving the breaking core API automatically.
+The wire protocol and native/browser client versions are unchanged.
+`woven-loadtest` remains workspace-only (`publish = false`).
+
+For releases, verify and publish registry dependencies before their consumers:
+core; transport and inference-core; transport-quic, inference-tools, and
+inference-test-provider; inference-coordinator; server. Run `cargo package --locked
+-p <crate>` before tagging each artifact, once its dependencies are available on
+crates.io. Workspace tests alone do not verify registry dependency compatibility.
+Each artifact uses its own `release/<crate>/v<version>` tag; several tags may
+legitimately refer to the same commit.
+
 ## Local development
 
 ```sh
