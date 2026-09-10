@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use woven_server::{ServerConfig, serve};
+use woven_server::{RemoteServerConfig, ServerConfig, serve, serve_remote};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivityLogMode {
@@ -41,7 +41,10 @@ impl ActivityLogMode {
          Development activity logging is disabled by default.\n\
          --log-all        Print all safe activity metadata to stdout in debug builds.\n\
          --log-transform  Print entity position and entity-scoped latest-state activity only.\n\
-         --log-none       Disable development activity logging (the default)."
+         --log-none       Disable development activity logging (the default).\n\
+         Remote QUIC: set WOVEN_REMOTE_QUIC=1 and WOVEN_QUIC_BIND, WOVEN_MANAGEMENT_BIND,\n\
+         WOVEN_TLS_CERT_FILE, WOVEN_TLS_KEY_FILE, WOVEN_AUTH_TOKEN_FILE.\n\
+         Management HTTP must remain loopback. Remote WebTransport/inference are disabled."
     }
 }
 
@@ -60,7 +63,18 @@ async fn main() -> ExitCode {
     }
 
     init_logging(activity_log_mode);
-    match serve(ServerConfig::default()).await {
+    let result = match RemoteServerConfig::from_env() {
+        Ok(Some(config)) => {
+            if activity_log_mode != ActivityLogMode::None {
+                eprintln!("Remote mode does not permit development activity logging.");
+                return ExitCode::FAILURE;
+            }
+            serve_remote(config).await
+        }
+        Ok(None) => serve(ServerConfig::default()).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Woven node stopped: {error}");

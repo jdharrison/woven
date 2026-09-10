@@ -3,6 +3,8 @@
 #![deny(unsafe_code)]
 
 pub mod admission;
+mod remote;
+pub use remote::{RemoteServer, RemoteServerConfig, serve_remote, start_remote};
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -113,6 +115,14 @@ fn router_with_transports(
 
 /// Serve the development composition on `config.bind_address`.
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+    if !config.bind_address.ip().is_loopback()
+        || !config.quic_bind_address.ip().is_loopback()
+        || !config.webtransport_bind_address.ip().is_loopback()
+    {
+        return Err(ServerError::QuicConfiguration(
+            "development listeners must be loopback; use RemoteServerConfig".to_owned(),
+        ));
+    }
     let worker = spawn_worker(TransportIndependentWorker::new(development_core()?));
     let inference_sink = if config.inference_enabled {
         let (inference_tx, _entity) = spawn_inference_coordinator(worker.clone()).await?;
@@ -580,6 +590,13 @@ fn development_quic_endpoint(bind_address: SocketAddr) -> Result<quinn::Endpoint
 }
 
 fn development_core() -> Result<WovenCore<DevAuthenticator>, woven_core::CoreError> {
+    scoped_core("dev-token", true)
+}
+
+fn scoped_core(
+    token: &str,
+    include_ai: bool,
+) -> Result<WovenCore<DevAuthenticator>, woven_core::CoreError> {
     let namespace = NamespaceId::new(1);
     let session = SessionKey {
         namespace,
@@ -620,13 +637,15 @@ fn development_core() -> Result<WovenCore<DevAuthenticator>, woven_core::CoreErr
 
     let mut authenticator = DevAuthenticator::new();
     let _ = authenticator.insert(
-        "dev-token",
+        token,
         AuthenticatedPrincipal::new(PrincipalId::new(1), grants),
     );
-    let _ = authenticator.insert(
-        AI_DEV_TOKEN,
-        AuthenticatedPrincipal::new(PrincipalId::new(AI_PRINCIPAL_ID), ai_grants),
-    );
+    if include_ai {
+        let _ = authenticator.insert(
+            AI_DEV_TOKEN,
+            AuthenticatedPrincipal::new(PrincipalId::new(AI_PRINCIPAL_ID), ai_grants),
+        );
+    }
     let mut core = WovenCore::new(authenticator, CoreConfig::default())?;
     core.register_channel(ChannelDefinition::relay_owned(
         ChannelId::new(1),
@@ -640,12 +659,14 @@ fn development_core() -> Result<WovenCore<DevAuthenticator>, woven_core::CoreErr
         PersistenceClass::Stateful { ttl: None },
         64 * 1024,
     ))?;
-    core.register_channel(ChannelDefinition::relay_owned(
-        ChannelId::new(AI_STATUS_CHANNEL_ID),
-        woven_core::DeliveryClass::LatestValue,
-        PersistenceClass::Stateful { ttl: None },
-        64 * 1024,
-    ))?;
+    if include_ai {
+        core.register_channel(ChannelDefinition::relay_owned(
+            ChannelId::new(AI_STATUS_CHANNEL_ID),
+            woven_core::DeliveryClass::LatestValue,
+            PersistenceClass::Stateful { ttl: None },
+            64 * 1024,
+        ))?;
+    }
     core.provision_session(session)?;
     for space_id in [1, 2] {
         core.install_space(

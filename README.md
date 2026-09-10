@@ -156,7 +156,25 @@ Cloud deployment and engine distributions are intentionally not part of this pip
 
 The development server composition explicitly provisions namespace/session `1`, logical spaces `1` and `2`, reliable and latest-value channels, and the development token `dev-token`. This composition exists solely for local development and test automation; it is not a production authentication or TLS configuration. When the inference plane is enabled, it also provisions one demo AI identity with its own dev token, entity, and status channel; see [`crates/woven-inference-coordinator`](crates/woven-inference-coordinator).
 
-[`.env.example`](.env.example) documents the non-secret `WOVEN_*` configuration contract for deployment-oriented runtime configuration, including `WOVEN_INFERENCE_ENABLED` (the inference plane is off by default). Development authentication must be selected explicitly; authentication is never silently disabled. TLS termination and production certificate configuration are deferred with deployment infrastructure.
+The default binary uses loopback development settings; inference is disabled by default
+and can be enabled through the library's development configuration. Non-loopback development
+listeners are rejected.
+
+## Opt-in secure remote QUIC
+
+For controlled remote testing, a separate composition accepts an explicit QUIC bind,
+PEM certificate/key files, and a scoped static credential file via `WOVEN_REMOTE_QUIC=1`
+and the required environment settings documented in the
+[server README](crates/woven-server/README.md#opt-in-remote-native-quic).
+Management HTTP remains loopback-only; remote WebTransport and inference are disabled.
+The [native client](crates/woven-client-rust/README.md#verified-remote-quic-weaver-integration-api)
+adds `Client::connect_with_tls` with custom CA trust and standard certificate/name
+verification. No insecure remote client mode is available.
+
+This explicitly provisions only the fixed development-like session; it is **not production
+tenant authentication**. Local QUIC tests validate the path. Cloud deployment, external
+traffic, secret provisioning, certificate issuance/renewal, and public exposure remain
+separate, approval-gated work.
 
 ## Security baseline
 

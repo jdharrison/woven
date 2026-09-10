@@ -40,6 +40,18 @@ client; a browser maps it to WebTransport via the deterministic port convention
 also exposes admission and queue endpoints (`/v1/virtual-servers/{server_id}/join`,
 `/v1/queues/{ticket}`, etc.) and an operational snapshot route.
 
+**Opt-in remote native QUIC** — `woven-server` now supports explicit PEM certificate/key
+and static scoped-token file configuration, with loopback-only management HTTP and no
+remote WebTransport/inference. `woven-client::Client::connect_with_tls` verifies the
+certificate chain, validity, and URL DNS/IP SAN against supplied CA roots. Defaults remain
+local development; insecure development listeners/clients cannot use non-loopback targets.
+This is a fixed explicitly provisioned namespace/session 1, spaces 1/2, channels 1/2
+composition using the existing development authentication scheme, **not production tenant
+identity or hosted auth**. Local real-QUIC tests cover trust/name rejection, wrong/default
+tokens, authorization, fanout and disconnect. No cloud deployment or external target test
+has been performed. See the [server configuration](../crates/woven-server/README.md) and
+[exact client API](../crates/woven-client-rust/README.md).
+
 **Interest management** (`woven-core` + `woven-loadtest`) — bounded 2D/3D
 spatial grid routing for replaceable state, with owner-updated positions, cell indexes,
 radius filtering, optional exact distance checks, and reliable-event bypass; a bounded

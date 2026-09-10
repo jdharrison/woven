@@ -1856,6 +1856,7 @@ dependencies = [
  "axum",
  "quinn",
  "rcgen 0.13.2",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

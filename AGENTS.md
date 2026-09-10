@@ -274,6 +274,35 @@ harness.run_pending() → Vec<Result<CommandResult, CoreError>>
 
 ---
 
+## Secure remote QUIC composition and native client
+
+- Default `serve(ServerConfig)` / `serve_dev_ephemeral` remain local development;
+  `serve` rejects non-loopback development listeners.
+- `woven_server::RemoteServerConfig` has explicit `quic_bind_address`, loopback-only
+  `management_bind_address`, and PEM `certificate_file`, `private_key_file`,
+  `auth_token_file` paths. `from_env()` requires `WOVEN_REMOTE_QUIC=1` plus
+  `WOVEN_QUIC_BIND`, `WOVEN_MANAGEMENT_BIND`, `WOVEN_TLS_CERT_FILE`,
+  `WOVEN_TLS_KEY_FILE`, `WOVEN_AUTH_TOKEN_FILE`; partial configuration fails closed.
+- `start_remote(config).await -> Result<RemoteServer, ServerError>` exposes actual
+  `quic_address`/`management_address`; retain handle, drop to close listeners.
+  `serve_remote(config).await` runs until Ctrl-C or listener failure.
+- Remote mode explicitly provisions namespace/session 1, logical broadcast spaces 1/2,
+  epoch 1, channel 1 ReliableOrdered/Ephemeral and channel 2 LatestValue/Stateful (no TTL),
+  64 KiB channel payload ceilings. One externally supplied static credential maps to
+  principal 1 through existing `DevAuthenticator` / WVN1 `Development` auth. No default
+  or AI token, remote WebTransport, inference, or production tenant authentication.
+- `woven_client::ClientTlsConfig::from_ca_pem(&[u8]) -> Result<Self, ClientError>`
+  accepts a bounded custom CA PEM bundle; `with_root_certificates(rustls::RootCertStore)`
+  accepts a nonempty application-supplied root store. `Client::connect_with_tls(config,
+  tls).await` uses normal chain/validity/URL host verification, DNS/IPv4/IPv6, native QUIC
+  only, ten-second whole-handshake deadline. No remote insecure fallback. Existing
+  `ClientConfig` fields are unchanged; `Client::connect` is literal-loopback-only dev TLS.
+- Management HTTP is unauthenticated and must not be exposed or publicly proxied.
+  Unix key/token files must deny group/other permissions. Never log credentials.
+  See crate READMEs for exact APIs, secure file handling and deliberate limitations.
+- Local integration coverage: `woven-server/tests/remote_quic.rs`. Cloud deployment,
+  firewall/IAM/secret operations and remote traffic remain separately approval-gated.
+
 ## `woven-transport` public API
 
 Shared by every transport adapter (QUIC, WebTransport) and by the inference
