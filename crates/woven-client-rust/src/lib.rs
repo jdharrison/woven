@@ -302,7 +302,13 @@ async fn wtransport_connect(
     host: &str,
     port: u16,
     path: &str,
-) -> Result<wtransport::Connection, ClientError> {
+) -> Result<
+    (
+        wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
+        wtransport::Connection,
+    ),
+    ClientError,
+> {
     let client_config = WtransportClientConfig::builder()
         .with_bind_default()
         .with_no_cert_validation()
@@ -314,7 +320,7 @@ async fn wtransport_connect(
         .await
         .map_err(|_| ClientError::Transport("WebTransport connect timed out".to_owned()))?
         .map_err(|e| ClientError::Transport(e.to_string()))?;
-    Ok(connection)
+    Ok((endpoint, connection))
 }
 
 /// Read a single size-prefixed codec frame from a quinn `RecvStream`.
@@ -365,11 +371,13 @@ async fn read_wtransport_envelope(
 
 enum Transport {
     Quic {
+        endpoint: Endpoint,
         connection: quinn::Connection,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
     },
     WebTransport {
+        endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
         connection: wtransport::Connection,
         send: wtransport::SendStream,
         recv: wtransport::RecvStream,
@@ -459,6 +467,7 @@ impl Client {
                     .map_err(|e| ClientError::Transport(e.to_string()))?;
                 Self {
                     transport: Transport::Quic {
+                        endpoint,
                         connection,
                         send,
                         recv,
@@ -467,7 +476,7 @@ impl Client {
                 }
             }
             UrlScheme::WebTransport => {
-                let connection = wtransport_connect(&host, port, &path).await?;
+                let (endpoint, connection) = wtransport_connect(&host, port, &path).await?;
                 let (send, recv) = connection
                     .clone()
                     .open_bi()
@@ -477,6 +486,7 @@ impl Client {
                     .map_err(|e| ClientError::Transport(e.to_string()))?;
                 Self {
                     transport: Transport::WebTransport {
+                        endpoint,
                         connection,
                         send,
                         recv,
@@ -816,7 +826,10 @@ impl Client {
         }
     }
 
-    /// Close the connection gracefully.
+    /// Initiate connection closure without waiting for transport shutdown.
+    ///
+    /// Retained for compatibility. Use [`Self::close_gracefully`] before shutting
+    /// down the connection's runtime to give the peer a chance to observe closure.
     pub fn close(self) -> Result<(), ClientError> {
         match self.transport {
             Transport::Quic { connection, .. } => {
@@ -827,6 +840,43 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Close and retain the endpoint until it becomes idle or `timeout` expires.
+    ///
+    /// This makes a bounded, good-faith effort to transmit QUIC connection-close
+    /// frames, including for WebTransport. It does not flush pending application
+    /// data or acknowledge peer receipt, server cleanup, or `EntityLeft` delivery.
+    /// `Ok(())` means the endpoint became idle; timeout returns a transport error
+    /// and releases the client anyway. Zero allows no waiting budget.
+    ///
+    /// Await this on a Tokio runtime with time enabled and keep the runtime that
+    /// owns the connection running throughout. Cancelling/dropping this future
+    /// releases the endpoint and forfeits the remaining shutdown opportunity.
+    pub async fn close_gracefully(self, timeout: Duration) -> Result<(), ClientError> {
+        let idle = async {
+            match &self.transport {
+                Transport::Quic {
+                    endpoint,
+                    connection,
+                    ..
+                } => {
+                    connection.close(quinn::VarInt::from_u32(0), b"client closed");
+                    endpoint.wait_idle().await;
+                }
+                Transport::WebTransport {
+                    endpoint,
+                    connection,
+                    ..
+                } => {
+                    connection.close(wtransport::VarInt::from_u32(0), b"client closed");
+                    endpoint.wait_idle().await;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, idle)
+            .await
+            .map_err(|_| ClientError::Transport("graceful close timed out".to_owned()))
     }
 
     /// Encode `envelope` and send it on the transport's bidirectional stream.

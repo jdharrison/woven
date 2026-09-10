@@ -8,6 +8,28 @@ cargo add woven-client
 
 `woven-client` is a library crate. It does not provide a standalone executable.
 
+## Bounded shutdown
+
+`Client::close(self)` remains synchronous and only initiates connection closure.
+Before tearing down a client's Tokio runtime, prefer:
+
+```rust,ignore
+client.close_gracefully(std::time::Duration::from_secs(2)).await?;
+```
+
+Both transports retain their endpoint. The async API initiates connection close,
+then awaits Quinn's `Endpoint::wait_idle()` (via the WebTransport wrapper where
+applicable), bounded by the supplied duration. Keep the connection's owning
+runtime running and await with Tokio time enabled. No sleep or idle-timeout change
+is used. `Ok(())` means the endpoint became idle; expiration returns
+`ClientError::Transport("graceful close timed out")` and releases the client.
+Cancelling the future forfeits its remaining shutdown opportunity.
+
+This is a good-faith opportunity to send close frames, **not** an acknowledgement
+of peer receipt, server cleanup, `EntityLeft`, or pending application data.
+Connection close can discard buffered application data. Packet loss or an expired
+close budget can still leave the peer waiting for its normal idle timeout.
+
 ## Verified remote QUIC (Weaver integration API)
 
 Existing `ClientConfig` fields are unchanged. Use the additive verified-TLS entry point:

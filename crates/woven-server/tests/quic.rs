@@ -111,6 +111,21 @@ async fn webtransport_client_completes_handshake_and_fans_out() {
     assert!(
         matches!(received.message, MessagePayload::ReliableEvent(ref payload) if payload.bytes == b"hello-wt")
     );
+    alice
+        .close_gracefully(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let left = bob
+        .recv_timeout(Duration::from_millis(500))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        left.message,
+        MessagePayload::Control(ControlPayload::EntityLeft(_))
+    ));
+    assert_eq!(left.entity_id, Some(alice_entity));
+    bob.close_gracefully(Duration::from_secs(2)).await.unwrap();
 }
 
 #[tokio::test]

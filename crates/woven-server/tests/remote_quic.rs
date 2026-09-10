@@ -96,7 +96,7 @@ async fn verified_remote_composition_on_loopback() {
         // An unauthorized control operation terminates the connection by protocol policy.
         alice.close().unwrap();
         let mut alice = Client::connect_with_tls(client_config(&url, TOKEN), tls.clone()).await.unwrap();
-        let mut bob = Client::connect_with_tls(client_config(&url, TOKEN), tls).await.unwrap();
+        let mut bob = Client::connect_with_tls(client_config(&url, TOKEN), tls.clone()).await.unwrap();
         for client in [&mut alice, &mut bob] {
             client.join_session(1, 1).await.unwrap();
             client.subscribe_space(1, 1, 1, 1, 1).await.unwrap();
@@ -105,10 +105,13 @@ async fn verified_remote_composition_on_loopback() {
         let _ = assigned(&mut bob).await;
         alice.publish_event(1, 1, 1, 1, 1, entity, 1, 1, b"verified fanout".to_vec()).await.unwrap();
         assert!(matches!(bob.recv().await.unwrap().message, MessagePayload::ReliableEvent(ref payload) if payload.bytes == b"verified fanout"));
-        alice.close().unwrap();
-        let left = bob.recv().await.unwrap();
+        alice.close_gracefully(Duration::from_secs(2)).await.unwrap();
+        let left = bob.recv_timeout(Duration::from_millis(500)).await.unwrap().expect("prompt EntityLeft after graceful close");
         assert!(matches!(left.message, MessagePayload::Control(ControlPayload::EntityLeft(_))) && left.entity_id == Some(entity));
-        bob.close().unwrap();
+        bob.close_gracefully(Duration::from_secs(2)).await.unwrap();
+        let no_budget = Client::connect_with_tls(client_config(&url, TOKEN), tls).await.unwrap();
+        assert!(matches!(no_budget.close_gracefully(Duration::ZERO).await,
+            Err(ClientError::Transport(ref message)) if message == "graceful close timed out"));
         drop(server);
         drop(name_server);
 
