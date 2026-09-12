@@ -1,0 +1,355 @@
+#!/usr/bin/python3 -I
+"""Installed, reviewed root-owned entry point. Never execute from the checkout via sudo."""
+from contextlib import ExitStack
+import fcntl
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SHA = re.compile(r"[0-9a-f]{40}", re.ASCII)
+ROOT = Path("/opt/woven")
+SOURCE = Path("/home/this/woven")
+UNIT = "woven-server.service"
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C"}
+CANCELLATION_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+COPY_SECONDS = 60
+
+
+class DeployError(Exception):
+    pass
+
+
+class DeploymentBusy(DeployError):
+    pass
+
+
+class Cancelled(Exception):
+    """Must not be treated as a retryable health-probe failure."""
+
+
+class RollbackFailed(DeployError):
+    pass
+
+
+def validate_args(args):
+    if len(args) != 1 or SHA.fullmatch(args[0]) is None:
+        raise DeployError("usage: deploy-woven <full lowercase 40-character commit SHA>")
+    return args[0]
+
+
+def run(args, *, seconds=30, capture=False):
+    # Never print command output: even build scripts are capable of emitting secrets.
+    with subprocess.Popen(args, env=ENV, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True) as process:
+        try:
+            output, _ = process.communicate(timeout=seconds)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        if process.returncode:
+            raise DeployError("bounded command failed (output deliberately suppressed)")
+        return output.decode("utf-8").strip() if capture else None
+
+
+def as_this(args, **kwargs):
+    return run(["/usr/sbin/runuser", "-u", "this", "--", "/usr/bin/env", "-i",
+                "HOME=/home/this", "USER=this", "LOGNAME=this", "LANG=C",
+                "GIT_TERMINAL_PROMPT=0",
+                "PATH=/home/this/.cargo/bin:/usr/bin:/bin", *args], **kwargs)
+
+
+def git(*args, **kwargs):
+    return as_this(["/usr/bin/git", "--no-pager", "-c", "core.hooksPath=/dev/null",
+                    "-C", str(SOURCE), *args], **kwargs)
+
+
+def fetch_source():
+    # Fixed public URL: the non-admin caller needs no checkout access or Git credentials.
+    git("-c", "credential.helper=", "-c", "core.askPass=", "fetch", "--no-tags",
+        "https://github.com/jdharrison/woven.git",
+        "+refs/heads/main:refs/remotes/origin/main", seconds=120)
+
+
+def trusted_directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise DeployError("deployment directories must be real root-owned, non-writable directories")
+
+
+def release_link(name):
+    path = ROOT / name
+    if not path.is_symlink():
+        if path.exists():
+            raise DeployError("release pointer must be a symlink")
+        return None
+    target = os.readlink(path)
+    if not re.fullmatch(r"releases/[0-9a-f]{40}", target):
+        raise DeployError("unexpected release pointer")
+    directory = ROOT / target
+    trusted_directory(directory)
+    binary = directory / "woven-server"
+    info = binary.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise DeployError("release binary must be a regular root-owned, non-writable file")
+    return target
+
+
+def point(name, target):
+    path = ROOT / name
+    if target is None:
+        path.unlink(missing_ok=True)
+        return
+    staging = ROOT / ("." + name + ".next")
+    staging.unlink(missing_ok=True)
+    staging.symlink_to(target)
+    os.replace(staging, path)
+
+
+def service(action):
+    run(["/usr/bin/systemctl", action, UNIT], seconds=45)
+
+
+def healthy(target):
+    # Three consecutive observations avoid accepting a single transient startup response.
+    consecutive = 0
+    for _ in range(12):
+        try:
+            run(["/usr/bin/systemctl", "is-active", "--quiet", UNIT], seconds=3)
+            pid = run(["/usr/bin/systemctl", "show", "--property=MainPID", "--value", UNIT],
+                      seconds=3, capture=True)
+            if not pid.isdecimal() or int(pid) <= 1:
+                raise DeployError("no service process")
+            if os.readlink("/proc/" + pid + "/exe") != str(ROOT / target / "woven-server"):
+                raise DeployError("service is not running requested release")
+            for flags, address, port in [("-Hlunp", "0.0.0.0:8081", "8081"),
+                                         ("-Hltnp", "127.0.0.1:8080", "8080")]:
+                sockets = run(["/usr/bin/ss", flags, "sport = :" + port],
+                              seconds=3, capture=True)
+                if not any(address in line.split() and "pid=" + pid + "," in line
+                           for line in sockets.splitlines()):
+                    raise DeployError("service listener missing")
+            run(["/usr/bin/curl", "--disable", "--noproxy", "*", "--fail", "--silent",
+                 "--connect-timeout", "1", "--max-time", "2", "--output", "/dev/null",
+                 "http://127.0.0.1:8080/metrics"], seconds=3)
+            consecutive += 1
+            if consecutive == 3:
+                return True
+        except (DeployError, OSError, subprocess.TimeoutExpired):
+            consecutive = 0
+        time.sleep(1)
+    return False
+
+
+def prune():
+    keep = {release_link("current"), release_link("previous")}
+    for path in (ROOT / "releases").iterdir():
+        if SHA.fullmatch(path.name) and "releases/" + path.name not in keep:
+            trusted_directory(path)
+            shutil.rmtree(path)
+
+
+def activate(target):
+    old = release_link("current")
+    previous = release_link("previous")
+    if old == target:
+        if not healthy(target):
+            raise DeployError("current SHA is unhealthy; operator intervention required")
+        prune()
+        return
+    try:
+        # Persist the rollback pointer before switching; both are same-filesystem renames.
+        point("previous", old)
+        point("current", target)
+        service("reset-failed")
+        service("restart")
+        if not healthy(target):
+            raise DeployError("candidate failed health checks")
+    except BaseException as failure:
+        # A second termination signal must not interrupt the recovery attempt.
+        for signum in CANCELLATION_SIGNALS:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            point("current", old)
+            if old is None:
+                service("stop")
+            else:
+                service("reset-failed")
+                service("restart")
+                if not healthy(old):
+                    raise DeployError("previous binary failed health checks")
+            point("previous", previous)
+            prune()
+        except BaseException:
+            raise RollbackFailed("DEPLOY FAILED; ROLLBACK FAILED: releases retained; manual recovery required") from None
+        raise DeployError("deploy failed; prior release restored (or initial service stopped)") from failure
+    prune()
+
+
+def open_directory(path):
+    """Anchor an absolute directory without following any pathname component symlink."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def copy_artifact(scratch_fd, destination):
+    # Every user-writable component is opened relative to an already anchored descriptor.
+    with ExitStack() as descriptors:
+        parent = scratch_fd
+        for component in ("target", "release"):
+            parent = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=parent)
+            descriptors.callback(os.close, parent)
+        fd = os.open("woven-server", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=parent)
+        descriptors.callback(os.close, fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_ARTIFACT_BYTES:
+            raise DeployError("invalid build artifact")
+        staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=ROOT / "releases"))
+        try:
+            deadline = time.monotonic() + COPY_SECONDS
+
+            def check_deadline():
+                if time.monotonic() >= deadline:
+                    raise DeployError("artifact copy deadline exceeded")
+
+            with (staging / "woven-server").open("xb") as output:
+                remaining = info.st_size
+                while remaining:
+                    check_deadline()
+                    chunk = os.read(fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise DeployError("build artifact truncated during copy")
+                    output.write(chunk)
+                    remaining -= len(chunk)
+                    check_deadline()
+                if os.read(fd, 1):
+                    raise DeployError("build artifact grew during copy")
+                after = os.fstat(fd)
+                if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                        info.st_size, info.st_mtime_ns, info.st_ctime_ns):
+                    raise DeployError("build artifact changed during copy")
+                output.flush()
+                os.fchmod(output.fileno(), 0o755)
+                os.fsync(output.fileno())
+                check_deadline()
+            staging.chmod(0o755)
+            check_deadline()
+            os.rename(staging, destination)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+
+
+def build(sha):
+    if git("status", "--porcelain", "--untracked-files=all", capture=True):
+        raise DeployError("source checkout is dirty; refusing deployment")
+    if git("rev-parse", "--verify", sha + "^{commit}", capture=True) != sha:
+        raise DeployError("requested object is not the exact commit")
+    # main() refreshes this ref under the deployment lock before entering build().
+    git("merge-base", "--is-ancestor", sha, "refs/remotes/origin/main")
+    destination = ROOT / "releases" / sha
+    if destination.exists():
+        if "releases/" + sha in {release_link("current"), release_link("previous")}:
+            return "releases/" + sha
+        trusted_directory(destination)
+        shutil.rmtree(destination)
+    account = pwd.getpwnam("this")
+    scratch = Path(tempfile.mkdtemp(prefix="woven-build-", dir="/var/tmp"))
+    scratch_fd = open_directory(scratch)
+    worktree = scratch / "source"
+    try:
+        os.fchown(scratch_fd, account.pw_uid, account.pw_gid)
+        git("-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(worktree), sha,
+            seconds=120)
+        if as_this(["/usr/bin/git", "-C", str(worktree), "rev-parse", "HEAD"], capture=True) != sha:
+            raise DeployError("worktree HEAD does not match requested SHA")
+        if as_this(["/usr/bin/git", "-C", str(worktree), "status", "--porcelain",
+                    "--untracked-files=all"], capture=True):
+            raise DeployError("isolated worktree is dirty")
+        # cwd is set by a trusted system utility, never a checkout-provided shell script.
+        as_this(["/usr/bin/env", "--chdir=" + str(worktree),
+                 "CARGO_TARGET_DIR=" + str(scratch / "target"),
+                 "/home/this/.cargo/bin/cargo", "build", "--locked", "--release", "-p", "woven-server"],
+                seconds=1800)
+        copy_artifact(scratch_fd, destination)
+    finally:
+        os.close(scratch_fd)
+        try:
+            git("-c", "core.hooksPath=/dev/null", "worktree", "remove", "--force", str(worktree),
+                seconds=60)
+        finally:
+            shutil.rmtree(scratch)
+    return "releases/" + sha
+
+
+def interrupted(signum, frame):
+    raise Cancelled("deployment interrupted")
+
+
+def main(args):
+    sha = validate_args(args)
+    if os.geteuid() != 0:
+        raise DeployError("invoke the installed root-owned script via sudo")
+    os.umask(0o022)
+    for path in [Path("/opt"), ROOT, ROOT / "releases"]:
+        trusted_directory(path)
+    for signum in CANCELLATION_SIGNALS:
+        signal.signal(signum, interrupted)
+    fd = os.open(ROOT / "deploy.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DeploymentBusy("deployment busy; caller must recheck main head before retry") from None
+        release_link("current")
+        release_link("previous")
+        fetch_source()
+        # Only activate() prunes, after confirmed success or confirmed recovery.
+        # An uncertain outcome must leave all recovery binaries intact.
+        activate(build(sha))
+    print("Deployed " + sha + "; process/listener/metrics checks passed, not data-plane readiness")
+
+
+def cli(args):
+    try:
+        main(args)
+    except DeploymentBusy as error:
+        print(str(error), file=sys.stderr)
+        return 75
+    except (DeployError, Cancelled) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except (OSError, subprocess.TimeoutExpired):
+        # OS exception details may contain sensitive filesystem information.
+        print("Deployment failed (OS error or command timeout); inspect service state and "
+              "release pointers locally. No command output is logged.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv[1:]))

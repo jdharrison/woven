@@ -1,0 +1,119 @@
+name: Deploy woven-01
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy successful main revision
+    if: >-
+      vars.WOVEN_DEPLOY_ENABLED == 'true' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    concurrency:
+      group: production-woven-01
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Resolve current main with successful push CI
+        id: revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          [[ "$latest" =~ ^[0-9a-f]{40}$ ]]
+          conclusion=$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=$latest&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // "pending"')
+          if [[ "$conclusion" == success ]]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "Current main $latest has no successful latest push CI run; no deployment." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Verify deployment configuration
+        if: steps.revision.outputs.deploy == 'true'
+        env:
+          WIF_PROVIDER: ${{ vars.WOVEN_WIF_PROVIDER }}
+          DEPLOY_ACCOUNT: ${{ vars.WOVEN_DEPLOY_SERVICE_ACCOUNT }}
+          SSH_HOST_KEY: ${{ vars.WOVEN_SSH_HOST_KEY }}
+        run: |
+          set -eu
+          test -n "$WIF_PROVIDER"
+          test -n "$DEPLOY_ACCOUNT"
+          test -n "$SSH_HOST_KEY"
+
+      - name: Authenticate to Google Cloud
+        if: steps.revision.outputs.deploy == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WOVEN_WIF_PROVIDER }}
+          service_account: ${{ vars.WOVEN_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        if: steps.revision.outputs.deploy == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Pin VM SSH host key
+        if: steps.revision.outputs.deploy == 'true'
+        env:
+          SSH_HOST_KEY: ${{ vars.WOVEN_SSH_HOST_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST_KEY" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+={0,2}$ ]]
+          instance_id=$(gcloud compute instances describe woven-01 \
+            --project signalweave-112358 --zone us-central1-f --format='value(id)')
+          [[ "$instance_id" =~ ^[0-9]+$ ]]
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf 'compute.%s %s\n' "$instance_id" "$SSH_HOST_KEY" > "$HOME/.ssh/google_compute_known_hosts"
+          chmod 600 "$HOME/.ssh/google_compute_known_hosts"
+
+      - name: Deploy exact revision over IAP
+        if: steps.revision.outputs.deploy == 'true'
+        env:
+          DEPLOY_SHA: ${{ steps.revision.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          for attempt in 1 2 3; do
+            latest=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+            if [[ "$DEPLOY_SHA" != "$latest" ]]; then
+              echo "Revision superseded before SSH; no deployment performed." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            result=0
+            gcloud compute ssh woven-01 \
+              --project signalweave-112358 --zone us-central1-f \
+              --tunnel-through-iap --quiet --ssh-key-expire-after=10m \
+              --strict-host-key-checking=yes \
+              --ssh-flag='-o ConnectTimeout=20' \
+              --ssh-flag='-o ServerAliveInterval=15' \
+              --ssh-flag='-o ServerAliveCountMax=4' \
+              --command="sudo -n /usr/local/sbin/deploy-woven $DEPLOY_SHA" || result=$?
+            if [[ "$result" == 0 ]]; then
+              echo "Deployed $DEPLOY_SHA to woven-01. Process, listeners and metrics checks passed; this is not a protocol-level smoke test." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [[ "$result" != 75 || "$attempt" == 3 ]]; then
+              exit "$result"
+            fi
+            sleep 20
+          done
