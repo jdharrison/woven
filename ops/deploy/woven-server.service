@@ -3,7 +3,7 @@ Description=Woven remote native QUIC server
 After=network.target
 StartLimitIntervalSec=120
 StartLimitBurst=5
-ConditionPathIsExecutable=/opt/woven/current/woven-server
+ConditionFileIsExecutable=/opt/woven/current/woven-server
 
 [Service]
 Type=simple

@@ -15,6 +15,11 @@ A, B, C = (character * 40 for character in "abc")
 
 
 class ValidationTests(unittest.TestCase):
+    def test_unit_skips_start_without_an_executable_release(self):
+        unit = Path(__file__).with_name("woven-server.service").read_text()
+        self.assertIn("ConditionFileIsExecutable=/opt/woven/current/woven-server\n", unit)
+        self.assertNotIn("ConditionPathIsExecutable", unit)
+
     def test_exact_sha_only(self):
         self.assertEqual(deploy.validate_args([A]), A)
         for args in [[], [A, B], ["main"], ["a" * 39], ["a" * 41], ["A" * 40],

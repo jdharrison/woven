@@ -1,9 +1,36 @@
 # Debian `woven-01`: exact-SHA local deployment
 
 The local deploy tooling and [deployment workflow](../.github/workflows/deploy.yml)
-are implemented; **rollout has not been executed**. Production setup is **blocked
-on the security/access decision below**. Keep automation disabled until that
-review and manual bootstrap are complete. This guide performs no cloud mutations.
+are implemented. **Deployment remains disabled; the live node has not been restarted.**
+Production activation is blocked on cloud authentication, the security/access
+migration below, and publishing the workflow. Keep automation disabled until those
+steps and the remaining bootstrap checks are complete.
+
+## Staged on September 11, 2026
+
+- GitHub repository `jdharrison/woven` has `WOVEN_DEPLOY_ENABLED=false` explicitly
+  set. `WOVEN_SSH_HOST_KEY` contains the Ed25519 public key retrieved over the
+  existing strictly host-verified SSH connection. No private key was uploaded.
+- `/usr/local/sbin/deploy-woven` is installed root-owned with mode `0755`;
+  `/etc/systemd/system/woven-server.service` is root-owned with mode `0644`.
+- `/opt/woven` and `/opt/woven/releases` exist as root-owned `0755` directories.
+  There is no current release or rollback seed yet.
+- Systemd reports the unit loaded, **disabled and inactive**, with `MainPID=0`.
+  Boot enablement and service startup were not performed.
+- Transferred tooling was checksum-verified. All 34 hermetic tests passed on the
+  actual Debian VM, including the condition regression test. Native unit verification caught and prompted correction
+  of the executable condition to `ConditionFileIsExecutable`; verification then
+  reported only the expected missing `/opt/woven/current/woven-server`. Full unit
+  startup validation is still pending installation of a real release.
+- The existing standalone PID `39490` still owned UDP `8081` and loopback TCP
+  `8080` after staging. This is a recorded observation, not a PID to reuse blindly.
+- GCP CLI reauthentication is required before identity/IAM preparation can proceed.
+  No IAM, OS Login, firewall, attached service-account, or credential changes were
+  performed. The workflow commits remain local and unpushed.
+
+Staging copies are retained in `/home/this/woven-deploy-staging-ea78ea3`; this is
+not the privileged invocation path. Recheck file checksums and all observations
+before activation.
 
 ## Implemented workflow
 
@@ -213,7 +240,7 @@ WVN1 QUIC handshake, authorization, routing/delivery, external reachability, or
 capacity. HTTP metrics or systemd active state alone are not data-plane readiness.
 An independently approved protocol-level test is needed for those claims.
 
-## Reviewed manual bootstrap (not performed here)
+## Reviewed manual bootstrap (installation staged; activation pending)
 
 Use an approved maintenance window. Debian needs Python 3, systemd, Git, util-linux
 (`runuser`), iproute2 (`ss`), curl, and the existing Rust toolchain. Verify executable
@@ -293,8 +320,9 @@ After approval, an administrator must review existing files/drop-ins/pointers,
 create root-owned mode-`0755` `/opt/woven` and `/opt/woven/releases`, and install the
 reviewed script as root-owned mode-`0755` `/usr/local/sbin/deploy-woven` and unit as
 root-owned mode-`0644` `/etc/systemd/system/woven-server.service`. Verify the unit,
-reload systemd, and enable boot startup as a separate manual bootstrap. These
-installation/mutation steps have **not** been executed.
+reload systemd, and enable boot startup as a separate manual bootstrap. File
+installation and daemon reload have been performed as recorded above; boot
+startup remains disabled. Recheck existing installed copies before replacing them.
 
 Enabling sets boot startup but does **not** start the unit. It has an executable
 condition so boot before the first release does not try to launch a missing binary.
