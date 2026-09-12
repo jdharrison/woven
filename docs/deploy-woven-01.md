@@ -2,8 +2,8 @@
 
 The local deploy tooling and [deployment workflow](../.github/workflows/deploy.yml)
 are implemented. **Deployment remains disabled; the live node has not been restarted.**
-Production activation is blocked on cloud authentication, the security/access
-migration below, and publishing the workflow. Keep automation disabled until those
+Cloud identity/IAM staging is complete. Production activation still requires the
+security/access migration below and publishing the workflow. Keep automation disabled until those
 steps and the remaining bootstrap checks are complete.
 
 ## Staged on September 11, 2026
@@ -18,19 +18,72 @@ steps and the remaining bootstrap checks are complete.
 - Systemd reports the unit loaded, **disabled and inactive**, with `MainPID=0`.
   Boot enablement and service startup were not performed.
 - Transferred tooling was checksum-verified. All 34 hermetic tests passed on the
-  actual Debian VM, including the condition regression test. Native unit verification caught and prompted correction
+  actual Debian VM, including the condition regression test. Native unit
+  verification caught and prompted correction
   of the executable condition to `ConditionFileIsExecutable`; verification then
   reported only the expected missing `/opt/woven/current/woven-server`. Full unit
   startup validation is still pending installation of a real release.
 - The existing standalone PID `39490` still owned UDP `8081` and loopback TCP
   `8080` after staging. This is a recorded observation, not a PID to reuse blindly.
-- GCP CLI reauthentication is required before identity/IAM preparation can proceed.
-  No IAM, OS Login, firewall, attached service-account, or credential changes were
-  performed. The workflow commits remain local and unpushed.
+- After GCP reauthentication, the dedicated identity/IAM resources below were
+  created and read back for verification. OS Login metadata, firewall rules, the
+  attached VM service account, and runtime credentials remain unchanged. The
+  workflow commits remain local and unpushed.
 
 Staging copies are retained in `/home/this/woven-deploy-staging-ea78ea3`; this is
 not the privileged invocation path. Recheck file checksums and all observations
 before activation.
+
+## Cloud identity staging (disabled)
+
+Project: `signalweave-112358` (`932588991464`). The following resources were
+created with approval to prepare automation without activating it:
+
+| Resource | Staged configuration |
+| --- | --- |
+| Deployment service account | `woven-node-deploy@signalweave-112358.iam.gserviceaccount.com` |
+| Runtime service account | `woven-node-runtime@signalweave-112358.iam.gserviceaccount.com`; not attached to a VM |
+| WIF provider | `projects/932588991464/locations/global/workloadIdentityPools/github-pool/providers/woven-node-github`; **disabled** |
+| Project lookup custom role | `projects/signalweave-112358/roles/wovenDeployProjectLookup`; only `compute.projects.get` and `resourcemanager.projects.get` |
+| VM permission | `roles/compute.osLogin` for deployment SA on **woven-01 only**, not OS Admin Login |
+| IAP permission | `roles/iap.tunnelResourceAccessor` for deployment SA, conditioned on `destination.ip == '10.128.0.2' && destination.port == 22` |
+| Runtime act-as permission | Deployment SA has `roles/iam.serviceAccountUser` only on the new runtime SA, not the attached default Compute SA |
+| Runtime project roles | `roles/logging.logWriter`, `roles/monitoring.metricWriter` for the existing Ops Agent use case; no Editor |
+
+The new provider checks immutable repository ID `1350893583`, owner ID `4994852`,
+repository `jdharrison/woven`, ref `refs/heads/main`, workflow ref
+`jdharrison/woven/.github/workflows/deploy.yml@refs/heads/main`, and event
+`workflow_run`. Its repository principal set has `roles/iam.workloadIdentityUser`
+on the deployment SA only. No user-managed service-account keys were created.
+The existing Woven Host provider `github-provider` was not modified.
+
+IAP API was enabled. No new firewall allowance was added: the existing SSH rule
+already permits TCP 22. This is not a claim that the VM firewall is fully hardened.
+GitHub variables `WOVEN_WIF_PROVIDER` and `WOVEN_DEPLOY_SERVICE_ACCOUNT` now point
+to the staged identities. `WOVEN_DEPLOY_ENABLED` remains **false**, independently
+of the provider's disabled state.
+
+### Remaining activation checklist
+
+1. Obtain approval for the maintenance/access transition and publishing the local
+   Woven commits. Host commits are separate and must not be pushed incidentally.
+2. Preserve operator/recovery access before OS Login activation. Verify the real
+   deployment account's OS Login POSIX username before installing its narrow
+   sudoers rule; no new sudo permission has been installed yet.
+3. Review the attached Ops Agent dependencies, then stop the VM, attach the staged
+   runtime service account, and start it in the approved window. The external IP
+   is ephemeral: plan address retention or certificate/client endpoint changes
+   **before stopping**, since the existing TLS identity is tied to that IP.
+4. Enable OS Login only after access preservation is verified; validate non-admin
+   login and the wrapper-only sudo boundary without broadly granting roles.
+5. Seed a verified rollback release and migrate the standalone process to the
+   installed systemd unit. Verify startup and rollback before enabling boot start.
+6. Publish and validate the workflow with the GitHub flag still false. Enable the
+   WIF provider only for approved access testing; its permissions have been read
+   back, but keyless authentication/IAP SSH have not been exercised end to end.
+7. Only after acceptance, set `WOVEN_DEPLOY_ENABLED=true` and trigger successful CI
+   on current main. Neither flipping that flag nor enabling the provider alone
+   completes the unfinished VM bootstrap.
 
 ## Implemented workflow
 
@@ -85,8 +138,10 @@ the non-admin caller needs neither checkout access nor permission to run Git as
 | `WOVEN_SSH_HOST_KEY` | Independently verified Ed25519 public host key: `ssh-ed25519 <base64>`, without a comment or hostname |
 
 **Disabled by default:** leave the enable flag unset/false until bootstrap, access,
-rollback, and host-key verification are accepted. The flag is a job-admission gate,
-**not live cancellation** of an already admitted deployment.
+rollback, and host-key verification are accepted. The staged WIF provider is also
+disabled and must be enabled separately for approved keyless access testing.
+The flag is a job-admission gate, **not live cancellation** of an already admitted
+deployment. Disabling the provider does not revoke credentials already issued.
 
 The workflow looks up the numeric VM instance ID and pins the public key under
 `compute.<instance_id>` in gcloud's default `~/.ssh/google_compute_known_hosts`.
@@ -96,7 +151,8 @@ connect timeout, and 15-second keepalives with four missed responses allowed.
 
 ### Security/access approval gate — production setup blocked
 
-IAM and access changes require explicit approval; none are applied by this guide:
+The scoped staging grants above are applied. The access/maintenance transition
+still requires explicit approval:
 
 - Use a **separate WIF provider**, restricted to `jdharrison/woven`, `main`, and
   `.github/workflows/deploy.yml`, and a dedicated deployment identity. Repository
@@ -113,10 +169,10 @@ IAM and access changes require explicit approval; none are applied by this guide
   scopes**. Do **not** blindly grant `iam.serviceAccounts.actAs` on that account
   to make SSH work. VM-local access to its credentials also makes the broad
   attached identity a security concern despite non-admin login/scoped sudo.
-- Decide on a **dedicated least-privilege runtime service account or no attached
-  service account**. Changing/detaching the VM service account requires a reviewed
-  **VM stop/start**, dependency assessment, and access-preservation plan. This is
-  the unresolved security/access decision blocking production setup and enablement.
+- The **dedicated least-privilege runtime service account** is staged, not attached.
+  Replacing the VM service account requires a reviewed **VM stop/start**, dependency
+  assessment, IP/TLS continuity plan, and access-preservation plan. These remain
+  required before production activation.
 
 ## Files and behavior
 
