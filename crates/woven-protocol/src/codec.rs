@@ -1,3 +1,7 @@
+use crate::{
+    AdmissionRejectionCode, AdmissionResult, AdmissionStatus, QueueCancel, QueueClaim,
+    QueueHeartbeat, QueueState, QueueStatusRequest, QueueUpdate, RequestAdmission,
+};
 use std::fmt;
 
 use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
@@ -790,6 +794,100 @@ fn encode_control(
                 offset.as_union_value(),
             )
         }
+        ControlPayload::RequestAdmission(value) => {
+            let idempotency_key = builder.create_string(&value.idempotency_key);
+            let offset = wire::RequestAdmissionPayload::create(
+                builder,
+                &wire::RequestAdmissionPayloadArgs {
+                    idempotency_key: Some(idempotency_key),
+                },
+            );
+            (
+                wire::ControlPayload::RequestAdmissionPayload,
+                offset.as_union_value(),
+            )
+        }
+        ControlPayload::AdmissionResult(value) => {
+            let offset = wire::AdmissionResultPayload::create(
+                builder,
+                &wire::AdmissionResultPayloadArgs {
+                    status: wire::AdmissionStatus(value.status.value()),
+                    rejection_code: wire::AdmissionRejectionCode(value.rejection_code.value()),
+                    ticket_id: value.ticket_id.unwrap_or(0),
+                    poll_after_ms: value.poll_after_ms,
+                    ticket_remaining_ms: value.ticket_remaining_ms,
+                },
+            );
+            (
+                wire::ControlPayload::AdmissionResultPayload,
+                offset.as_union_value(),
+            )
+        }
+        ControlPayload::QueueStatusRequest(value) => {
+            let offset = wire::QueueStatusRequestPayload::create(
+                builder,
+                &wire::QueueStatusRequestPayloadArgs {
+                    ticket_id: value.ticket_id,
+                },
+            );
+            (
+                wire::ControlPayload::QueueStatusRequestPayload,
+                offset.as_union_value(),
+            )
+        }
+        ControlPayload::QueueHeartbeat(value) => {
+            let offset = wire::QueueHeartbeatPayload::create(
+                builder,
+                &wire::QueueHeartbeatPayloadArgs {
+                    ticket_id: value.ticket_id,
+                },
+            );
+            (
+                wire::ControlPayload::QueueHeartbeatPayload,
+                offset.as_union_value(),
+            )
+        }
+        ControlPayload::QueueClaim(value) => {
+            let offset = wire::QueueClaimPayload::create(
+                builder,
+                &wire::QueueClaimPayloadArgs {
+                    ticket_id: value.ticket_id,
+                },
+            );
+            (
+                wire::ControlPayload::QueueClaimPayload,
+                offset.as_union_value(),
+            )
+        }
+        ControlPayload::QueueCancel(value) => {
+            let offset = wire::QueueCancelPayload::create(
+                builder,
+                &wire::QueueCancelPayloadArgs {
+                    ticket_id: value.ticket_id,
+                },
+            );
+            (
+                wire::ControlPayload::QueueCancelPayload,
+                offset.as_union_value(),
+            )
+        }
+        ControlPayload::QueueUpdate(value) => {
+            let offset = wire::QueueUpdatePayload::create(
+                builder,
+                &wire::QueueUpdatePayloadArgs {
+                    ticket_id: value.ticket_id,
+                    state: wire::QueueState(value.state.value()),
+                    position: value.position,
+                    poll_after_ms: value.poll_after_ms,
+                    ticket_remaining_ms: value.ticket_remaining_ms,
+                    offer_remaining_ms: value.offer_remaining_ms,
+                },
+            );
+            (
+                wire::ControlPayload::QueueUpdatePayload,
+                offset.as_union_value(),
+            )
+        }
         ControlPayload::ToolCallCompleted(value) => {
             let result = builder.create_vector(&value.result);
             let offset = wire::ToolCallCompletedPayload::create(
@@ -1201,6 +1299,101 @@ fn decode_control(
                 result: checked_control_vector(codec, value.result())?,
             })
         }
+        MessageKind::RequestAdmission => {
+            require_control(
+                envelope,
+                kind,
+                wire::ControlPayload::RequestAdmissionPayload,
+            )?;
+            let value = envelope
+                .control_as_request_admission_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::RequestAdmission(RequestAdmission {
+                idempotency_key: checked_control_string(codec, value.idempotency_key())?,
+            })
+        }
+        MessageKind::AdmissionResult => {
+            require_control(envelope, kind, wire::ControlPayload::AdmissionResultPayload)?;
+            let value = envelope
+                .control_as_admission_result_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::AdmissionResult(AdmissionResult {
+                status: AdmissionStatus::from_wire(value.status().0).ok_or(
+                    CodecError::UnsupportedEnumValue {
+                        name: "AdmissionStatus",
+                        value: u64::from(value.status().0),
+                    },
+                )?,
+                rejection_code: AdmissionRejectionCode::from_wire(value.rejection_code().0).ok_or(
+                    CodecError::UnsupportedEnumValue {
+                        name: "AdmissionRejectionCode",
+                        value: u64::from(value.rejection_code().0),
+                    },
+                )?,
+                ticket_id: nonzero(value.ticket_id()),
+                poll_after_ms: value.poll_after_ms(),
+                ticket_remaining_ms: value.ticket_remaining_ms(),
+            })
+        }
+        MessageKind::QueueStatusRequest => {
+            require_control(
+                envelope,
+                kind,
+                wire::ControlPayload::QueueStatusRequestPayload,
+            )?;
+            let value = envelope
+                .control_as_queue_status_request_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::QueueStatusRequest(QueueStatusRequest {
+                ticket_id: value.ticket_id(),
+            })
+        }
+        MessageKind::QueueHeartbeat => {
+            require_control(envelope, kind, wire::ControlPayload::QueueHeartbeatPayload)?;
+            let value = envelope
+                .control_as_queue_heartbeat_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::QueueHeartbeat(QueueHeartbeat {
+                ticket_id: value.ticket_id(),
+            })
+        }
+        MessageKind::QueueClaim => {
+            require_control(envelope, kind, wire::ControlPayload::QueueClaimPayload)?;
+            let value = envelope
+                .control_as_queue_claim_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::QueueClaim(QueueClaim {
+                ticket_id: value.ticket_id(),
+            })
+        }
+        MessageKind::QueueCancel => {
+            require_control(envelope, kind, wire::ControlPayload::QueueCancelPayload)?;
+            let value = envelope
+                .control_as_queue_cancel_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::QueueCancel(QueueCancel {
+                ticket_id: value.ticket_id(),
+            })
+        }
+        MessageKind::QueueUpdate => {
+            require_control(envelope, kind, wire::ControlPayload::QueueUpdatePayload)?;
+            let value = envelope
+                .control_as_queue_update_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::QueueUpdate(QueueUpdate {
+                ticket_id: value.ticket_id(),
+                state: QueueState::from_wire(value.state().0).ok_or(
+                    CodecError::UnsupportedEnumValue {
+                        name: "QueueState",
+                        value: u64::from(value.state().0),
+                    },
+                )?,
+                position: value.position(),
+                poll_after_ms: value.poll_after_ms(),
+                ticket_remaining_ms: value.ticket_remaining_ms(),
+                offer_remaining_ms: value.offer_remaining_ms(),
+            })
+        }
         MessageKind::Unknown
         | MessageKind::EntityState
         | MessageKind::ReliableEvent
@@ -1276,6 +1469,44 @@ const fn nonzero(value: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_decode_rejects_invalid_wire_semantics_and_enums() {
+        for invalid in 0..5 {
+            let mut builder = FlatBufferBuilder::new();
+            let payload = wire::QueueUpdatePayload::create(
+                &mut builder,
+                &wire::QueueUpdatePayloadArgs {
+                    ticket_id: u64::from(invalid != 0),
+                    state: if invalid == 1 {
+                        wire::QueueState(255)
+                    } else {
+                        wire::QueueState::Offered
+                    },
+                    ..Default::default()
+                },
+            );
+            let root = wire::Envelope::create(
+                &mut builder,
+                &wire::EnvelopeArgs {
+                    namespace_id: u64::from(invalid != 2),
+                    session_id: 2,
+                    correlation_id: if invalid == 3 { 0 } else { 3 },
+                    message_kind: if invalid == 4 {
+                        wire::MessageKind::AdmissionResult
+                    } else {
+                        wire::MessageKind::QueueUpdate
+                    },
+                    delivery_class: wire::DeliveryClass::ReliableOrdered,
+                    control_type: wire::ControlPayload::QueueUpdatePayload,
+                    control: Some(payload.as_union_value()),
+                    ..Default::default()
+                },
+            );
+            wire::finish_size_prefixed_envelope_buffer(&mut builder, root);
+            assert!(Codec::default().decode(builder.finished_data()).is_err());
+        }
+    }
 
     fn raw_frame(protocol_version: u16, message_kind: u8, with_ping_control: bool) -> Vec<u8> {
         let mut builder = FlatBufferBuilder::new();

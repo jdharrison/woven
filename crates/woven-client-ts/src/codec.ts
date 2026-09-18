@@ -4,6 +4,9 @@ import {
   DeliveryClass,
   MessageKind,
   ControlPayload,
+  RequestAdmissionPayload, AdmissionResultPayload, AdmissionStatus, AdmissionRejectionCode,
+  QueueStatusRequestPayload, QueueHeartbeatPayload, QueueClaimPayload, QueueCancelPayload,
+  QueueUpdatePayload, QueueState,
 } from "../generated/woven/protocol/v1.js";
 import { unionToControlPayload } from "../generated/woven/protocol/v1/control-payload.js";
 
@@ -124,7 +127,7 @@ export class EnvelopeCodec {
 
 function decodeEnvelope(envelope: FbEnvelope): DecodedEnvelope {
   const controlType = envelope.controlType();
-  return {
+  const decoded: DecodedEnvelope = {
     protocolVersion: envelope.protocolVersion(),
     messageKind: envelope.messageKind(),
     deliveryClass: envelope.deliveryClass(),
@@ -145,4 +148,46 @@ function decodeEnvelope(envelope: FbEnvelope): DecodedEnvelope {
         ? null
         : unionToControlPayload(controlType, (obj) => envelope.control(obj)),
   };
+  validateManaged(decoded);
+  return decoded;
+}
+
+/** Managed controls are codec-compatible only; this does not enable a managed browser transport. */
+function validateManaged(e: DecodedEnvelope): void {
+  const kindManaged = e.messageKind >= MessageKind.RequestAdmission && e.messageKind <= MessageKind.QueueUpdate;
+  const unionManaged = e.controlType >= ControlPayload.RequestAdmissionPayload && e.controlType <= ControlPayload.QueueUpdatePayload;
+  if (!kindManaged && !unionManaged) return;
+  const require = (valid: boolean): void => {
+    if (!valid) throw new CodecError("InvalidSemantics", "invalid managed admission envelope or fields");
+  };
+  require(kindManaged && unionManaged && e.messageKind - e.controlType === 3);
+  require(e.protocolVersion === PROTOCOL_VERSION && e.deliveryClass === DeliveryClass.ReliableOrdered);
+  require(e.namespaceId !== 0n && e.sessionId !== 0n && e.correlationId !== null);
+  require(e.spaceId === 0n && e.spaceEpoch === 0n && e.channelId === null && e.entityId === null);
+  require(e.payloadTypeId === 0n && (e.payload === null || e.payload.length === 0));
+  const c = e.control;
+  if (c instanceof RequestAdmissionPayload) {
+    const length = new TextEncoder().encode(c.idempotencyKey() ?? "").length;
+    require(length > 0 && length <= 256);
+  } else if (c instanceof AdmissionResultPayload) {
+    const queued = c.status() === AdmissionStatus.Queued;
+    require(c.status() >= AdmissionStatus.Admitted && c.status() <= AdmissionStatus.Rejected);
+    require(c.rejectionCode() >= AdmissionRejectionCode.None && c.rejectionCode() <= AdmissionRejectionCode.InvalidIdempotencyKey);
+    require((c.status() === AdmissionStatus.Rejected) === (c.rejectionCode() !== AdmissionRejectionCode.None));
+    require(queued === (c.ticketId() !== 0n));
+    require(c.pollAfterMs() <= 30_000 && c.ticketRemainingMs() <= 900_000);
+    require(queued || c.ticketRemainingMs() === 0);
+    require(queued || c.status() === AdmissionStatus.Paused || c.pollAfterMs() === 0);
+  } else if (c instanceof QueueUpdatePayload) {
+    const live = c.state() === QueueState.Waiting || c.state() === QueueState.Offered;
+    require(c.ticketId() !== 0n && c.state() >= QueueState.Waiting && c.state() <= QueueState.Missing);
+    require((c.state() === QueueState.Waiting) === (c.position() !== 0));
+    require(c.pollAfterMs() <= 30_000 && c.ticketRemainingMs() <= 900_000 && c.offerRemainingMs() <= 30_000);
+    require(c.state() === QueueState.Offered || c.offerRemainingMs() === 0);
+    require(live || (c.pollAfterMs() === 0 && c.ticketRemainingMs() === 0));
+  } else if (c instanceof QueueStatusRequestPayload || c instanceof QueueHeartbeatPayload || c instanceof QueueClaimPayload || c instanceof QueueCancelPayload) {
+    require(c.ticketId() !== 0n);
+  } else {
+    require(false);
+  }
 }

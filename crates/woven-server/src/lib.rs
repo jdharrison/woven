@@ -3,6 +3,8 @@
 #![deny(unsafe_code)]
 
 pub mod admission;
+mod managed;
+pub use managed::{ManagedServer, ManagedServerConfig, serve_managed, start_managed};
 mod remote;
 pub use remote::{RemoteServer, RemoteServerConfig, serve_remote, start_remote};
 

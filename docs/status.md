@@ -20,7 +20,8 @@ admission control: capacity allocation, FIFO queueing with offers, reconnect gra
 usage counters, and configurable windowed aggregation with in-memory/JSONL/spooling sinks.
 
 **Protocol** (`woven-protocol`) — the full v1 metadata envelope and typed control
-messages, including inference/tool-call lifecycle messages, a pinned vendored FlatBuffers
+messages, including inference/tool-call lifecycle and managed admission/queue controls
+(message kinds 33–39), a pinned vendored FlatBuffers
 compiler, verifier-backed bounded decoding, semantic validation, and checked-in golden
 fixtures proving byte-for-byte cross-language stability.
 
@@ -51,6 +52,40 @@ identity or hosted auth**. Local real-QUIC tests cover trust/name rejection, wro
 tokens, authorization, fanout and disconnect. No cloud deployment or external target test
 has been performed. See the [server configuration](../crates/woven-server/README.md) and
 [exact client API](../crates/woven-client-rust/README.md).
+
+**Opt-in managed native QUIC runtime** — `ManagedServerConfig` / `start_managed`
+starts empty, with separate read-only management and authenticated loopback admin
+listeners. The Host-compatible node/session API implements scoped provision/read/
+capacity/delete, incarnation binding, revision retries and bounded revocation history.
+SHA-256 session-token verifiers and unique connection principals live in the core
+worker. Admission and joins are atomic; deletion closes admitted, waiting and
+not-yet-joined real QUIC sockets. The WVN1 bridge and native client admission/queue
+APIs are implemented and tested over local TLS-verified QUIC, including CCU-one
+queue/heartbeat/claim, duplicate operations, ticket ownership, scope isolation,
+ordinary-join rejection, correlated rate errors, teardown and helper cancellation.
+Runtime tests also cover response fields, replay, limits and configuration.
+The real Host-to-managed-node E2E in
+`crates/woven-server/tests/host_managed_local.rs` is implemented and has passed via
+`npm run test:local` from `../woven-host` (relative to Woven's root). It uses
+real Host HTTP APIs, authenticated node admin HTTP, and Host-returned descriptors
+with the TLS-verified native QUIC client, backed by isolated Firebase Auth/Firestore
+emulators on loopback. Coverage includes ownership/capacity, monitoring, queue/claim,
+TLS/scope rejection, server deletion and account teardown. This cross-repository test
+is ignored by ordinary Cargo runs and must be launched through Host's local runner.
+
+Managed mode is native QUIC only, with opaque shared session credentials, fixed
+spaces/channels, zero reconnect grace, and in-memory configuration/revocation history.
+The native client selects Bearer explicitly; the current QUIC adapter verifies the
+token without enforcing a Bearer-only scheme label. Admission exchanges are exclusive
+pre-subscription operations with ten-second timeouts. The consuming cancellation
+helper has a positive caller-set deadline capped at 15 minutes and performs zero
+transport retries. Wire remaining-lifetime fields are currently zero (unavailable),
+not fresh TTLs. TypeScript has generated bindings/codec compatibility only, not a
+managed browser queue client or WebTransport endpoint. Validation includes the local
+Host API-to-native-client path, not browser UI, Weaver integration, external deployment,
+production Firebase/App Check, durable recovery/failover, or production per-user
+identity. See
+[managed sessions](managed-sessions.md).
 
 **Interest management** (`woven-core` + `woven-loadtest`) — bounded 2D/3D
 spatial grid routing for replaceable state, with owner-updated positions, cell indexes,

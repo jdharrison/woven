@@ -107,11 +107,22 @@ fn invalid(message: &str) -> ServerError {
     ServerError::QuicConfiguration(message.to_owned())
 }
 
-fn read_bounded(path: &Path, limit: usize, secret: bool) -> Result<Vec<u8>, ServerError> {
+pub(super) fn read_bounded(
+    path: &Path,
+    limit: usize,
+    secret: bool,
+) -> Result<Vec<u8>, ServerError> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(invalid("TLS and credential inputs must be regular files"));
     }
-    let file = std::fs::File::open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(invalid("TLS and credential inputs must be regular files"));
@@ -135,7 +146,7 @@ fn read_bounded(path: &Path, limit: usize, secret: bool) -> Result<Vec<u8>, Serv
     Ok(bytes)
 }
 
-fn validate_token(bytes: &[u8]) -> Result<&str, ServerError> {
+pub(super) fn validate_token(bytes: &[u8]) -> Result<&str, ServerError> {
     let token = std::str::from_utf8(bytes)
         .map_err(|_| invalid("credential file must be UTF-8"))?
         .trim_end_matches(['\r', '\n']);

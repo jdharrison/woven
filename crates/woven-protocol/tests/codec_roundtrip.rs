@@ -31,6 +31,17 @@ fn envelope_for_control(payload: ControlPayload) -> Envelope {
         | MessageKind::Ping
         | MessageKind::Pong
         | MessageKind::ProtocolError => {}
+        MessageKind::RequestAdmission
+        | MessageKind::AdmissionResult
+        | MessageKind::QueueStatusRequest
+        | MessageKind::QueueHeartbeat
+        | MessageKind::QueueClaim
+        | MessageKind::QueueCancel
+        | MessageKind::QueueUpdate => {
+            envelope.namespace_id = 10;
+            envelope.session_id = 20;
+            envelope.correlation_id = Some(1);
+        }
         MessageKind::JoinSession | MessageKind::LeaveSession => {
             envelope.namespace_id = 10;
             envelope.session_id = 20;

@@ -18,6 +18,8 @@ name = "woven-server"
 path = "src/main.rs"
 
 [dependencies]
+ring = "=0.17.14"
+serde_json.workspace = true
 woven-core.workspace = true
 woven-protocol.workspace = true
 woven-transport.workspace = true
@@ -37,9 +39,11 @@ quinn.workspace = true
 rustls.workspace = true
 wtransport.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
 [dev-dependencies]
 woven-client = { path = "../woven-client-rust", version = "0.1.2" }
-serde_json.workspace = true
 tower.workspace = true
 
 [lints]

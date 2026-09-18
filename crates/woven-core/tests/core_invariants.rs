@@ -295,6 +295,138 @@ fn capacity_managed_session_requires_and_releases_admission_lease() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single lifecycle regression covering ownership through disconnect"
+)]
+fn queue_ownership_claim_and_disconnect_are_connection_bound() {
+    use woven_core::{QueueOperation, QueueStatus};
+    let session = session_a();
+    let mut core = make_core(CoreConfig::default());
+    core.configure_session_admission(
+        session,
+        AdmissionMetadata {
+            node_id: NodeId::new(1),
+            session,
+        },
+        QueuePolicy {
+            reconnect_grace: std::time::Duration::ZERO,
+            ..QueuePolicy::default()
+        },
+        CapacityUpdate {
+            allocated_ccu: 1,
+            revision: 1,
+        },
+    )
+    .unwrap();
+    let first = core.transport_connected().unwrap();
+    core.authenticate(first, &Credentials::new("alice"))
+        .unwrap();
+    let second = core.transport_connected().unwrap();
+    core.authenticate(second, &Credentials::new("bob")).unwrap();
+    let now = Instant::now();
+    let key = IdempotencyKey::new("same-key").unwrap();
+    let JoinDecision::Admitted(lease) = core
+        .request_session_admission_at(first, session, key.clone(), now)
+        .unwrap()
+    else {
+        panic!("admitted");
+    };
+    assert_eq!(
+        core.request_session_admission_at(first, session, key.clone(), now)
+            .unwrap(),
+        JoinDecision::Admitted(lease)
+    );
+    core.join_session_with_admission(first, session, lease)
+        .unwrap();
+    assert_eq!(
+        core.request_session_admission_at(first, session, key.clone(), now)
+            .unwrap(),
+        JoinDecision::Admitted(lease)
+    );
+    let JoinDecision::Queued(ticket) = core
+        .request_session_admission_at(second, session, key.clone(), now)
+        .unwrap()
+    else {
+        panic!("queued");
+    };
+    assert_eq!(
+        core.request_session_admission_at(second, session, key, now)
+            .unwrap(),
+        JoinDecision::Queued(ticket.clone())
+    );
+    for operation in [
+        QueueOperation::Status,
+        QueueOperation::Heartbeat,
+        QueueOperation::Cancel,
+        QueueOperation::Claim,
+    ] {
+        assert_eq!(
+            core.session_queue_at(first, session, ticket.id, operation, now)
+                .unwrap(),
+            QueueStatus::Missing
+        );
+    }
+    assert_eq!(
+        core.session_queue_at(second, session, ticket.id, QueueOperation::Heartbeat, now)
+            .unwrap(),
+        QueueStatus::Waiting { position: 1 }
+    );
+    core.transport_lost(first).unwrap();
+    assert_eq!(
+        core.session_queue_at(
+            second,
+            session,
+            ticket.id,
+            QueueOperation::Status,
+            Instant::now()
+        )
+        .unwrap(),
+        QueueStatus::Offered
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            core.session_queue_at(
+                second,
+                session,
+                ticket.id,
+                QueueOperation::Claim,
+                Instant::now()
+            )
+            .unwrap(),
+            QueueStatus::Admitted
+        );
+    }
+    assert_eq!(
+        core.apply_session_capacity_at(
+            session,
+            CapacityUpdate {
+                allocated_ccu: 1,
+                revision: 1
+            },
+            Instant::now()
+        )
+        .unwrap()
+        .active_ccu,
+        1
+    );
+    core.transport_lost(second).unwrap();
+    assert_eq!(
+        core.apply_session_capacity_at(
+            session,
+            CapacityUpdate {
+                allocated_ccu: 1,
+                revision: 1
+            },
+            Instant::now()
+        )
+        .unwrap()
+        .active_ccu,
+        0
+    );
+}
+
+#[test]
 fn transport_loss_releases_an_unjoined_admission_lease() {
     let session = session_a();
     let mut core = make_core(CoreConfig::default());

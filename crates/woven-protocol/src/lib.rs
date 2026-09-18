@@ -13,11 +13,13 @@ mod generated {
 
 pub use codec::{Codec, CodecError, CodecLimits};
 pub use model::{
-    Authenticate, Authenticated, AuthenticationScheme, Capabilities, ControlPayload, DeliveryClass,
-    EntityEntered, EntityLeaveReason, EntityLeft, Envelope, Hello, InferenceAccepted,
-    InferenceCancelled, InferenceCompleted, InferenceExpired, InferenceFailed, InferenceProgress,
-    InferenceRequested, InferenceStreamChunk, JoinSession, LeaveSession, MessageKind,
-    MessagePayload, OpaquePayload, Ping, Pong, ProtocolError, ProtocolErrorCode, SnapshotRequest,
+    AdmissionRejectionCode, AdmissionResult, AdmissionStatus, Authenticate, Authenticated,
+    AuthenticationScheme, Capabilities, ControlPayload, DeliveryClass, EntityEntered,
+    EntityLeaveReason, EntityLeft, Envelope, Hello, InferenceAccepted, InferenceCancelled,
+    InferenceCompleted, InferenceExpired, InferenceFailed, InferenceProgress, InferenceRequested,
+    InferenceStreamChunk, JoinSession, LeaveSession, MessageKind, MessagePayload, OpaquePayload,
+    Ping, Pong, ProtocolError, ProtocolErrorCode, QueueCancel, QueueClaim, QueueHeartbeat,
+    QueueState, QueueStatusRequest, QueueUpdate, RequestAdmission, SnapshotRequest,
     SpaceTransition, SubscribeSpace, SubscriptionAccepted, SubscriptionRejected,
     SubscriptionRejectionCode, ToolCallAccepted, ToolCallCompleted, ToolCallProposed,
     ToolCallRejected, ToolCallRejectionCode, UnsubscribeSpace,

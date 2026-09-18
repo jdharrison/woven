@@ -40,7 +40,14 @@ enum MessageKind : ubyte {
   ToolCallProposed = 29,
   ToolCallAccepted = 30,
   ToolCallRejected = 31,
-  ToolCallCompleted = 32
+  ToolCallCompleted = 32,
+  RequestAdmission = 33,
+  AdmissionResult = 34,
+  QueueStatusRequest = 35,
+  QueueHeartbeat = 36,
+  QueueClaim = 37,
+  QueueCancel = 38,
+  QueueUpdate = 39
 }
 
 enum DeliveryClass : ubyte {
@@ -247,6 +254,32 @@ table ToolCallCompletedPayload {
   result:[ubyte];
 }
 
+enum AdmissionStatus : ubyte { Unknown = 0, Admitted = 1, Queued = 2, Paused = 3, Rejected = 4 }
+enum AdmissionRejectionCode : ubyte { None = 0, ServerPaused = 1, QueueFull = 2, QueueDisabled = 3, AlreadyQueued = 4, InvalidIdempotencyKey = 5 }
+enum QueueState : ubyte { Unknown = 0, Waiting = 1, Offered = 2, Admitted = 3, Cancelled = 4, Expired = 5, Missing = 6 }
+
+// Scope and correlation are exclusively envelope-bound. Never expose leases/resume tokens.
+table RequestAdmissionPayload { idempotency_key:string; }
+table AdmissionResultPayload {
+  status:AdmissionStatus;
+  rejection_code:AdmissionRejectionCode;
+  ticket_id:ulong;
+  poll_after_ms:uint;
+  ticket_remaining_ms:uint;
+}
+table QueueStatusRequestPayload { ticket_id:ulong; }
+table QueueHeartbeatPayload { ticket_id:ulong; }
+table QueueClaimPayload { ticket_id:ulong; }
+table QueueCancelPayload { ticket_id:ulong; }
+table QueueUpdatePayload {
+  ticket_id:ulong;
+  state:QueueState;
+  position:uint;
+  poll_after_ms:uint;
+  ticket_remaining_ms:uint;
+  offer_remaining_ms:uint;
+}
+
 // ControlPayload is used only by the typed control messages. EntityState,
 // ReliableEvent, and Snapshot carry their application-defined bytes in
 // Envelope.payload with a non-zero payload_type_id.
@@ -279,7 +312,14 @@ union ControlPayload {
   ToolCallProposedPayload = 26,
   ToolCallAcceptedPayload = 27,
   ToolCallRejectedPayload = 28,
-  ToolCallCompletedPayload = 29
+  ToolCallCompletedPayload = 29,
+  RequestAdmissionPayload = 30,
+  AdmissionResultPayload = 31,
+  QueueStatusRequestPayload = 32,
+  QueueHeartbeatPayload = 33,
+  QueueClaimPayload = 34,
+  QueueCancelPayload = 35,
+  QueueUpdatePayload = 36
 }
 
 table Envelope {

@@ -2,6 +2,9 @@
 
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
+export { AdmissionRejectionCode } from './v1/admission-rejection-code.js';
+export { AdmissionResultPayload } from './v1/admission-result-payload.js';
+export { AdmissionStatus } from './v1/admission-status.js';
 export { AuthenticatePayload } from './v1/authenticate-payload.js';
 export { AuthenticatedPayload } from './v1/authenticated-payload.js';
 export { AuthenticationScheme } from './v1/authentication-scheme.js';
@@ -28,6 +31,13 @@ export { PingPayload } from './v1/ping-payload.js';
 export { PongPayload } from './v1/pong-payload.js';
 export { ProtocolErrorCode } from './v1/protocol-error-code.js';
 export { ProtocolErrorPayload } from './v1/protocol-error-payload.js';
+export { QueueCancelPayload } from './v1/queue-cancel-payload.js';
+export { QueueClaimPayload } from './v1/queue-claim-payload.js';
+export { QueueHeartbeatPayload } from './v1/queue-heartbeat-payload.js';
+export { QueueState } from './v1/queue-state.js';
+export { QueueStatusRequestPayload } from './v1/queue-status-request-payload.js';
+export { QueueUpdatePayload } from './v1/queue-update-payload.js';
+export { RequestAdmissionPayload } from './v1/request-admission-payload.js';
 export { SnapshotRequestPayload } from './v1/snapshot-request-payload.js';
 export { SpaceTransitionPayload } from './v1/space-transition-payload.js';
 export { SubscribeSpacePayload } from './v1/subscribe-space-payload.js';

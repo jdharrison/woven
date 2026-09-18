@@ -1,0 +1,10 @@
+message_kind=QueueUpdate
+namespace_id=1
+session_id=2
+correlation_id=3
+ticket_id=18446744073709551615
+state=Offered
+position=0
+poll_after_ms=1000
+ticket_remaining_ms=120000
+offer_remaining_ms=30000

@@ -35,5 +35,12 @@ export enum MessageKind {
   ToolCallProposed = 29,
   ToolCallAccepted = 30,
   ToolCallRejected = 31,
-  ToolCallCompleted = 32
+  ToolCallCompleted = 32,
+  RequestAdmission = 33,
+  AdmissionResult = 34,
+  QueueStatusRequest = 35,
+  QueueHeartbeat = 36,
+  QueueClaim = 37,
+  QueueCancel = 38,
+  QueueUpdate = 39
 }

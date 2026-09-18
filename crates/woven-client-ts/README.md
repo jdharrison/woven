@@ -5,6 +5,20 @@ The browser client for Woven, generated FlatBuffers bindings plus a real
 API. Per ADR 0014, browsers connect over **WebTransport** (QUIC over HTTPS/HTTP-3),
 so this is the full native client path for web runtimes — not just a codec.
 
+## Managed admission compatibility
+
+Generated WVN1 bindings include RequestAdmission, AdmissionResult, QueueStatusRequest,
+QueueHeartbeat, QueueClaim, QueueCancel, and QueueUpdate. `EnvelopeCodec` parses them
+and validates managed scope, correlation, union/kind matching, IDs and result fields.
+Tickets remain `bigint`; polling advice and remaining lifetimes are numbers in ms.
+Zero remaining lifetime means unavailable, not a fresh TTL. Public exports include
+managed payload classes and AdmissionStatus/AdmissionRejectionCode/QueueState enums.
+
+This is **wire codec compatibility only**: no managed browser WebTransport composition,
+queue runner, or remote managed browser support is provided. Do not infer a managed
+WebTransport endpoint from a Host-provided native QUIC endpoint. The Rust native
+client owns this slice's managed connection/admission API.
+
 ## What's here
 
 - `generated/` — flatc `--ts` output. Regenerate after any schema change (see below).

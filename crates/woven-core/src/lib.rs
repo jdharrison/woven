@@ -14,8 +14,9 @@ mod worker;
 
 pub use admission::{
     AdmissionController, AdmissionLease, AdmissionMetadata, AdmissionSnapshot, CancelResult,
-    CapacityUpdate, ClaimError, IdempotencyKey, JoinDecision, JoinRequest, QueuePolicy,
-    QueueStatus, QueueTicket, QueueTicketId, RejectionReason, ReleaseReason, ResumeToken,
+    CapacityUpdate, ClaimError, IdempotencyKey, JoinDecision, JoinRequest, QueueOperation,
+    QueuePolicy, QueueStatus, QueueTicket, QueueTicketId, RejectionReason, ReleaseReason,
+    ResumeToken,
 };
 pub use auth::{
     AccessGrant, AuthError, AuthenticatedPrincipal, Authenticator, AuthorizationGrants,
@@ -26,6 +27,9 @@ pub use authority::{
     AuthorityTransform, ChannelDefinition, ProposedMessage, RelayOwned,
 };
 pub use cache::{CacheEntry, CacheError, CacheKey, CacheService, InMemoryCacheService};
+pub use core::managed::{
+    ManagedAdmissionSnapshot, ManagedError, ManagedOutcome, ManagedRequest, ManagedSnapshot,
+};
 pub use core::{
     CleanupSummary, CoreConfig, CoreError, EntityTransition, EntityTransitionRequest, IdKind,
     PublishOutcome, PublishRateLimit, PublishRequest, QueueActivity, RemovedEntity, WovenCore,

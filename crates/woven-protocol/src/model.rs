@@ -58,6 +58,13 @@ numeric_enum!(MessageKind, u8, {
     ToolCallAccepted = 30,
     ToolCallRejected = 31,
     ToolCallCompleted = 32,
+    RequestAdmission = 33,
+    AdmissionResult = 34,
+    QueueStatusRequest = 35,
+    QueueHeartbeat = 36,
+    QueueClaim = 37,
+    QueueCancel = 38,
+    QueueUpdate = 39,
 });
 
 numeric_enum!(DeliveryClass, u8, {
@@ -299,6 +306,13 @@ pub struct ToolCallCompleted {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlPayload {
+    RequestAdmission(RequestAdmission),
+    AdmissionResult(AdmissionResult),
+    QueueStatusRequest(QueueStatusRequest),
+    QueueHeartbeat(QueueHeartbeat),
+    QueueClaim(QueueClaim),
+    QueueCancel(QueueCancel),
+    QueueUpdate(QueueUpdate),
     Hello(Hello),
     Capabilities(Capabilities),
     Authenticate(Authenticate),
@@ -334,6 +348,13 @@ impl ControlPayload {
     #[must_use]
     pub const fn message_kind(&self) -> MessageKind {
         match self {
+            Self::RequestAdmission(_) => MessageKind::RequestAdmission,
+            Self::AdmissionResult(_) => MessageKind::AdmissionResult,
+            Self::QueueStatusRequest(_) => MessageKind::QueueStatusRequest,
+            Self::QueueHeartbeat(_) => MessageKind::QueueHeartbeat,
+            Self::QueueClaim(_) => MessageKind::QueueClaim,
+            Self::QueueCancel(_) => MessageKind::QueueCancel,
+            Self::QueueUpdate(_) => MessageKind::QueueUpdate,
             Self::Hello(_) => MessageKind::Hello,
             Self::Capabilities(_) => MessageKind::Capabilities,
             Self::Authenticate(_) => MessageKind::Authenticate,
@@ -376,6 +397,8 @@ impl ControlPayload {
                 .server_name
                 .len()
                 .saturating_add(value.server_version.len()),
+            Self::RequestAdmission(value) => value.idempotency_key.len(),
+
             Self::Authenticate(value) => value.credentials.len(),
             Self::JoinSession(value) => value.resume_token.len(),
             Self::LeaveSession(value) => value.reason.len(),
@@ -395,7 +418,13 @@ impl ControlPayload {
             Self::ToolCallAccepted(value) => value.tool_id.len(),
             Self::ToolCallRejected(value) => value.reason.len(),
             Self::ToolCallCompleted(value) => value.result.len(),
-            Self::Authenticated(_)
+            Self::AdmissionResult(_)
+            | Self::QueueStatusRequest(_)
+            | Self::QueueHeartbeat(_)
+            | Self::QueueClaim(_)
+            | Self::QueueCancel(_)
+            | Self::QueueUpdate(_)
+            | Self::Authenticated(_)
             | Self::SubscribeSpace(_)
             | Self::UnsubscribeSpace(_)
             | Self::SubscriptionAccepted(_)
@@ -409,6 +438,65 @@ impl ControlPayload {
             | Self::InferenceProgress(_) => 0,
         }
     }
+}
+
+numeric_enum!(AdmissionStatus, u8, {
+    Unknown = 0, Admitted = 1, Queued = 2, Paused = 3, Rejected = 4,
+});
+numeric_enum!(AdmissionRejectionCode, u8, {
+    None = 0, ServerPaused = 1, QueueFull = 2, QueueDisabled = 3,
+    AlreadyQueued = 4, InvalidIdempotencyKey = 5,
+});
+numeric_enum!(QueueState, u8, {
+    Unknown = 0, Waiting = 1, Offered = 2, Admitted = 3,
+    Cancelled = 4, Expired = 5, Missing = 6,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestAdmission {
+    pub idempotency_key: String,
+}
+
+/// Sanitized result: admitted means the worker has already joined the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionResult {
+    pub status: AdmissionStatus,
+    pub rejection_code: AdmissionRejectionCode,
+    pub ticket_id: Option<u64>,
+    /// Advisory only; never a permit or a promise of capacity.
+    pub poll_after_ms: u32,
+    /// Zero means unavailable; never synthesize a lifetime from configured TTL.
+    pub ticket_remaining_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueStatusRequest {
+    pub ticket_id: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueHeartbeat {
+    pub ticket_id: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueClaim {
+    pub ticket_id: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueCancel {
+    pub ticket_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueUpdate {
+    pub ticket_id: u64,
+    pub state: QueueState,
+    /// One-based, present only while waiting.
+    pub position: u32,
+    pub poll_after_ms: u32,
+    /// Zero means unavailable.
+    pub ticket_remaining_ms: u32,
+    /// Zero means unavailable.
+    pub offer_remaining_ms: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

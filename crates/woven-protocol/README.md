@@ -2,6 +2,61 @@
 
 This crate defines the transport-neutral Woven Protocol v1 envelope, typed control messages, bounded size-prefixed framing, safe owned Rust representations, and conformance fixtures. A transport adapter supplies and consumes complete frames; this crate does not depend on WebSocket, QUIC, WebTransport, or `woven-core` internals.
 
+## Managed admission wire slice
+
+Additive WVN1 controls (Rust variant and struct names match):
+
+| ControlPayload | MessageKind | Union tag | Rust fields |
+|---|---:|---:|---|
+| `RequestAdmission` | 33 | 30 | `idempotency_key: String` |
+| `AdmissionResult` | 34 | 31 | `status: AdmissionStatus`, `rejection_code: AdmissionRejectionCode`, `ticket_id: Option<u64>`, `poll_after_ms: u32`, `ticket_remaining_ms: u32` |
+| `QueueStatusRequest` | 35 | 32 | `ticket_id: u64` |
+| `QueueHeartbeat` | 36 | 33 | `ticket_id: u64` |
+| `QueueClaim` | 37 | 34 | `ticket_id: u64` |
+| `QueueCancel` | 38 | 35 | `ticket_id: u64` |
+| `QueueUpdate` | 39 | 36 | `ticket_id: u64`, `state: QueueState`, `position: u32`, `poll_after_ms: u32`, `ticket_remaining_ms: u32`, `offer_remaining_ms: u32` |
+
+Enums (u8):
+- `AdmissionStatus`: Unknown=0, Admitted=1, Queued=2, Paused=3, Rejected=4.
+- `AdmissionRejectionCode`: None=0, ServerPaused=1, QueueFull=2, QueueDisabled=3,
+  AlreadyQueued=4, InvalidIdempotencyKey=5.
+- `QueueState`: Unknown=0, Waiting=1, Offered=2, Admitted=3, Cancelled=4, Expired=5, Missing=6.
+
+All seven controls require ReliableOrdered, nonzero namespace/session and correlation
+in the envelope, and no space/channel/entity/epoch scope or domain payload. Replies
+must echo request scope/correlation; the bridge must bind them to authenticated
+connection scope. Ticket IDs are nonzero u64 (TS bigint). Keys are 1–256 UTF-8 bytes.
+No lease, principal, resume token, or client-controlled lifetime is present.
+
+Only Queued admission results carry a ticket; only Rejected carries a non-None
+rejection. Waiting positions are one-based; all other positions are zero. Poll advice
+is 0–30,000 ms and is nonzero only for Queued/Paused admissions or Waiting/Offered
+updates. Ticket lifetime is at most 900,000 ms, offer lifetime at most 30,000 ms;
+zero means **unavailable**, not an invented fresh TTL. Lifetimes are absent (zero)
+on terminal results; offer lifetime is only valid for Offered. Transport should
+emit actual remaining lifetimes only when the worker provides them. Recommended
+poll advice is 1,000 ms. Unknown result states and inconsistent fields are rejected.
+
+The implemented `woven-transport` bridge routes RequestAdmission to the
+connection-bound worker admission API and sends Admitted only after atomic lease
+binding/join; no second JoinSessionWithAdmission command is needed. Queue operations
+invoke SessionQueue; Claim also joins atomically in core. The bridge sanitizes
+JoinDecision/QueueStatus into wire results without serializing core lease/ticket
+structs. Foreign/nonexistent tickets both map to Missing. Authentication/scope/rate
+failures use correlated ProtocolError replies and close the connection, rather than
+fabricating admission outcomes. Ordinary JoinSession remains for unmanaged sessions
+and cannot bypass managed admission.
+
+Regenerate the additive golden with `cargo run -p woven-protocol --example
+write_managed_fixture`. The protocol crate remains transport-neutral; the managed
+node composition, bridge, and native client are implemented in their respective
+crates and covered by `woven-server/tests/managed_quic.rs`. The real Host-to-managed-
+node E2E in `woven-server/tests/host_managed_local.rs` has also passed via
+`npm run test:local` from the sibling `../woven-host` checkout (relative to
+Woven's root). It exercises Host HTTP APIs and TLS-verified native QUIC with isolated
+Firebase Auth/Firestore emulators on loopback, not cloud or browser validation.
+This cross-repository test is ignored by ordinary Cargo runs.
+
 ## Wire format
 
 The canonical schema is `schemas/woven_v1.fbs`. It uses the `WVN1` FlatBuffers file identifier and a four-byte little-endian FlatBuffers size prefix. The prefix is the byte count after the prefix; `CodecLimits::max_frame_len` counts the complete frame, including those four bytes.

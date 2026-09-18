@@ -205,6 +205,9 @@ pub enum CoreError {
     AuthorityEmissionLimitExceeded,
     JournalOutboxSaturated,
     IdExhausted,
+    AdmissionRateLimited {
+        retry_after: Duration,
+    },
     AdmissionAlreadyConfigured(SessionKey),
     AdmissionLeaseRequired(SessionKey),
     InvalidAdmissionLease(SessionKey),
@@ -481,7 +484,11 @@ impl AuthorizedMessage {
     }
 }
 
+#[path = "managed.rs"]
+pub mod managed;
+
 pub struct WovenCore<A> {
+    managed: Option<managed::ManagedState>,
     authenticator: A,
     config: CoreConfig,
     next_connection_id: u64,
@@ -491,6 +498,7 @@ pub struct WovenCore<A> {
     channels: BTreeMap<ChannelId, ChannelDefinition>,
     admissions: BTreeMap<SessionKey, AdmissionController>,
     pending_admissions: BTreeMap<(ConnectionId, SessionKey), AdmissionLease>,
+    admission_tickets: BTreeMap<(ConnectionId, SessionKey), crate::QueueTicket>,
     admission_leases: BTreeMap<(ConnectionId, SessionKey), AdmissionLease>,
     journal_outbox: JournalOutbox,
 }
@@ -499,6 +507,7 @@ impl<A: Authenticator> WovenCore<A> {
     pub fn new(authenticator: A, config: CoreConfig) -> Result<Self, CoreError> {
         let config = config.validate()?;
         Ok(Self {
+            managed: None,
             authenticator,
             config,
             next_connection_id: 1,
@@ -508,6 +517,7 @@ impl<A: Authenticator> WovenCore<A> {
             channels: BTreeMap::new(),
             admissions: BTreeMap::new(),
             pending_admissions: BTreeMap::new(),
+            admission_tickets: BTreeMap::new(),
             admission_leases: BTreeMap::new(),
             journal_outbox: JournalOutbox::new(config.journal_outbox_capacity),
         })
@@ -591,6 +601,7 @@ impl<A: Authenticator> WovenCore<A> {
         idempotency_key: IdempotencyKey,
         now: Instant,
     ) -> Result<JoinDecision, CoreError> {
+        self.check_managed_admission_rate_at(connection, now)?;
         validate_connection_id(connection)?;
         validate_session_key(session_key)?;
         let principal = self.authenticated_principal(connection)?;
@@ -600,6 +611,31 @@ impl<A: Authenticator> WovenCore<A> {
             .admissions
             .get_mut(&session_key)
             .ok_or(CoreError::AdmissionLeaseRequired(session_key))?;
+        if let Some(lease) = self
+            .admission_leases
+            .get(&(connection, session_key))
+            .or_else(|| self.pending_admissions.get(&(connection, session_key)))
+        {
+            return Ok(JoinDecision::Admitted(*lease));
+        }
+        if let Some(ticket) = self.admission_tickets.get(&(connection, session_key)) {
+            return Ok(JoinDecision::Queued(ticket.clone()));
+        }
+        if self
+            .admission_tickets
+            .keys()
+            .filter(|(id, _)| *id == connection)
+            .count()
+            + self
+                .pending_admissions
+                .keys()
+                .filter(|(id, _)| *id == connection)
+                .count()
+            + self.connections[&connection].memberships.len()
+            >= self.config.max_memberships_per_connection
+        {
+            return Err(CoreError::InvalidAdmissionLease(session_key));
+        }
         let decision = controller.request_join_at(
             crate::JoinRequest::new(principal.principal_id, idempotency_key),
             now,
@@ -609,7 +645,83 @@ impl<A: Authenticator> WovenCore<A> {
                 .insert((connection, session_key), lease);
             Ok(JoinDecision::Admitted(lease))
         } else {
+            if let JoinDecision::Queued(ticket) = &decision {
+                if self
+                    .admission_tickets
+                    .iter()
+                    .any(|((owner, scope), existing)| {
+                        *owner != connection && *scope == session_key && existing.id == ticket.id
+                    })
+                {
+                    return Err(CoreError::InvalidAdmissionLease(session_key));
+                }
+                self.admission_tickets
+                    .insert((connection, session_key), ticket.clone());
+            }
             Ok(decision)
+        }
+    }
+
+    /// Connection-bound queue operations. A foreign ticket is indistinguishable from a missing one.
+    pub fn session_queue_at(
+        &mut self,
+        connection: ConnectionId,
+        session: SessionKey,
+        ticket: crate::QueueTicketId,
+        operation: crate::QueueOperation,
+        now: Instant,
+    ) -> Result<crate::QueueStatus, CoreError> {
+        self.check_managed_admission_rate_at(connection, now)?;
+        let principal = self.authenticated_principal(connection)?;
+        require_namespace_read(&principal, session.namespace)?;
+        require_session_read(&principal, session)?;
+        if self
+            .admission_tickets
+            .get(&(connection, session))
+            .is_none_or(|owned| owned.id != ticket)
+        {
+            return Ok(crate::QueueStatus::Missing);
+        }
+        let controller = self
+            .admissions
+            .get_mut(&session)
+            .ok_or(CoreError::AdmissionLeaseRequired(session))?;
+        if !controller.ticket_owned_by(ticket, principal.principal_id) {
+            return Ok(crate::QueueStatus::Missing);
+        }
+        match operation {
+            crate::QueueOperation::Status => Ok(controller.queue_status_at(ticket, now)),
+            crate::QueueOperation::Heartbeat => Ok(controller.heartbeat_at(ticket, now)),
+            crate::QueueOperation::Cancel => {
+                controller.cancel_at(ticket, now);
+                Ok(controller.queue_status_at(ticket, now))
+            }
+            crate::QueueOperation::Claim => {
+                if let Ok(lease) = controller.claim_offer_at(ticket, now) {
+                    self.pending_admissions.insert((connection, session), lease);
+                    if let Err(error) = self.join_session_with_admission(connection, session, lease)
+                    {
+                        self.pending_admissions.remove(&(connection, session));
+                        self.admissions
+                            .get_mut(&session)
+                            .ok_or(CoreError::AdmissionLeaseRequired(session))?
+                            .release_at(lease, crate::ReleaseReason::Intentional, now);
+                        return Err(error);
+                    }
+                }
+                Ok(self
+                    .admissions
+                    .get_mut(&session)
+                    .ok_or(CoreError::AdmissionLeaseRequired(session))?
+                    .queue_status_at(ticket, now))
+            }
+        }
+    }
+
+    /// Maintains all configured admission controllers on the owning worker.
+    pub fn maintain_admission_at(&mut self, now: Instant) {
+        for controller in self.admissions.values_mut() {
+            controller.maintain_at(now);
         }
     }
 
@@ -768,10 +880,15 @@ impl<A: Authenticator> WovenCore<A> {
         if state.authenticated.is_some() {
             return Err(CoreError::AlreadyAuthenticated);
         }
-        let principal = self
-            .authenticator
-            .authenticate(credentials)
-            .map_err(CoreError::AuthenticationFailed)?;
+        let principal = if let Some(managed) = &mut self.managed {
+            managed
+                .authenticate(connection, credentials)
+                .map_err(CoreError::AuthenticationFailed)?
+        } else {
+            self.authenticator
+                .authenticate(credentials)
+                .map_err(CoreError::AuthenticationFailed)?
+        };
         require_nonzero(principal.principal_id.get(), IdKind::Principal)?;
         let principal_id = principal.principal_id;
         self.connections
@@ -876,6 +993,7 @@ impl<A: Authenticator> WovenCore<A> {
         validate_session_key(key)?;
         self.require_membership(connection, key)?;
         self.release_session_admission(connection, key, crate::ReleaseReason::Intentional);
+        self.admission_tickets.remove(&(connection, key));
         Ok(self.detach_connection_from_session(connection, key))
     }
 
@@ -1764,11 +1882,24 @@ impl<A: Authenticator> WovenCore<A> {
                 controller.release_at(lease, crate::ReleaseReason::Intentional, Instant::now());
             }
         }
+        self.admission_tickets.retain(|(owner, session), ticket| {
+            if *owner != connection {
+                return true;
+            }
+            if let Some(controller) = self.admissions.get_mut(session) {
+                controller.cancel_at(ticket.id, Instant::now());
+            }
+            false
+        });
         let state = self
             .connections
             .remove(&connection)
             .ok_or(CoreError::UnknownConnection(connection))?;
         summary.queued_messages_discarded += state.outbound.len();
+        if let Some(managed) = &mut self.managed {
+            managed.connections.remove(&connection);
+            managed.operations.remove(&connection);
+        }
         Ok(summary)
     }
 

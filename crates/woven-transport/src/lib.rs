@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod admission;
 mod metrics;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +53,10 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 enum WorkerRequest {
+    Managed {
+        request: woven_core::ManagedRequest,
+        reply: oneshot::Sender<Result<woven_core::ManagedOutcome, woven_core::ManagedError>>,
+    },
     Command {
         command: Command,
         reply: oneshot::Sender<Result<CommandResult, CoreError>>,
@@ -136,6 +141,21 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Trusted management operations share the bounded mailbox with native client commands.
+    pub async fn manage(
+        &self,
+        request: woven_core::ManagedRequest,
+    ) -> Result<woven_core::ManagedOutcome, woven_core::ManagedError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::Managed { request, reply })
+            .await
+            .map_err(|_| woven_core::ManagedError::WorkerUnavailable)?;
+        receive
+            .await
+            .map_err(|_| woven_core::ManagedError::WorkerUnavailable)?
+    }
+
     /// Always-on cumulative counters for capacity and cost observability.
     #[must_use]
     pub fn metrics(&self) -> &ServerMetrics {
@@ -281,8 +301,10 @@ where
     let (sender, mut receiver) = mpsc::channel::<WorkerRequest>(COMMAND_CAPACITY);
     tokio::spawn(async move {
         let mut worker = worker;
-        let mut recipients = BTreeMap::new();
+        let mut recipients: BTreeMap<ConnectionId, LifecycleRecipient> = BTreeMap::new();
         let mut subscriptions = BTreeMap::new();
+        let mut admission_interval = tokio::time::interval(Duration::from_millis(100));
+        admission_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sweep_interval = tokio::time::interval(STATE_SWEEP_INTERVAL);
         sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -291,6 +313,10 @@ where
                     Some(request) => request,
                     None => break,
                 },
+                _ = admission_interval.tick() => {
+                    worker.core_mut().maintain_admission_at(Instant::now());
+                    continue;
+                }
                 _ = sweep_interval.tick() => {
                     let evicted = worker.core_mut().sweep_expired_state(Instant::now());
                     if evicted > 0 {
@@ -304,6 +330,18 @@ where
                 }
             };
             match request {
+                WorkerRequest::Managed { request, reply } => {
+                    let result = worker.core_mut().manage_at(request, Instant::now());
+                    if let Ok(woven_core::ManagedOutcome::Deleted { connections }) = &result {
+                        for connection in connections {
+                            if let Some(recipient) = recipients.remove(connection) {
+                                let _ = recipient.shutdown.try_send(());
+                            }
+                            subscriptions.remove(connection);
+                        }
+                    }
+                    let _ = reply.send(result);
+                }
                 WorkerRequest::Command { command, reply } => {
                     #[cfg(debug_assertions)]
                     let activity = log_development_activity(&command);
@@ -341,6 +379,10 @@ where
                         activity = "register_lifecycle",
                         connection_id = connection.get(),
                     );
+                    if !worker.core().is_connected(connection) {
+                        let _ = recipient.shutdown.try_send(());
+                        continue;
+                    }
                     recipients.insert(connection, recipient);
                     subscriptions
                         .entry(connection)
@@ -488,6 +530,11 @@ fn log_development_activity(command: &Command) -> &'static str {
             "join_session"
         }
         Command::RequestSessionAdmission {
+            connection,
+            session,
+            ..
+        }
+        | Command::SessionQueue {
             connection,
             session,
             ..
@@ -870,6 +917,7 @@ fn lifecycle_action(command: &Command) -> LifecycleAction {
         | Command::Authenticate { .. }
         | Command::JoinSession { .. }
         | Command::RequestSessionAdmission { .. }
+        | Command::SessionQueue { .. }
         | Command::JoinSessionWithAdmission { .. }
         | Command::UpdateEntityPosition { .. }
         | Command::Publish(_)
@@ -1192,6 +1240,18 @@ pub async fn handle_authenticated(
         namespace: NamespaceId::new(envelope.namespace_id),
         session: SessionId::new(envelope.session_id),
     };
+    if matches!(
+        envelope.message_kind(),
+        MessageKind::RequestAdmission
+            | MessageKind::AdmissionResult
+            | MessageKind::QueueStatusRequest
+            | MessageKind::QueueHeartbeat
+            | MessageKind::QueueClaim
+            | MessageKind::QueueCancel
+            | MessageKind::QueueUpdate
+    ) {
+        return admission::handle(worker, connection, envelope, write_sender).await;
+    }
     let space = SpaceKey {
         session,
         space: SpaceId::new(envelope.space_id),
@@ -1470,11 +1530,16 @@ pub fn core_error_code(error: &CoreError) -> ProtocolErrorCode {
         | CoreError::SpaceWriteAccessDenied(_)
         | CoreError::ChannelWriteAccessDenied(_)
         | CoreError::EntityNotOwned(_)
-        | CoreError::AuthorityRejected(_) => ProtocolErrorCode::Unauthorized,
+        | CoreError::AuthorityRejected(_)
+        | CoreError::AdmissionLeaseRequired(_)
+        | CoreError::InvalidAdmissionLease(_) => ProtocolErrorCode::Unauthorized,
+        CoreError::SessionNotFound(_) => ProtocolErrorCode::InvalidScope,
         CoreError::SpaceEpochMismatch { .. } => ProtocolErrorCode::StaleEpoch,
         CoreError::StaleSequence { .. } => ProtocolErrorCode::SequenceRejected,
         CoreError::PayloadTooLarge { .. } => ProtocolErrorCode::PayloadTooLarge,
-        CoreError::PublishRateLimited { .. } => ProtocolErrorCode::RateLimited,
+        CoreError::PublishRateLimited { .. } | CoreError::AdmissionRateLimited { .. } => {
+            ProtocolErrorCode::RateLimited
+        }
         _ => ProtocolErrorCode::Internal,
     }
 }

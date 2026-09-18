@@ -10,7 +10,9 @@
 
 #![deny(unsafe_code)]
 
+mod admission;
 mod transform;
+pub use admission::ManagedAdmissionOutcome;
 
 pub use transform::Transform;
 
@@ -42,7 +44,8 @@ pub struct ClientConfig {
     /// - `quic://host:port` for native QUIC
     /// - `wtransport://host:port/path` for WebTransport
     pub url: String,
-    /// Bearer token sent to the server during the `Authenticate` handshake step.
+    /// Credential sent during `Authenticate`. Existing connect methods use Development;
+    /// `connect_with_tls_and_auth` permits explicit Bearer authentication.
     pub token: String,
     /// Maximum frame size advertised in `Hello` (bytes). Default: 65536.
     pub max_frame_bytes: u32,
@@ -402,7 +405,7 @@ impl Client {
     /// WebTransport. Use [`Self::connect_with_tls`] for verified native QUIC.
     /// The complete handshake is bounded to ten seconds.
     pub async fn connect(config: ClientConfig) -> Result<Self, ClientError> {
-        Self::connect_inner(config, None).await
+        Self::connect_inner(config, None, AuthenticationScheme::Development).await
     }
 
     /// Connect over native QUIC with verified TLS, including on loopback.
@@ -412,16 +415,32 @@ impl Client {
         config: ClientConfig,
         tls: ClientTlsConfig,
     ) -> Result<Self, ClientError> {
-        Self::connect_inner(config, Some(tls)).await
+        Self::connect_inner(config, Some(tls), AuthenticationScheme::Development).await
+    }
+
+    /// Verified native QUIC with an explicit WVN1 authentication scheme.
+    /// Bearer is an opaque Host-supplied credential, not a JWT contract.
+    pub async fn connect_with_tls_and_auth(
+        config: ClientConfig,
+        tls: ClientTlsConfig,
+        scheme: AuthenticationScheme,
+    ) -> Result<Self, ClientError> {
+        if scheme == AuthenticationScheme::Unknown {
+            return Err(ClientError::HandshakeFailed(
+                "authentication scheme must be explicit".to_owned(),
+            ));
+        }
+        Self::connect_inner(config, Some(tls), scheme).await
     }
 
     async fn connect_inner(
         config: ClientConfig,
         tls: Option<ClientTlsConfig>,
+        auth_scheme: AuthenticationScheme,
     ) -> Result<Self, ClientError> {
         tokio::time::timeout(
             Duration::from_secs(10),
-            Self::connect_handshake(config, tls),
+            Self::connect_handshake(config, tls, auth_scheme),
         )
         .await
         .map_err(|_| ClientError::Transport("connection handshake timed out".to_owned()))?
@@ -431,6 +450,7 @@ impl Client {
     async fn connect_handshake(
         config: ClientConfig,
         tls: Option<ClientTlsConfig>,
+        auth_scheme: AuthenticationScheme,
     ) -> Result<Self, ClientError> {
         debug!("connecting to woven server");
 
@@ -554,7 +574,7 @@ impl Client {
                 sender_sequence: 0,
                 correlation_id: None,
                 message: MessagePayload::Control(ControlPayload::Authenticate(Authenticate {
-                    scheme: AuthenticationScheme::Development,
+                    scheme: auth_scheme,
                     credentials: config.token.into_bytes(),
                 })),
             })
@@ -580,7 +600,8 @@ impl Client {
         Ok(client)
     }
 
-    /// Send a `JoinSession` control envelope.
+    /// Send a legacy `JoinSession` control envelope for an unmanaged session.
+    /// Managed nodes must reject this path; use `request_admission` instead.
     pub async fn join_session(
         &mut self,
         namespace_id: u64,

@@ -24,6 +24,12 @@ pub enum Command {
         session: SessionKey,
         idempotency_key: IdempotencyKey,
     },
+    SessionQueue {
+        connection: ConnectionId,
+        session: SessionKey,
+        ticket: crate::QueueTicketId,
+        operation: crate::QueueOperation,
+    },
     JoinSessionWithAdmission {
         connection: ConnectionId,
         session: SessionKey,
@@ -77,6 +83,7 @@ pub enum CommandResult {
     Authenticated(PrincipalId),
     Joined,
     Admission(JoinDecision),
+    Queue(crate::QueueStatus),
     Left(CleanupSummary),
     Subscribed,
     Unsubscribed(CleanupSummary),
@@ -110,6 +117,10 @@ impl<A: Authenticator> TransportIndependentWorker<A> {
         &mut self.core
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive dispatch arm per worker command"
+    )]
     pub fn handle(&mut self, command: Command) -> Result<CommandResult, CoreError> {
         match command {
             Command::TransportConnected => self
@@ -136,8 +147,17 @@ impl<A: Authenticator> TransportIndependentWorker<A> {
                 idempotency_key,
             } => self
                 .core
-                .request_session_admission_at(connection, session, idempotency_key, Instant::now())
+                .admit_and_join_session_at(connection, session, idempotency_key, Instant::now())
                 .map(CommandResult::Admission),
+            Command::SessionQueue {
+                connection,
+                session,
+                ticket,
+                operation,
+            } => self
+                .core
+                .session_queue_at(connection, session, ticket, operation, Instant::now())
+                .map(CommandResult::Queue),
             Command::JoinSessionWithAdmission {
                 connection,
                 session,

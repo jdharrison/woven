@@ -5,6 +5,12 @@ export {
 } from "./client.js";
 export { EnvelopeCodec, CodecError, PROTOCOL_VERSION, FILE_IDENTIFIER } from "./codec.js";
 export type { DecodedEnvelope } from "./codec.js";
+// Managed wire compatibility only; no managed WebTransport composition is supported.
+export {
+  RequestAdmissionPayload, AdmissionResultPayload, AdmissionStatus, AdmissionRejectionCode,
+  QueueStatusRequestPayload, QueueHeartbeatPayload, QueueClaimPayload, QueueCancelPayload,
+  QueueUpdatePayload, QueueState,
+} from "../generated/woven/protocol/v1.js";
 export {
   encodeHello,
   encodeAuthenticate,

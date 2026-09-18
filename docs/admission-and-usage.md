@@ -6,6 +6,10 @@ machine, and how a Weaver client is expected to interact with these features.
 
 ## Scope
 
+For the proposed authenticated management and native QUIC integration boundary, see
+[Managed sessions](managed-sessions.md). That contract is design-only; the HTTP routes
+below remain an unmounted test adapter, not a supported client admission API.
+
 Everything in this document is implemented in `woven-core` and exposed through a thin
 development HTTP adapter in `woven-server`. The following are intentionally **not**
 implemented in this milestone:

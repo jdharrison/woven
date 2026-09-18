@@ -69,7 +69,7 @@ export class WovenClient {
   readonly transport: WebTransport;
   readonly stream: WebTransportBidirectionalStream;
   private readonly codec = new EnvelopeCodec();
-  private inBuffer = new Uint8Array(0);
+  private inBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private pending: DecodedEnvelope[] = [];
   private closed = false;
 

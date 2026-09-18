@@ -2,7 +2,9 @@
 
 use std::process::ExitCode;
 
-use woven_server::{RemoteServerConfig, ServerConfig, serve, serve_remote};
+use woven_server::{
+    ManagedServerConfig, RemoteServerConfig, ServerConfig, serve, serve_managed, serve_remote,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivityLogMode {
@@ -63,16 +65,26 @@ async fn main() -> ExitCode {
     }
 
     init_logging(activity_log_mode);
-    let result = match RemoteServerConfig::from_env() {
+    let result = match ManagedServerConfig::from_env() {
         Ok(Some(config)) => {
             if activity_log_mode != ActivityLogMode::None {
-                eprintln!("Remote mode does not permit development activity logging.");
+                eprintln!("Managed mode does not permit development activity logging.");
                 return ExitCode::FAILURE;
             }
-            serve_remote(config).await
+            serve_managed(config).await
         }
-        Ok(None) => serve(ServerConfig::default()).await,
         Err(error) => Err(error),
+        Ok(None) => match RemoteServerConfig::from_env() {
+            Ok(Some(config)) => {
+                if activity_log_mode != ActivityLogMode::None {
+                    eprintln!("Remote mode does not permit development activity logging.");
+                    return ExitCode::FAILURE;
+                }
+                serve_remote(config).await
+            }
+            Ok(None) => serve(ServerConfig::default()).await,
+            Err(error) => Err(error),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

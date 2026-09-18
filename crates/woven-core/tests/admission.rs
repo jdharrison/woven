@@ -294,7 +294,7 @@ fn paused_and_full_queue_are_structured_rejections() {
 }
 
 #[test]
-fn duplicate_idempotency_key_returns_existing_ticket() {
+fn idempotency_keys_are_principal_scoped() {
     let now = Instant::now();
     let mut controller = controller(1);
     let _ = controller.request_join_at(join(1, "a"), now);
@@ -306,8 +306,12 @@ fn duplicate_idempotency_key_returns_existing_ticket() {
         JoinDecision::Queued(ticket) => ticket,
         _ => panic!(),
     };
-    assert_eq!(first.id, second.id);
-    assert_eq!(first.principal, second.principal);
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.principal, second.principal);
+    assert_eq!(
+        controller.request_join_at(join(2, "b"), now),
+        JoinDecision::Queued(first)
+    );
 }
 
 #[test]

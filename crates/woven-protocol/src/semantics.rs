@@ -32,6 +32,13 @@ pub(crate) fn validate(envelope: &Envelope) -> Result<(), CodecError> {
 #[allow(clippy::too_many_lines)]
 fn validate_control(envelope: &Envelope, control: &ControlPayload) -> Result<(), CodecError> {
     match control {
+        managed @ (ControlPayload::RequestAdmission(_)
+        | ControlPayload::AdmissionResult(_)
+        | ControlPayload::QueueStatusRequest(_)
+        | ControlPayload::QueueHeartbeat(_)
+        | ControlPayload::QueueClaim(_)
+        | ControlPayload::QueueCancel(_)
+        | ControlPayload::QueueUpdate(_)) => validate_managed(envelope, managed),
         ControlPayload::Hello(value) => {
             require_unscoped(envelope)?;
             validate_hello(envelope, value)
@@ -137,6 +144,55 @@ fn validate_control(envelope: &Envelope, control: &ControlPayload) -> Result<(),
         | ControlPayload::ToolCallAccepted(_)
         | ControlPayload::ToolCallRejected(_)
         | ControlPayload::ToolCallCompleted(_)) => validate_inference_control(envelope, inference),
+    }
+}
+
+fn validate_managed(envelope: &Envelope, control: &ControlPayload) -> Result<(), CodecError> {
+    use crate::{AdmissionRejectionCode as Rejection, AdmissionStatus as Admission, QueueState};
+    require_session_scope(envelope)?;
+    require(
+        envelope.correlation_id.unwrap_or(0),
+        envelope,
+        "managed controls require correlation_id",
+    )?;
+    let valid = match control {
+        ControlPayload::RequestAdmission(value) => {
+            !value.idempotency_key.is_empty() && value.idempotency_key.len() <= 256
+        }
+        ControlPayload::QueueStatusRequest(value) => value.ticket_id != 0,
+        ControlPayload::QueueHeartbeat(value) => value.ticket_id != 0,
+        ControlPayload::QueueClaim(value) => value.ticket_id != 0,
+        ControlPayload::QueueCancel(value) => value.ticket_id != 0,
+        ControlPayload::AdmissionResult(value) => {
+            let queued = value.status == Admission::Queued;
+            value.status != Admission::Unknown
+                && (value.status == Admission::Rejected)
+                    == (value.rejection_code != Rejection::None)
+                && queued == value.ticket_id.is_some()
+                && value.ticket_id != Some(0)
+                && value.poll_after_ms <= 30_000
+                && value.ticket_remaining_ms <= 900_000
+                && (queued || value.ticket_remaining_ms == 0)
+                && (matches!(value.status, Admission::Queued | Admission::Paused)
+                    || value.poll_after_ms == 0)
+        }
+        ControlPayload::QueueUpdate(value) => {
+            let live = matches!(value.state, QueueState::Waiting | QueueState::Offered);
+            value.ticket_id != 0
+                && value.state != QueueState::Unknown
+                && (value.state == QueueState::Waiting) == (value.position != 0)
+                && value.poll_after_ms <= 30_000
+                && value.ticket_remaining_ms <= 900_000
+                && value.offer_remaining_ms <= 30_000
+                && (value.state == QueueState::Offered || value.offer_remaining_ms == 0)
+                && (live || (value.poll_after_ms == 0 && value.ticket_remaining_ms == 0))
+        }
+        _ => unreachable!("managed control dispatch"),
+    };
+    if valid {
+        Ok(())
+    } else {
+        invalid(envelope, "invalid managed admission fields")
     }
 }
 

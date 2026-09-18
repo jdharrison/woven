@@ -8,6 +8,45 @@ cargo add woven-client
 
 `woven-client` is a library crate. It does not provide a standalone executable.
 
+## Managed native admission (wire/client slice)
+
+Host supplies the endpoint, opaque token, namespace/session, allowed spaces/channels,
+ and CA trust material. Use `Client::connect_with_tls_and_auth(config, tls,
+woven_protocol::AuthenticationScheme::Bearer)` for explicit bearer authentication.
+Existing `connect`/`connect_with_tls` and `ClientConfig` fields retain Development
+compatibility. No JWT format, discovery, or insecure remote fallback is introduced.
+
+Before subscribing, use `request_admission(namespace, session, correlation, key)`.
+It returns sanitized `AdmissionResult`; Admitted means the worker has already joined.
+For Queued, use `queue_status`, `queue_heartbeat`, `queue_claim`, or `queue_cancel`,
+each taking `(namespace, session, correlation, ticket_id)` and returning `QueueUpdate`.
+Each exchange is bounded to ten seconds. Use unique nonzero correlations and reuse
+an idempotency key only for the same logical request on the same connection/scope.
+These are exclusive pre-subscription exchanges, not a multiplexed application inbox;
+unexpected traffic, transport failure, and timeouts fail closed rather than dropping
+messages silently or reusing a partially read stream. Do not externally cancel a
+borrowed exchange and then reuse the client; drop/close it instead.
+
+`client.admit_with_cancellation(namespace, session, key, timeout, cancellation_future)`
+consumes a fresh authenticated client and returns `(Client, ManagedAdmissionOutcome)`
+on semantic completion. Timeout must be positive and at most 15 minutes. It sends
+heartbeats while waiting and claims observed offers, clamping advisory poll intervals
+to 1–5 seconds. Paused/rejected/terminal results are returned without retries. It
+performs zero transport retries (within the contract's maximum of three), because
+partial stream I/O cannot safely be replayed. Cancellation, deadline, or I/O error
+closes/drops the connection, including races with an admitted claim; worker cleanup
+must release its ticket/lease. Close initiation is not proof of peer receipt.
+
+`queue_cancel` does not leave an already admitted session; disconnect to release it.
+Legacy `join_session` is unchanged and is not a managed admission bypass. Managed
+core/transport bridging and real TLS-verified native QUIC integration are implemented
+and covered by `woven-server/tests/managed_quic.rs`. The cross-repository
+`woven-server/tests/host_managed_local.rs` E2E has also passed via
+`npm run test:local` from the sibling `../woven-host` checkout (relative to
+Woven's root): real Host HTTP APIs provision the managed node and supply descriptors
+used by this native client. It uses isolated Firebase Auth/Firestore emulators and
+loopback sockets, not a cloud deployment or browser UI; ordinary Cargo runs ignore it.
+
 ## Bounded shutdown
 
 `Client::close(self)` remains synchronous and only initiates connection closure.

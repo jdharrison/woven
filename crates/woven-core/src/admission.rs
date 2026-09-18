@@ -146,6 +146,15 @@ pub enum QueueStatus {
     Missing,
 }
 
+/// A connection-owned queue action executed by the core worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueOperation {
+    Status,
+    Heartbeat,
+    Claim,
+    Cancel,
+}
+
 /// Result of cancelling a queue ticket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CancelResult {
@@ -208,6 +217,7 @@ struct TicketEntry {
     created: Instant,
     last_heartbeat: Instant,
     state: TicketState,
+    terminal_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,7 +250,7 @@ pub struct AdmissionController {
     reservations: BTreeMap<u64, Reservation>,
     tickets: BTreeMap<QueueTicketId, TicketEntry>,
     waiting: VecDeque<QueueTicketId>,
-    idempotency_index: BTreeMap<IdempotencyKey, QueueTicketId>,
+    idempotency_index: BTreeMap<(PrincipalId, IdempotencyKey), QueueTicketId>,
     counters: Arc<UsageCounters>,
 }
 
@@ -284,12 +294,17 @@ impl AdmissionController {
             return JoinDecision::Rejected(RejectionReason::InvalidIdempotencyKey);
         };
 
+        if self.next_lease == u64::MAX {
+            return JoinDecision::Rejected(RejectionReason::QueueFull);
+        }
         if self.admission_limit() == 0 {
             self.counters.increment_paused_rejections();
             return JoinDecision::Paused;
         }
 
-        if let Some(ticket_id) = self.idempotency_index.get(&idempotency_key)
+        if let Some(ticket_id) = self
+            .idempotency_index
+            .get(&(request.principal, idempotency_key.clone()))
             && let Some(entry) = self.tickets.get(ticket_id)
         {
             match entry.state {
@@ -315,7 +330,15 @@ impl AdmissionController {
             return JoinDecision::Rejected(RejectionReason::QueueDisabled);
         }
 
-        if self.queue_depth() >= self.policy.max_depth {
+        if self
+            .tickets
+            .values()
+            .filter(|entry| entry.terminal_at.is_none())
+            .count()
+            >= self.policy.max_depth
+            || self.next_ticket == u64::MAX
+            || self.next_lease == u64::MAX
+        {
             self.counters.increment_queue_full_rejections();
             return JoinDecision::Rejected(RejectionReason::QueueFull);
         }
@@ -349,9 +372,13 @@ impl AdmissionController {
         match entry.state {
             TicketState::Waiting | TicketState::Offered(_) => {
                 entry.state = TicketState::Cancelled;
-                self.idempotency_index.remove(&entry.ticket.idempotency_key);
+                entry.terminal_at = Some(now);
+                self.idempotency_index
+                    .remove(&(entry.ticket.principal, entry.ticket.idempotency_key.clone()));
                 self.waiting.retain(|candidate| *candidate != id);
                 self.counters.increment_cancelled_tickets();
+                self.prune_terminal_at(now);
+                self.apply_pending();
                 self.promote_at(now);
                 CancelResult::Cancelled
             }
@@ -371,7 +398,9 @@ impl AdmissionController {
             match entry.state {
                 TicketState::Offered(_) => {
                     entry.state = TicketState::Admitted;
-                    self.idempotency_index.remove(&entry.ticket.idempotency_key);
+                    entry.terminal_at = Some(now);
+                    self.idempotency_index
+                        .remove(&(entry.ticket.principal, entry.ticket.idempotency_key.clone()));
                     entry.ticket.principal
                 }
                 TicketState::Waiting => return Err(ClaimError::NotOffered),
@@ -381,6 +410,7 @@ impl AdmissionController {
             }
         };
         self.counters.increment_promoted_players();
+        self.prune_terminal_at(now);
         Ok(self.admit(principal, now))
     }
 
@@ -398,7 +428,7 @@ impl AdmissionController {
         };
         self.counters.end_connection(removed.usage_handle, now);
         self.counters.set_active_ccu(count(self.active.len()));
-        if matches!(reason, ReleaseReason::Unexpected) {
+        if matches!(reason, ReleaseReason::Unexpected) && !self.policy.reconnect_grace.is_zero() {
             let expires = now.checked_add(self.policy.reconnect_grace).unwrap_or(now);
             self.reservations.insert(
                 lease.id,
@@ -464,7 +494,7 @@ impl AdmissionController {
     #[must_use]
     pub fn snapshot(&self) -> AdmissionSnapshot {
         let occupied = self.occupied();
-        let available = self.allocated_ccu.saturating_sub(occupied);
+        let available = self.admission_limit().saturating_sub(occupied);
         AdmissionSnapshot {
             allocated_ccu: self.allocated_ccu,
             active_ccu: count(self.active.len()),
@@ -487,7 +517,7 @@ impl AdmissionController {
         self.counters.clone()
     }
 
-    /// Returns true if this controller has ever issued the ticket.
+    /// Returns true while this controller retains the ticket.
     #[must_use]
     pub fn has_ticket(&self, id: QueueTicketId) -> bool {
         self.tickets.contains_key(&id)
@@ -545,9 +575,11 @@ impl AdmissionController {
                 created: now,
                 last_heartbeat: now,
                 state: TicketState::Waiting,
+                terminal_at: None,
             },
         );
-        self.idempotency_index.insert(idempotency_key, id);
+        self.idempotency_index
+            .insert((principal, idempotency_key), id);
         self.waiting.push_back(id);
         ticket
     }
@@ -640,7 +672,9 @@ impl AdmissionController {
                 abandoned_offers += 1;
             }
             if was_live && matches!(entry.state, TicketState::Expired) {
-                self.idempotency_index.remove(&entry.ticket.idempotency_key);
+                entry.terminal_at = Some(now);
+                self.idempotency_index
+                    .remove(&(entry.ticket.principal, entry.ticket.idempotency_key.clone()));
             }
         }
         if expired_tickets > 0 {
@@ -656,9 +690,57 @@ impl AdmissionController {
                 Some(TicketState::Waiting)
             )
         });
+        self.prune_terminal_at(now);
         self.counters.set_queue_depth(self.queue_depth());
         self.apply_pending();
         self.promote_at(now);
+    }
+
+    /// Advances bounded expiry, retention and promotion without client traffic.
+    pub fn maintain_at(&mut self, now: Instant) {
+        self.expire_at(now);
+    }
+
+    fn prune_terminal_at(&mut self, now: Instant) {
+        self.tickets.retain(|_, entry| {
+            entry
+                .terminal_at
+                .is_none_or(|at| now.saturating_duration_since(at) < Duration::from_secs(60))
+        });
+        let mut terminal = self
+            .tickets
+            .iter()
+            .filter_map(|(id, entry)| entry.terminal_at.map(|at| (at, *id)))
+            .collect::<Vec<_>>();
+        terminal.sort_unstable();
+        let excess = terminal.len().saturating_sub(1024);
+        for (_, id) in terminal.into_iter().take(excess) {
+            self.tickets.remove(&id);
+        }
+        self.idempotency_index
+            .retain(|_, id| self.tickets.contains_key(id));
+    }
+
+    /// Ownership must be checked before any operation that can mutate a ticket.
+    #[must_use]
+    pub fn ticket_owned_by(&self, id: QueueTicketId, principal: PrincipalId) -> bool {
+        self.tickets
+            .get(&id)
+            .is_some_and(|entry| entry.ticket.principal == principal)
+    }
+
+    /// Cancels all live tickets for a departing identity.
+    pub fn cancel_principal_at(&mut self, principal: PrincipalId, now: Instant) {
+        let ids = self
+            .tickets
+            .iter()
+            .filter_map(|(id, entry)| {
+                (entry.ticket.principal == principal && entry.terminal_at.is_none()).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.cancel_at(id, now);
+        }
     }
 
     fn admission_limit(&self) -> u32 {
@@ -916,7 +998,51 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_idempotency_key_returns_existing_ticket() {
+    fn terminal_history_and_indexes_remain_bounded_under_churn() {
+        let now = Instant::now();
+        let mut controller = controller(1);
+        let _ = controller.request_join_at(join(1, "active"), now);
+        for principal in 2..4096 {
+            let JoinDecision::Queued(ticket) =
+                controller.request_join_at(join(principal, "same"), now)
+            else {
+                panic!("queued");
+            };
+            assert!(controller.ticket_owned_by(ticket.id, PrincipalId::new(principal)));
+            controller.cancel_at(ticket.id, now);
+            assert!(controller.tickets.len() <= 1024);
+            assert!(controller.idempotency_index.is_empty());
+            assert!(controller.waiting.is_empty());
+        }
+        controller.maintain_at(now + Duration::from_secs(60));
+        assert!(controller.tickets.is_empty());
+        assert_eq!(controller.snapshot().active_ccu, 1);
+    }
+
+    #[test]
+    fn offered_tickets_count_toward_live_queue_bound() {
+        let now = Instant::now();
+        let mut controller = controller(1);
+        controller.policy.max_depth = 1;
+        let JoinDecision::Admitted(lease) = controller.request_join_at(join(1, "a"), now) else {
+            panic!("admitted");
+        };
+        let JoinDecision::Queued(ticket) = controller.request_join_at(join(2, "b"), now) else {
+            panic!("queued");
+        };
+        controller.release_at(lease, ReleaseReason::Intentional, now);
+        assert_eq!(
+            controller.queue_status_at(ticket.id, now),
+            QueueStatus::Offered
+        );
+        assert_eq!(
+            controller.request_join_at(join(3, "c"), now),
+            JoinDecision::Rejected(RejectionReason::QueueFull)
+        );
+    }
+
+    #[test]
+    fn idempotency_keys_are_principal_scoped() {
         let now = Instant::now();
         let mut controller = controller(1);
         let _ = controller.request_join_at(join(1, "a"), now);
@@ -928,8 +1054,12 @@ mod tests {
             JoinDecision::Queued(ticket) => ticket,
             _ => panic!(),
         };
-        assert_eq!(first.id, second.id);
-        assert_eq!(first.principal, second.principal);
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.principal, second.principal);
+        assert_eq!(
+            controller.request_join_at(join(2, "b"), now),
+            JoinDecision::Queued(first)
+        );
     }
 
     #[test]

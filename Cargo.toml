@@ -41,7 +41,7 @@ tokio = { version = "1.53", features = ["full"] }
 async-trait = "0.1"
 # QUIC + TLS
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 wtransport = { version = "=0.7.2", features = ["dangerous-configuration"] }
 # HTTP control plane
