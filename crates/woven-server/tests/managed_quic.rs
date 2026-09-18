@@ -88,17 +88,26 @@ impl WirePeer {
         self.recv.read_exact(&mut bytes[4..]).await.unwrap();
         codec.decode(&bytes).unwrap()
     }
-    async fn authenticate(&mut self, token: &str) -> u64 {
+    async fn authenticate_with_scheme(
+        &mut self,
+        token: &str,
+        scheme: AuthenticationScheme,
+    ) -> Envelope {
         self.send(Envelope::control(
             DeliveryClass::ReliableOrdered,
             ControlPayload::Authenticate(Authenticate {
-                scheme: AuthenticationScheme::Bearer,
+                scheme,
                 credentials: token.as_bytes().to_vec(),
             }),
         ))
         .await;
-        let MessagePayload::Control(ControlPayload::Authenticated(value)) =
-            self.recv().await.message
+        self.recv().await
+    }
+    async fn authenticate(&mut self, token: &str) -> u64 {
+        let MessagePayload::Control(ControlPayload::Authenticated(value)) = self
+            .authenticate_with_scheme(token, AuthenticationScheme::Bearer)
+            .await
+            .message
         else {
             panic!("expected Authenticated")
         };
@@ -151,6 +160,27 @@ async fn distinct_principals_correlated_rate_errors_and_result_controls_rejected
     }).await.expect("bounded wire error checks");
 }
 
+#[tokio::test]
+async fn managed_quic_rejects_development_authentication_scheme() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "f".repeat(64);
+        provision(&server, 1, 1, &token).await;
+        let mut peer = WirePeer::connect(&fixture, &server).await;
+        let response = peer
+            .authenticate_with_scheme(&token, AuthenticationScheme::Development)
+            .await;
+        assert!(matches!(
+            response.message,
+            MessagePayload::Control(ControlPayload::ProtocolError(error))
+                if error.code == ProtocolErrorCode::Unauthorized
+        ));
+    })
+    .await
+    .expect("bounded managed QUIC scheme rejection");
+}
+
 const ADMIN: &str = "managed-wire-test-admin-not-a-client-credential";
 const LIMIT: Duration = Duration::from_secs(30);
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -190,6 +220,7 @@ impl Fixture {
             certificate_file: self.path.join("cert.pem"),
             private_key_file: self.path.join("key.pem"),
             admin_token_file: self.path.join("admin"),
+            webtransport: None,
         })
         .await
         .unwrap()
@@ -304,6 +335,13 @@ async fn lite_managed_runtime_exposes_only_ephemeral_channel_one() {
         )
         .await;
         assert_eq!(status, 200);
+        assert_eq!(
+            node["transports"],
+            json!({"quic": true, "webTransport": {"enabled": false}})
+        );
+        assert!(node["transports"]["webTransport"]
+            .get("certificateSha256")
+            .is_none());
         assert_eq!(
             node["spaces"],
             json!([

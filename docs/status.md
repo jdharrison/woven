@@ -53,16 +53,25 @@ tokens, authorization, fanout and disconnect. No cloud deployment or external ta
 has been performed. See the [server configuration](../crates/woven-server/README.md) and
 [exact client API](../crates/woven-client-rust/README.md).
 
-**Opt-in managed native QUIC runtime** — `ManagedServerConfig` / `start_managed`
-starts empty, with separate read-only management and authenticated loopback admin
-listeners. The Host-compatible node/session API implements scoped provision/read/
-capacity/delete, incarnation binding, revision retries and bounded revocation history.
-SHA-256 session-token verifiers and unique connection principals live in the core
-worker. Admission and joins are atomic; deletion closes admitted, waiting and
-not-yet-joined real QUIC sockets. The WVN1 bridge and native client admission/queue
-APIs are implemented and tested over local TLS-verified QUIC, including CCU-one
-queue/heartbeat/claim, duplicate operations, ticket ownership, scope isolation,
-ordinary-join rejection, correlated rate errors, teardown and helper cancellation.
+**Opt-in managed QUIC/WebTransport runtime** — `ManagedServerConfig` / `start_managed`
+starts empty, with mandatory native QUIC, optional WebTransport, separate read-only management,
+and an authenticated loopback admin listener. Managed WebTransport has its own explicit UDP bind
+address and request path; it does not infer a QUIC-plus-one endpoint. Its bounded allowlist accepts
+only exact canonical browser HTTP(S) origins and rejects missing origins. Both data-plane
+transports use the configured leaf-first PEM chain and require the WVN1 Bearer authentication
+scheme; development/static compositions keep Development compatibility. Authenticated
+`GET /v1/node` reports whether WebTransport is live and, when enabled, the lowercase SHA-256 DER
+fingerprint of the actual configured leaf certificate, but no endpoint URL.
+
+The Host-compatible node/session API implements scoped provision/read/capacity/delete,
+incarnation binding, revision retries and bounded revocation history. SHA-256 session-token
+verifiers and unique connection principals live in the core worker. Admission and joins are
+atomic; deletion closes admitted, waiting and not-yet-joined sockets on both managed transports.
+The WVN1 bridge and Rust client admission/queue APIs are tested over local TLS-verified QUIC,
+including CCU-one queue/heartbeat/claim, duplicate operations, ticket ownership, scope isolation,
+ordinary-join rejection, correlated rate errors, teardown and helper cancellation. A real
+TLS-verified WebTransport test client covers the same worker bridge, direct and queued admission,
+origin rejection, Bearer enforcement, scope deletion, fingerprint metadata, and shutdown.
 Runtime tests also cover response fields, replay, limits and configuration.
 The real Host-to-managed-node E2E in
 `crates/woven-server/tests/host_managed_local.rs` is implemented and has passed via
@@ -73,18 +82,17 @@ emulators on loopback. Coverage includes ownership/capacity, monitoring, queue/c
 TLS/scope rejection, server deletion and account teardown. This cross-repository test
 is ignored by ordinary Cargo runs and must be launched through Host's local runner.
 
-Managed mode is native QUIC only, with opaque shared session credentials, fixed
-spaces/channels, zero reconnect grace, and in-memory configuration/revocation history.
-The native client selects Bearer explicitly; the current QUIC adapter verifies the
-token without enforcing a Bearer-only scheme label. Admission exchanges are exclusive
-pre-subscription operations with ten-second timeouts. The consuming cancellation
-helper has a positive caller-set deadline capped at 15 minutes and performs zero
-transport retries. Wire remaining-lifetime fields are currently zero (unavailable),
-not fresh TTLs. TypeScript has generated bindings/codec compatibility only, not a
-managed browser queue client or WebTransport endpoint. Validation includes the local
-Host API-to-native-client path, not browser UI, Weaver integration, external deployment,
-production Firebase/App Check, durable recovery/failover, or production per-user
-identity. See
+Managed mode uses opaque shared session credentials, fixed spaces/channels, zero reconnect grace,
+and in-memory configuration/revocation history. Rust native QUIC and TypeScript WebTransport
+clients expose bounded admission/queue APIs and cancellation helpers. Admission exchanges are
+exclusive pre-subscription operations with ten-second timeouts; helper deadlines are positive,
+capped at 15 minutes, and perform zero transport retries. Wire remaining-lifetime fields are
+currently zero (unavailable), not fresh TTLs. The TypeScript admission implementation is covered
+with a mock WHATWG transport plus Rust/TypeScript wire compatibility, not a real browser E2E.
+Validation includes the local Host API-to-native-QUIC-client path and Rust-driven real
+WebTransport sockets, but not browser UI, a real TS-to-managed-node network path, Host-provided
+WebTransport descriptors, Weaver integration, external deployment, production Firebase/App
+Check, durable recovery/failover, or production per-user identity. See
 [managed sessions](managed-sessions.md).
 
 **Interest management** (`woven-core` + `woven-loadtest`) — bounded 2D/3D

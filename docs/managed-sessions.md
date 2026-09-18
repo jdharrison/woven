@@ -1,23 +1,33 @@
 # Managed sessions: local integration contract
 
-**Status: managed runtime/admin API, WVN1 bridge, and native QUIC admission client implemented and locally tested.**
-`woven_server::{ManagedServerConfig, start_managed, serve_managed}` provides the
-opt-in composition described below. Host owns endpoint selection, external server
-IDs, entitlements, and secret distribution.
+**Status: managed runtime/admin API, native QUIC plus optional WebTransport WVN1 bridges, and Rust/TypeScript admission clients implemented and locally tested within the limits below.**
+`woven_server::{ManagedServerConfig, start_managed, serve_managed}` provides the opt-in
+composition described below. Host owns endpoint selection, external server IDs, entitlements,
+and secret distribution.
 Woven receives only explicit scope, capacity, and credentials over a network API.
 No hosted product/tier names or account models enter core.
 
 ## Composition and trust boundary
 
-- A separate, opt-in managed native QUIC composition is available. Existing development and
-  static `RemoteServerConfig` behavior remain unchanged; managed and static modes
-  are mutually exclusive. Managed mode starts with no sessions or client tokens.
+- A separate, opt-in managed composition is available. Native QUIC is mandatory and
+  WebTransport is optional. Existing development and static `RemoteServerConfig` behavior remain
+  unchanged; managed and static modes are mutually exclusive. Managed mode starts with no
+  sessions or client tokens.
 - Required environment: `WOVEN_MANAGED_QUIC=1`, `WOVEN_QUIC_BIND`,
-  `WOVEN_MANAGEMENT_BIND` (existing read-only loopback HTTP),
-  `WOVEN_ADMIN_BIND` (separate loopback listener), `WOVEN_TLS_CERT_FILE`,
-  `WOVEN_TLS_KEY_FILE`, and `WOVEN_ADMIN_TOKEN_FILE`.
-  Missing, malformed, mixed-mode, or partial configuration fails before *any*
-  listener binds. No fallback to development credentials or certificates.
+  `WOVEN_MANAGEMENT_BIND` (existing read-only loopback HTTP), `WOVEN_ADMIN_BIND` (separate
+  loopback listener), `WOVEN_TLS_CERT_FILE`, `WOVEN_TLS_KEY_FILE`, and
+  `WOVEN_ADMIN_TOKEN_FILE`. Missing, malformed, mixed-mode, or partial configuration fails before
+  *any* listener binds. No fallback to development credentials or certificates.
+- Optional managed WebTransport is all-or-nothing:
+  `WOVEN_MANAGED_WEBTRANSPORT=1`, `WOVEN_WEBTRANSPORT_BIND`,
+  `WOVEN_WEBTRANSPORT_PATH`, and `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS`. It binds a separate,
+  explicit UDP endpoint; managed mode does not apply the development QUIC-plus-one convention.
+  The path is an exact absolute path of at most 256 bytes with no query or fragment. The entire
+  comma-separated origin setting is at most 2,048 bytes and contains 1–64 exact canonical
+  HTTP(S) URL origins. Schemes and hosts must already be lowercase, default ports must be omitted,
+  and paths (including a trailing slash), queries, fragments, credentials, whitespace, and
+  duplicates are rejected. Browser requests require an exact allowed `Origin`; missing origins
+  are rejected.
 - The admin listener is loopback-only in this slice. Host on another machine must
   use an operator-configured authenticated encrypted tunnel/private gateway to it;
   direct private-IP HTTP and public admin exposure are not supported. Host supplies
@@ -41,16 +51,21 @@ Reject unknown fields, zero/overflow IDs, oversized bodies, and invalid tokens.
 
 | Method and path | Request | Result |
 |---|---|---|
-| `GET /v1/node` | Admin auth | `nodeIncarnation`, limits and supported fixed channel/space definitions |
+| `GET /v1/node` | Admin auth | `nodeIncarnation`, transport status, limits and supported fixed channel/space definitions |
 | `PUT /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `{ "revision": "1", "allocatedCCU": 1, "clientToken": "<Host-supplied secret>" }` | `201` created; identical live retry `200` |
 | `GET /v1/namespaces/{namespaceId}/sessions/{sessionId}` | Admin auth | `200` sanitized configuration and admission snapshot; `404` absent |
 | `PATCH /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `{ "revision": "2", "allocatedCCU": 2 }` | `200` applied configuration/snapshot |
 | `DELETE /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `If-Match: "2"` (current revision) | `204` revoked and removed; identical delete retry `204` |
 
 All mutations also require `Woven-Node-Incarnation`, matching the authenticated
-`GET /v1/node` response. The node creates a fresh non-secret random incarnation at
-startup. A stale incarnation returns `409`; clients must not automatically replace
-it and replay a mutation. Host must deliberately reconcile after restart.
+`GET /v1/node` response. Its `transports.webTransport` object always includes `enabled`; when
+true it also includes `certificateSha256`, the 64-character lowercase SHA-256 digest of the DER
+bytes of the actual first certificate installed in the live WebTransport TLS chain. Disabled
+responses omit the hash. `/v1/node` never returns transport addresses or endpoint URLs; Host must
+combine this identity metadata with separately configured externally reachable endpoints. The
+node creates a fresh non-secret random incarnation at startup. A stale incarnation returns `409`;
+clients must not automatically replace it and replay a mutation. Host must deliberately reconcile
+after restart.
 
 Provisioning installs one exact `SessionKey`, mandatory admission, and fixed logical
 broadcast spaces 1/2, epoch 1. Both spaces expose only channel 1,
@@ -92,16 +107,16 @@ Errors use `{ "error": { "code": "..." } }`, with no secrets or caller input:
 `413 request_too_large`, `429 rate_limited`, `503 capacity_exhausted|worker_unavailable`.
 Responses use `Cache-Control: no-store`. No HTTP admission routes are exposed.
 
-## Native QUIC admission contract
+## Managed WVN1 admission contract
 
-Use `Client::connect_with_tls_and_auth(config, tls, AuthenticationScheme::Bearer)`
-with the existing WVN1 Bearer enum and operator-supplied CA roots. Certificate-chain,
-validity, and URL hostname/IP SAN verification remain enabled, including on loopback;
-there is no insecure remote fallback. Existing `connect`/`connect_with_tls` retain
-Development compatibility. The current QUIC adapter passes credentials to the worker
-without enforcing Bearer-only scheme selection: managed isolation is enforced by the
-scoped token verifier, not by the authentication-scheme label. This is opaque shared
-credential authentication, not JWT validation or per-user identity.
+Use `Client::connect_with_tls_and_auth(config, tls, AuthenticationScheme::Bearer)` for native
+QUIC, or configure the TypeScript `WovenClient` with `authenticationScheme:
+AuthenticationScheme.Bearer` for WebTransport. Managed QUIC and WebTransport both enforce that
+scheme before passing credentials to the worker: a valid managed token labeled `Development` is
+rejected as unauthorized. Existing development and static remote compositions retain their
+Development-compatible defaults. Rust certificate-chain, validity, and URL hostname/IP SAN
+verification remain enabled, including on loopback; there is no insecure remote fallback. This
+is opaque shared credential authentication, not JWT validation or per-user identity.
 
 A verified managed token grants only its exact namespace/session and configured
 spaces/channels. Each authenticated connection receives a distinct server-assigned
@@ -154,7 +169,7 @@ revocation and local close initiation, not proof the peer has received a close p
 Commands already in flight are serialized before or after deletion, never against
 partially removed state. Old authenticated connections cannot survive reprovisioning.
 
-## Implemented bounds and native client constraints
+## Implemented bounds and client constraints
 
 Fixed defaults for this local slice, validated against node hard limits:
 
@@ -172,19 +187,19 @@ Fixed defaults for this local slice, validated against node hard limits:
 - Admin body 8 KiB, 32 concurrent requests, 32 requests/second, 5-second deadline;
   worker submission uses a bounded mailbox. Timeout can mean applied-with-response-
   lost: retry identical mutations, never synthesize a new revision on timeout.
-- Native clients expose `request_admission`, `queue_status`, `queue_heartbeat`,
-  `queue_claim`, and `queue_cancel`, each with a ten-second exchange timeout. These
-  are exclusive pre-subscription exchanges, not a multiplexed application inbox.
-  Unexpected traffic, transport errors, and timeouts fail closed; after externally
-  cancelling a borrowed exchange, close/drop the client rather than reusing it.
-- `admit_with_cancellation` consumes a fresh authenticated client, with a caller-set
-  positive deadline of at most 15 minutes and heartbeat/claim polling clamped to
-  1–5 seconds. It performs **zero transport retries** because partial stream I/O
-  cannot safely be replayed. Semantic outcomes are returned without retrying.
-  Cancellation, deadline, or I/O error closes/drops the connection, including races
-  with an admitted claim; dropping the helper future drops its owned client.
-  `queue_cancel` does not undo an already admitted session: leave/disconnect to
-  release the lease.
+- Rust clients expose `request_admission`, `queue_status`, `queue_heartbeat`, `queue_claim`,
+  and `queue_cancel`; the TypeScript client exposes the corresponding camelCase methods. Each
+  operation has a ten-second exchange timeout. These are exclusive pre-subscription exchanges,
+  not a multiplexed application inbox. Unexpected traffic, transport errors, and timeouts fail
+  closed; after externally cancelling a borrowed exchange, close/drop the client rather than
+  reusing it.
+- Rust `admit_with_cancellation` and TypeScript `admitWithCancellation` consume a fresh
+  authenticated client, with a caller-set positive deadline of at most 15 minutes and
+  heartbeat/claim polling clamped to 1–5 seconds. They perform **zero transport retries** because
+  partial stream I/O cannot safely be replayed. Semantic outcomes are returned without retrying.
+  Cancellation, deadline, or I/O error closes/drops the connection, including races with an
+  admitted claim. `queue_cancel`/`queueCancel` does not undo an already admitted session:
+  leave/disconnect to release the lease.
 
 Runtime integration uses the authoritative core/worker, not an HTTP-side controller.
 `WorkerHandle::manage(ManagedRequest)` serializes PUT/GET/PATCH/DELETE with client
@@ -197,15 +212,19 @@ claims are also atomic. Managed admission operations are limited to four/second 
 connection (`CoreError::AdmissionRateLimited { retry_after }`); ordinary static/dev
 sessions do not acquire this new limit.
 
-The runtime tests in `woven-core/tests/managed.rs` and `woven-server/tests/managed.rs`
-cover HTTP response fields, credential isolation, worker queue/claim, verified QUIC
-teardown, revision/history exhaustion, configuration, request deadlines and bounds.
-`woven-server/tests/managed_quic.rs` additionally exercises the real TLS-verified
-WVN1 bridge/native client: the Ephemeral-only channel policy, distinct principals,
-correlated rate errors, CCU-one queue/heartbeat/claim, duplicate operations, ticket
-ownership/cancellation, scope isolation, ordinary-join rejection, DELETE teardown,
-and bounded helper cancellation.
-Protocol tests cover semantic validation and the additive `queue_update_v1` golden.
+The runtime tests in `woven-core/tests/managed.rs` and `woven-server/tests/managed.rs` cover HTTP
+response fields, credential isolation, worker queue/claim, verified QUIC teardown,
+revision/history exhaustion, configuration, request deadlines and bounds.
+`woven-server/tests/managed_quic.rs` additionally exercises the real TLS-verified WVN1
+bridge/native client: Bearer enforcement and Development rejection, the Ephemeral-only channel
+policy, distinct principals, correlated rate errors, CCU-one queue/heartbeat/claim, duplicate
+operations, ticket ownership/cancellation, scope isolation, ordinary-join rejection, DELETE
+teardown, and bounded helper cancellation. `woven-server/tests/managed_webtransport.rs` uses a
+real TLS-verified WebTransport socket and explicit `Origin` to cover Bearer enforcement and
+Development rejection, exact-origin admission, direct/queued admission and claim, atomic
+admission/join then subscription, wrong token/scope, DELETE and server-drop teardown, capability
+metadata, and the leaf fingerprint returned by `/v1/node`. Protocol tests cover semantic
+validation and the additive `queue_update_v1` golden.
 
 The cross-repository `woven-server/tests/host_managed_local.rs` E2E is implemented
 and has passed via `npm run test:local` from `../woven-host` (relative to
@@ -216,33 +235,46 @@ Coverage includes owner/scope isolation, ten admitted clients and an eleventh qu
 Host capacity/monitoring, disconnect/offer/claim, TLS trust/name rejection, server
 deletion and account teardown with socket closure and token revocation. This test is
 ignored by ordinary Cargo runs; use the Host launcher, not the helper directly.
-It does not validate browser UI, production Firebase/App Check, cloud deployment,
+It does not enable managed WebTransport and does not validate browser UI, TypeScript network
+traffic, Host-provided WebTransport descriptors, production Firebase/App Check, cloud deployment,
 Weaver integration, persistence/restarts, or multi-node behavior.
 
-Rust bindings are generated at build time; checked-in TypeScript bindings and codec
-support include all seven controls. TypeScript support is **wire codec compatibility
-only**, not a managed browser queue client or WebTransport composition. Do not infer
-a browser endpoint from a managed native QUIC URL. Regenerate bindings and golden
-fixtures after schema changes. The local Host E2E above does not add managed
-WebTransport support; Weaver integration and external remote deployment remain untested.
+Rust bindings are generated at build time; checked-in TypeScript bindings and codec support
+include all seven controls. The TypeScript WebTransport client implements `requestAdmission`,
+all four queue operations, and bounded `admitWithCancellation` with fail-closed timeout,
+cancellation, and reply validation. Its tests use an in-memory WHATWG WebTransport mock and
+Rust/TypeScript wire-compatibility fixtures. They do **not** establish a browser or Node
+WebTransport connection to the managed server. Managed WebTransport is a separate explicitly
+configured endpoint; do not infer it from a managed native QUIC URL. Regenerate bindings and
+golden fixtures after schema changes. The local Host E2E above remains native QUIC only; Weaver
+integration and external remote deployment remain untested.
 
 Local validation coverage spans the following boundaries (core/worker tests for
 expiry and bounds, real loopback QUIC tests for the network path):
 
 1. Missing/wrong client and admin tokens, swapped credentials, cross-scope access,
    unknown scope and deleted credentials all fail without creating state.
-2. CCU 1: two real TLS-verified QUIC clients with the same token have distinct
-   principals; second waits, first disconnects, second observes offer and claims.
+2. CCU 1: two real TLS-verified QUIC clients with the same token have distinct principals;
+   second waits, first disconnects, second observes offer and claims. Real WebTransport coverage
+   separately exercises the direct-admission and queue/offer/claim paths.
 3. Forged/cross-connection tickets cannot inspect, heartbeat, cancel, or claim;
    duplicate requests/claims do not leak permits. Ordinary join cannot bypass CCU.
 4. Expiry, churn, retry, and history-exhaustion tests prove all collections bounded.
-5. Partial/invalid environment and invalid TLS/secrets bind no listeners; read-only
-   management never exposes admin routes, including during failed startup.
+5. Partial/invalid environment and invalid TLS/secrets bind no listeners; read-only management
+   never exposes admin routes, including during failed startup. Configuration tests bound the
+   total origin setting and collected entry count, and reject noncanonical scheme/host case,
+   explicit default ports, paths/trailing slashes, queries, fragments, credentials, duplicates,
+   missing values, and invalid request paths.
 6. Capacity updates/replays/decreases and provisioning rollback preserve atomicity.
 7. DELETE closes admitted, waiting, and authenticated-not-joined sockets, releases
    all resources, revokes old tokens, and defeats stale create/update/delete replays.
-8. Wrong CA/hostname fails native TLS; legacy development/static remote tests pass.
+8. Wrong CA/hostname fails native TLS; legacy development/static remote tests pass. Managed QUIC
+   and WebTransport reject the Development scheme even when the token is otherwise valid.
+9. Managed WebTransport rejects missing/wrong origins, reports only local capability metadata on
+   the read-only listener, and reports enabled state plus the live leaf SHA-256 fingerprint—but no
+   endpoint URL—through authenticated `/v1/node`.
 
-No cloud actions, production secrets, deployments, persistence, failover, remote
-WebTransport, or production per-user identity are part of this Woven slice. Host
-implementation remains in the sibling repository; Weaver integration remains separate.
+No cloud actions, production secrets, deployments, persistence, failover, external managed
+WebTransport deployment, real-browser/TypeScript network E2E, or production per-user identity are
+part of this Woven slice. Host implementation remains in the sibling repository; Weaver
+integration remains separate.

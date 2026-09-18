@@ -21,8 +21,8 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, trace};
 use woven_core::{Command, CommandResult, ConnectionId, Credentials};
 use woven_protocol::{
-    Authenticated, Capabilities, Codec, ControlPayload, DeliveryClass, Envelope, MessageKind,
-    MessagePayload, PROTOCOL_VERSION, ProtocolErrorCode,
+    Authenticated, AuthenticationScheme, Capabilities, Codec, ControlPayload, DeliveryClass,
+    Envelope, MessageKind, MessagePayload, PROTOCOL_VERSION, ProtocolErrorCode,
 };
 use woven_transport::{
     MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, UnroutedControl, WorkerHandle, handle_authenticated,
@@ -40,6 +40,8 @@ const CLOSE_TRANSPORT: u32 = 0x101;
 pub struct QuicConfig {
     /// Handle to the bounded, single-owner core worker.
     pub worker: WorkerHandle,
+    /// Authentication scheme accepted during the WVN1 handshake.
+    pub expected_authentication_scheme: AuthenticationScheme,
     /// Server name reported in the protocol capabilities response.
     pub server_name: Arc<str>,
     /// Server version reported in the protocol capabilities response.
@@ -54,6 +56,7 @@ impl QuicConfig {
     pub fn new(worker: WorkerHandle) -> Self {
         Self {
             worker,
+            expected_authentication_scheme: AuthenticationScheme::Development,
             server_name: Arc::from("woven"),
             server_version: Arc::from(env!("CARGO_PKG_VERSION")),
             inference_sink: None,
@@ -438,6 +441,16 @@ async fn handle_authenticate(
         .await;
         return Err(());
     };
+    if auth.scheme != config.expected_authentication_scheme {
+        send_error(
+            write_sender,
+            MessageKind::Authenticate,
+            ProtocolErrorCode::Unauthorized,
+            "authentication scheme is not accepted".to_owned(),
+        )
+        .await;
+        return Err(());
+    }
     let token = match String::from_utf8(auth.credentials) {
         Ok(token) => token,
         Err(_) => {

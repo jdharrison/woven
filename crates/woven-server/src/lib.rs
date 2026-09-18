@@ -4,7 +4,9 @@
 
 pub mod admission;
 mod managed;
-pub use managed::{ManagedServer, ManagedServerConfig, serve_managed, start_managed};
+pub use managed::{
+    ManagedServer, ManagedServerConfig, ManagedWebTransportConfig, serve_managed, start_managed,
+};
 mod remote;
 pub use remote::{RemoteServer, RemoteServerConfig, serve_remote, start_remote};
 
@@ -735,6 +737,28 @@ mod tests {
         assert_eq!(health["layers"]["quic"], "active");
         assert_eq!(health["layers"]["webtransport"], "active");
         assert_eq!(health["layers"]["inference"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn capabilities_omit_disabled_webtransport() {
+        let app = router_with_transports(true, false, None, false, test_worker());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/capabilities")
+                    .body(Body::empty())
+                    .expect("capabilities request is valid"),
+            )
+            .await
+            .expect("capabilities response is available");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("capabilities response body is readable");
+        let capabilities: serde_json::Value =
+            serde_json::from_slice(&body).expect("capabilities response is valid JSON");
+        assert_eq!(capabilities["transports"], serde_json::json!(["quic"]));
+        assert!(capabilities.get("webtransport").is_none());
     }
 
     #[tokio::test]

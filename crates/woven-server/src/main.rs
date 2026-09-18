@@ -44,9 +44,11 @@ impl ActivityLogMode {
          --log-all        Print all safe activity metadata to stdout in debug builds.\n\
          --log-transform  Print entity position and entity-scoped latest-state activity only.\n\
          --log-none       Disable development activity logging (the default).\n\
-         Remote QUIC: set WOVEN_REMOTE_QUIC=1 and WOVEN_QUIC_BIND, WOVEN_MANAGEMENT_BIND,\n\
-         WOVEN_TLS_CERT_FILE, WOVEN_TLS_KEY_FILE, WOVEN_AUTH_TOKEN_FILE.\n\
-         Management HTTP must remain loopback. Remote WebTransport/inference are disabled."
+         Managed mode: set WOVEN_MANAGED_QUIC=1 and the required managed settings.\n\
+         Optionally add WOVEN_MANAGED_WEBTRANSPORT=1, WOVEN_WEBTRANSPORT_BIND,\n\
+         WOVEN_WEBTRANSPORT_PATH, and WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS.\n\
+         Static remote QUIC: set WOVEN_REMOTE_QUIC=1 and its required settings.\n\
+         Management HTTP must remain loopback; inference is disabled in managed/remote modes."
     }
 }
 

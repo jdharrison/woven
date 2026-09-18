@@ -8,6 +8,11 @@ import {
   SnapshotRequestPayload,
   SpaceTransitionPayload,
   InferenceRequestedPayload,
+  RequestAdmissionPayload,
+  QueueStatusRequestPayload,
+  QueueHeartbeatPayload,
+  QueueClaimPayload,
+  QueueCancelPayload,
   AuthenticationScheme,
   ControlPayload,
   DeliveryClass,
@@ -24,6 +29,14 @@ export interface EnvelopeScope {
   channelId?: bigint;
   entityId?: bigint;
   senderSequence?: bigint;
+  correlationId?: bigint;
+}
+
+/** Session scope required by every managed-admission request. */
+export interface ManagedEnvelopeScope {
+  namespaceId: bigint;
+  sessionId: bigint;
+  correlationId: bigint;
 }
 
 const zero = 0n;
@@ -40,7 +53,7 @@ export function encodeHello(opts: {
 }): Uint8Array {
   const builder = new flatbuffers.Builder(1024);
   const clientName = builder.createString(opts.clientName ?? "woven-client-ts");
-  const clientVersion = builder.createString(opts.clientVersion ?? "0.1.0");
+  const clientVersion = builder.createString(opts.clientVersion ?? "0.2.0");
   const control = HelloPayload.createHelloPayload(
     builder,
     1,
@@ -56,15 +69,17 @@ export function encodeHello(opts: {
   });
 }
 
-/** Encode an Authenticate control envelope. */
-export function encodeAuthenticate(credentials: Uint8Array): Uint8Array {
+/** Encode an Authenticate control envelope. Development remains the compatibility default. */
+export function encodeAuthenticate(
+  credentials: Uint8Array,
+  scheme: AuthenticationScheme = AuthenticationScheme.Development,
+): Uint8Array {
+  if (scheme !== AuthenticationScheme.Development && scheme !== AuthenticationScheme.Bearer) {
+    throw new Error("authentication scheme must be Development or Bearer");
+  }
   const builder = new flatbuffers.Builder(256);
   const creds = builder.createByteVector(credentials);
-  const control = AuthenticatePayload.createAuthenticatePayload(
-    builder,
-    AuthenticationScheme.Development,
-    creds,
-  );
+  const control = AuthenticatePayload.createAuthenticatePayload(builder, scheme, creds);
   return finishControl(
     builder,
     MessageKind.Authenticate,
@@ -92,6 +107,84 @@ export function encodeJoinSession(
     ControlPayload.JoinSessionPayload,
     control,
     { deliveryClass: DeliveryClass.ReliableOrdered, scope },
+  );
+}
+
+/** Encode a managed admission request with a nonzero correlation ID. */
+export function encodeRequestAdmission(
+  scope: ManagedEnvelopeScope,
+  idempotencyKey: string,
+): Uint8Array {
+  validateManagedScope(scope);
+  const keyLength = new TextEncoder().encode(idempotencyKey).length;
+  if (keyLength === 0 || keyLength > 256) {
+    throw new Error("idempotency key must contain 1 to 256 UTF-8 bytes");
+  }
+  const builder = new flatbuffers.Builder(512);
+  const key = builder.createString(idempotencyKey);
+  const control = RequestAdmissionPayload.createRequestAdmissionPayload(builder, key);
+  return finishControl(
+    builder,
+    MessageKind.RequestAdmission,
+    ControlPayload.RequestAdmissionPayload,
+    control,
+    { deliveryClass: DeliveryClass.ReliableOrdered, scope },
+  );
+}
+
+/** Encode a queue status request with a nonzero correlation and ticket ID. */
+export function encodeQueueStatusRequest(
+  scope: ManagedEnvelopeScope,
+  ticketId: bigint,
+): Uint8Array {
+  return encodeQueueRequest(
+    scope,
+    ticketId,
+    MessageKind.QueueStatusRequest,
+    ControlPayload.QueueStatusRequestPayload,
+    (builder) => QueueStatusRequestPayload.createQueueStatusRequestPayload(builder, ticketId),
+  );
+}
+
+/** Encode a queue heartbeat with a nonzero correlation and ticket ID. */
+export function encodeQueueHeartbeat(
+  scope: ManagedEnvelopeScope,
+  ticketId: bigint,
+): Uint8Array {
+  return encodeQueueRequest(
+    scope,
+    ticketId,
+    MessageKind.QueueHeartbeat,
+    ControlPayload.QueueHeartbeatPayload,
+    (builder) => QueueHeartbeatPayload.createQueueHeartbeatPayload(builder, ticketId),
+  );
+}
+
+/** Encode an offer claim with a nonzero correlation and ticket ID. */
+export function encodeQueueClaim(
+  scope: ManagedEnvelopeScope,
+  ticketId: bigint,
+): Uint8Array {
+  return encodeQueueRequest(
+    scope,
+    ticketId,
+    MessageKind.QueueClaim,
+    ControlPayload.QueueClaimPayload,
+    (builder) => QueueClaimPayload.createQueueClaimPayload(builder, ticketId),
+  );
+}
+
+/** Encode a queue cancellation with a nonzero correlation and ticket ID. */
+export function encodeQueueCancel(
+  scope: ManagedEnvelopeScope,
+  ticketId: bigint,
+): Uint8Array {
+  return encodeQueueRequest(
+    scope,
+    ticketId,
+    MessageKind.QueueCancel,
+    ControlPayload.QueueCancelPayload,
+    (builder) => QueueCancelPayload.createQueueCancelPayload(builder, ticketId),
   );
 }
 
@@ -234,6 +327,34 @@ function encodeOpaque(
   return builder.asUint8Array();
 }
 
+function encodeQueueRequest(
+  scope: ManagedEnvelopeScope,
+  ticketId: bigint,
+  kind: MessageKind,
+  controlType: ControlPayload,
+  createControl: (builder: flatbuffers.Builder) => number,
+): Uint8Array {
+  validateManagedScope(scope);
+  validateNonzeroU64(ticketId, "ticket ID");
+  const builder = new flatbuffers.Builder(256);
+  return finishControl(builder, kind, controlType, createControl(builder), {
+    deliveryClass: DeliveryClass.ReliableOrdered,
+    scope,
+  });
+}
+
+function validateManagedScope(scope: ManagedEnvelopeScope): void {
+  validateNonzeroU64(scope.namespaceId, "namespace ID");
+  validateNonzeroU64(scope.sessionId, "session ID");
+  validateNonzeroU64(scope.correlationId, "correlation ID");
+}
+
+function validateNonzeroU64(value: bigint, name: string): void {
+  if (value <= 0n || value > 0xffff_ffff_ffff_ffffn) {
+    throw new Error(`${name} must be a nonzero u64`);
+  }
+}
+
 function finishControl(
   builder: flatbuffers.Builder,
   kind: MessageKind,
@@ -254,7 +375,7 @@ function finishControl(
     scope.spaceEpoch ?? zero,
     zero,
     scope.senderSequence ?? zero,
-    zero,
+    scope.correlationId ?? zero,
     zero,
     0,
     controlType,

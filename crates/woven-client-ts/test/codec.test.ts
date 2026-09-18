@@ -17,6 +17,7 @@ import {
   DeliveryClass,
   MessageKind,
 } from "../generated/woven/protocol/v1.js";
+import { buildCapabilities } from "./wire-helpers.js";
 
 const codec = new EnvelopeCodec();
 const encoder = new TextEncoder();
@@ -158,6 +159,16 @@ describe("EnvelopeCodec stream framing", () => {
     const partial = bytes.subarray(0, 4);
     assert.equal(codec.decodeStream(partial), null);
   });
+
+  test("decodeStream rejects an oversized frame from the four-byte prefix", () => {
+    const bounded = new EnvelopeCodec(128, 64);
+    const prefix = new Uint8Array(4);
+    new DataView(prefix.buffer).setUint32(0, 128, true);
+    assert.throws(
+      () => bounded.decodeStream(prefix),
+      (error: unknown) => error instanceof CodecError && error.code === "FrameTooLarge",
+    );
+  });
 });
 
 describe("EnvelopeCodec error handling", () => {
@@ -178,6 +189,36 @@ describe("EnvelopeCodec error handling", () => {
     const wrong = bytes.slice();
     wrong[10] = 0x58; // corrupt an identifier byte
     assert.throws(() => codec.decode(wrong), CodecError);
+  });
+
+  test("rejects opaque payloads above the configured payload limit", () => {
+    const frame = encodeReliableEvent(
+      {
+        namespaceId: 1n,
+        sessionId: 1n,
+        spaceId: 1n,
+        spaceEpoch: 1n,
+        channelId: 1n,
+        entityId: 1n,
+      },
+      { typeId: 1n, bytes: new Uint8Array(3) },
+    );
+    assert.throws(
+      () => new EnvelopeCodec(1024, 2).decode(frame),
+      (error: unknown) => error instanceof CodecError && error.code === "PayloadTooLarge",
+    );
+  });
+
+  test("rejects variable-length control payloads above the configured payload limit", () => {
+    assert.throws(
+      () => new EnvelopeCodec(1024, 4).decode(buildCapabilities()),
+      (error: unknown) => error instanceof CodecError && error.code === "PayloadTooLarge",
+    );
+  });
+
+  test("rejects invalid frame and payload limit combinations", () => {
+    assert.throws(() => new EnvelopeCodec(0, 1), /invalid codec limits/);
+    assert.throws(() => new EnvelopeCodec(64, 65), /invalid codec limits/);
   });
 });
 

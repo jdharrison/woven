@@ -12,8 +12,8 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, trace};
 use woven_core::{Command, CommandResult, ConnectionId, Credentials};
 use woven_protocol::{
-    Authenticated, Capabilities, Codec, ControlPayload, DeliveryClass, Envelope, MessageKind,
-    MessagePayload, PROTOCOL_VERSION, ProtocolErrorCode,
+    Authenticated, AuthenticationScheme, Capabilities, Codec, ControlPayload, DeliveryClass,
+    Envelope, MessageKind, MessagePayload, PROTOCOL_VERSION, ProtocolErrorCode,
 };
 use woven_transport::{
     MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, UnroutedControl, WorkerHandle, handle_authenticated,
@@ -98,6 +98,8 @@ pub struct WebTransportConfig {
     pub worker: WorkerHandle,
     /// Exact WebTransport request path accepted by this adapter.
     pub path: Arc<str>,
+    /// Authentication scheme accepted during the WVN1 handshake.
+    pub expected_authentication_scheme: AuthenticationScheme,
     /// Server name reported in the protocol capabilities response.
     pub server_name: Arc<str>,
     /// Server version reported in the protocol capabilities response.
@@ -115,6 +117,7 @@ impl WebTransportConfig {
         Self {
             worker,
             path: Arc::from("/webtransport"),
+            expected_authentication_scheme: AuthenticationScheme::Development,
             server_name: Arc::from("woven"),
             server_version: Arc::from(env!("CARGO_PKG_VERSION")),
             origin_policy: OriginPolicy::default(),
@@ -147,6 +150,14 @@ pub fn server_endpoint(
 /// At most 4,096 connection tasks are active. When the limit is reached, acceptance pauses
 /// instead of creating an application-level backlog.
 pub async fn serve_endpoint(endpoint: ServerEndpoint, config: WebTransportConfig) {
+    serve_shared_endpoint(Arc::new(endpoint), config).await;
+}
+
+/// Accept WebTransport connection attempts on a retained shared endpoint.
+///
+/// This form lets an embedding server retain a handle for explicit shutdown while the accept
+/// loop is running. At most 4,096 connection tasks are active, matching [`serve_endpoint`].
+pub async fn serve_shared_endpoint(endpoint: Arc<ServerEndpoint>, config: WebTransportConfig) {
     let connection_tasks = Arc::new(Semaphore::new(MAX_CONNECTION_TASKS));
     loop {
         let incoming = endpoint.accept().await;
@@ -531,6 +542,16 @@ async fn handle_authenticate(
         .await;
         return Err(());
     };
+    if auth.scheme != config.expected_authentication_scheme {
+        send_error(
+            write_sender,
+            MessageKind::Authenticate,
+            ProtocolErrorCode::Unauthorized,
+            "authentication scheme is not accepted".to_owned(),
+        )
+        .await;
+        return Err(());
+    }
     let token = match String::from_utf8(auth.credentials) {
         Ok(token) => token,
         Err(_) => {

@@ -12,6 +12,7 @@ use woven_core::{
     Command, CommandResult, ConnectionId, IdempotencyKey, JoinDecision, NamespaceId,
     QueueOperation, QueueStatus, SessionId, SessionKey,
 };
+use woven_protocol::AuthenticationScheme;
 use woven_server::{ManagedServer, ManagedServerConfig, start_managed};
 
 const ADMIN: &str = "test-independent-admin-credential-0123456789";
@@ -51,6 +52,7 @@ impl Fixture {
             certificate_file: self.path.join("cert.pem"),
             private_key_file: self.path.join("key.pem"),
             admin_token_file: self.path.join("admin"),
+            webtransport: None,
         }
     }
     async fn client(
@@ -58,13 +60,14 @@ impl Fixture {
         server: &ManagedServer,
         token: &str,
     ) -> Result<Client, woven_client::ClientError> {
-        Client::connect_with_tls(
+        Client::connect_with_tls_and_auth(
             ClientConfig {
                 url: format!("quic://{}", server.quic_address),
                 token: token.into(),
                 ..ClientConfig::default()
             },
             ClientTlsConfig::from_ca_pem(self.pem.as_bytes()).unwrap(),
+            AuthenticationScheme::Bearer,
         )
         .await
     }
@@ -118,6 +121,8 @@ async fn host_contract_and_quic_scope_revocation() {
         let fixture = Fixture::new();
         let server = start_managed(fixture.config()).await.unwrap();
         assert_eq!(server.worker.live_counts().await.unwrap().sessions_active, 0);
+        assert!(server.webtransport_address.is_none());
+        assert!(server.webtransport_url.is_none());
         let path = "/v1/namespaces/1/sessions/1";
         let a = "a".repeat(64);
         let b = "b".repeat(64);
@@ -127,6 +132,13 @@ async fn host_contract_and_quic_scope_revocation() {
         let (status, node) = http(server.admin_address, "GET", "/v1/node", &headers(&server), "").await;
         assert_eq!(status, 200);
         assert_eq!(node["nodeIncarnation"], server.node_incarnation);
+        assert_eq!(
+            node["transports"],
+            json!({"quic": true, "webTransport": {"enabled": false}})
+        );
+        assert!(node["transports"]["webTransport"]
+            .get("certificateSha256")
+            .is_none());
         assert_eq!(node["spaces"], json!([
             {"spaceId": "1", "epoch": "1", "channelIds": ["1"]},
             {"spaceId": "2", "epoch": "1", "channelIds": ["1"]}

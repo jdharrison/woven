@@ -2,10 +2,12 @@ import { test, describe, beforeEach } from "node:test";
 import { strict as assert } from "node:assert";
 import { WovenClient } from "../src/client.js";
 import { EnvelopeCodec, DecodedEnvelope } from "../src/codec.js";
-import { MessageKind, DeliveryClass, ControlPayload } from "../generated/woven/protocol/v1.js";
-import { Envelope as FbEnvelope } from "../generated/woven/protocol/v1/envelope.js";
-import * as flatbuffers from "flatbuffers";
-import { WebTransport, WebTransportBidirectionalStream } from "../src/webtransport.js";
+import { MessageKind, ControlPayload } from "../generated/woven/protocol/v1.js";
+import {
+  WebTransport,
+  WebTransportBidirectionalStream,
+  WebTransportOptions,
+} from "../src/webtransport.js";
 import {
   encodeHello,
   encodeAuthenticate,
@@ -13,35 +15,11 @@ import {
   encodeSubscribeSpace,
   encodeReliableEvent,
 } from "../src/encode.js";
+import { buildAuthenticated, buildCapabilities } from "./wire-helpers.js";
 
 const codec = new EnvelopeCodec();
 const encoder = new TextEncoder();
 
-/** Build a minimal valid size-prefixed Envelope frame with just a message kind. */
-function buildControlFrame(kind: MessageKind): Uint8Array {
-  const builder = new flatbuffers.Builder(128);
-  const root = FbEnvelope.createEnvelope(
-    builder,
-    1,
-    kind,
-    DeliveryClass.ReliableOrdered,
-    0n,
-    0n,
-    0n,
-    0n,
-    0n,
-    0n,
-    0n,
-    0n,
-    0n,
-    0,
-    ControlPayload.NONE,
-    0,
-    0n,
-  );
-  FbEnvelope.finishSizePrefixedEnvelopeBuffer(builder, root);
-  return builder.asUint8Array();
-}
 
 /**
  * A minimal in-memory WebTransport server that speaks enough of the Woven
@@ -57,7 +35,12 @@ class FakeServer {
   private pushQueue: Uint8Array[] = [];
   private acc = new Uint8Array(0);
 
-  constructor() {
+  constructor(
+    private readonly respondToHello = true,
+    private readonly respondToAuthenticate = true,
+    private readonly capabilitiesFrame = buildCapabilities(),
+    private readonly authenticatedFrame = buildAuthenticated(),
+  ) {
     const self = this;
     this.readable = new ReadableStream<Uint8Array>({
       start: (c) => {
@@ -93,16 +76,19 @@ class FakeServer {
       this.acc = this.acc.subarray(result.consumed);
       const envelope = result.envelope;
       this.requests.push(envelope);
-      if (envelope.messageKind === MessageKind.Hello) {
-        this.pushFrame(buildControlFrame(MessageKind.Capabilities));
-      } else if (envelope.messageKind === MessageKind.Authenticate) {
-        this.pushFrame(buildControlFrame(MessageKind.Authenticated));
+      if (envelope.messageKind === MessageKind.Hello && this.respondToHello) {
+        this.pushFrame(this.capabilitiesFrame);
+      } else if (
+        envelope.messageKind === MessageKind.Authenticate &&
+        this.respondToAuthenticate
+      ) {
+        this.pushFrame(this.authenticatedFrame);
       }
     }
   }
 }
 
-function makeWebTransport(server: FakeServer): WebTransport {
+function makeWebTransport(server: FakeServer, onClose: () => void = () => {}): WebTransport {
   return {
     ready: Promise.resolve(),
     closed: Promise.resolve({ closeCode: 0 }),
@@ -115,7 +101,7 @@ function makeWebTransport(server: FakeServer): WebTransport {
       outgoingHighWaterMark: 0,
     },
     createBidirectionalStream: async () => server.bidi,
-    close: () => {},
+    close: onClose,
   } as WebTransport;
 }
 
@@ -132,10 +118,115 @@ describe("WovenClient handshake over mocked WebTransport", () => {
     const client = await WovenClient.fromTransport(wt, server.bidi, {
       url: "https://localhost:4433/webtransport",
       token: "dev-token",
+      connectTimeoutMs: 1_000,
     });
     assert.equal(server.requests[0]!.messageKind, MessageKind.Hello);
     assert.equal(server.requests[1]!.messageKind, MessageKind.Authenticate);
     client.close();
+  });
+
+  test("rejects semantically invalid Capabilities and Authenticated payloads", async () => {
+    const cases = [
+      new FakeServer(true, true, buildCapabilities({ selectedProtocolVersion: 2 })),
+      new FakeServer(true, true, buildCapabilities({ maxFrameSize: 0 })),
+      new FakeServer(true, true, buildCapabilities({ maxFrameSize: 64, maxPayloadSize: 65 })),
+      new FakeServer(true, true, buildCapabilities({ envelopeProtocolVersion: 2 })),
+      new FakeServer(
+        true,
+        true,
+        buildCapabilities({ controlType: ControlPayload.AuthenticatedPayload }),
+      ),
+      new FakeServer(true, true, buildCapabilities(), buildAuthenticated({ principalId: 0n })),
+      new FakeServer(
+        true,
+        true,
+        buildCapabilities(),
+        buildAuthenticated({ controlType: ControlPayload.CapabilitiesPayload }),
+      ),
+    ];
+
+    for (const invalidServer of cases) {
+      let closeCount = 0;
+      await assert.rejects(
+        WovenClient.fromTransport(
+          makeWebTransport(invalidServer, () => {
+            closeCount += 1;
+          }),
+          invalidServer.bidi,
+          {
+            url: "https://localhost:4433/webtransport",
+            token: "dev-token",
+            connectTimeoutMs: 1_000,
+          },
+        ),
+      );
+      assert.equal(closeCount, 1);
+    }
+  });
+
+  test("rejects invalid advertised client limits before handshake I/O", async () => {
+    const untouchedServer = new FakeServer();
+    const untouchedTransport = makeWebTransport(untouchedServer);
+    for (const limits of [
+      { maxFrameBytes: 0, maxPayloadBytes: 1 },
+      { maxFrameBytes: 64, maxPayloadBytes: 0 },
+      { maxFrameBytes: 64, maxPayloadBytes: 65 },
+      { maxFrameBytes: 64.5, maxPayloadBytes: 32 },
+      { maxFrameBytes: 0x1_0000_0000, maxPayloadBytes: 32 },
+    ]) {
+      await assert.rejects(
+        WovenClient.fromTransport(untouchedTransport, untouchedServer.bidi, {
+          url: "https://localhost:4433/webtransport",
+          token: "dev-token",
+          ...limits,
+        }),
+        /maxFrameBytes and maxPayloadBytes/,
+      );
+    }
+    assert.equal(untouchedServer.requests.length, 0);
+  });
+
+  test("a stalled WVN1 handshake times out and closes an injected transport", async () => {
+    const stalledServer = new FakeServer(false);
+    let closeCount = 0;
+    const stalledTransport = makeWebTransport(stalledServer, () => {
+      closeCount += 1;
+    });
+
+    await assert.rejects(
+      WovenClient.fromTransport(stalledTransport, stalledServer.bidi, {
+        url: "https://localhost:4433/webtransport",
+        token: "dev-token",
+        connectTimeoutMs: 20,
+      }),
+      (error: unknown) => {
+        const value = error as Error;
+        return value.name === "TimeoutError" && value.message === "WVN1 handshake timed out";
+      },
+    );
+    assert.equal(stalledServer.requests[0]?.messageKind, MessageKind.Hello);
+    assert.equal(closeCount, 1);
+  });
+
+  test("fromTransport rejects invalid timeouts before handshake I/O", async () => {
+    const untouchedServer = new FakeServer();
+    let closeCount = 0;
+    const untouchedTransport = makeWebTransport(untouchedServer, () => {
+      closeCount += 1;
+    });
+
+    for (const connectTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+      await assert.rejects(
+        WovenClient.fromTransport(untouchedTransport, untouchedServer.bidi, {
+          url: "https://localhost:4433/webtransport",
+          token: "dev-token",
+          connectTimeoutMs,
+        }),
+        /connectTimeoutMs must be a positive finite number/,
+      );
+    }
+    assert.equal(untouchedServer.requests.length, 0);
+    assert.equal(closeCount, 0);
   });
 
   test("joinSession and subscribeSpace are sent and decoded", async () => {
@@ -181,6 +272,64 @@ describe("WovenClient handshake over mocked WebTransport", () => {
     assert.deepEqual(envelope.payload, encoder.encode("from-server"));
     client.close();
   });
+
+  test("an oversized incoming prefix fails closed before frame accumulation", async () => {
+    const boundedServer = new FakeServer();
+    let closeCount = 0;
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(boundedServer, () => {
+        closeCount += 1;
+      }),
+      boundedServer.bidi,
+      {
+        url: "https://localhost:4433/webtransport",
+        token: "dev-token",
+        maxFrameBytes: 256,
+        maxPayloadBytes: 128,
+      },
+    );
+    const prefix = new Uint8Array(4);
+    new DataView(prefix.buffer).setUint32(0, 256, true);
+    boundedServer.pushFrame(prefix);
+    await assert.rejects(client.recv(), (error: unknown) => {
+      const value = error as { kind?: string; message?: string };
+      return value.kind === "protocol" && value.message?.includes("exceeds limit") === true;
+    });
+    assert.equal(closeCount, 1);
+  });
+
+  test("a burst beyond the bounded decoded inbox fails closed", async () => {
+    const boundedServer = new FakeServer();
+    let closeCount = 0;
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(boundedServer, () => {
+        closeCount += 1;
+      }),
+      boundedServer.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+    const frame = encodeReliableEvent(
+      {
+        namespaceId: 1n,
+        sessionId: 1n,
+        spaceId: 1n,
+        spaceEpoch: 1n,
+        channelId: 1n,
+        entityId: 1n,
+        senderSequence: 1n,
+      },
+      { typeId: 1n, bytes: encoder.encode("x") },
+    );
+    const burst = new Uint8Array(frame.length * 65);
+    for (let index = 0; index < 65; index += 1) burst.set(frame, index * frame.length);
+    boundedServer.pushFrame(burst);
+
+    await assert.rejects(client.recv(), (error: unknown) => {
+      const value = error as { kind?: string; message?: string };
+      return value.kind === "protocol" && value.message?.includes("pending envelope queue") === true;
+    });
+    assert.equal(closeCount, 1);
+  });
 });
 
 describe("WovenClient connect: quic:// derives WebTransport endpoint", () => {
@@ -201,6 +350,202 @@ describe("WovenClient connect: quic:// derives WebTransport endpoint", () => {
       });
       assert.deepEqual(seenUrl, ["https://127.0.0.1:8082/webtransport"]);
       client.close();
+    } finally {
+      delete (globalThis as Record<string, unknown>).WebTransport;
+    }
+  });
+
+  test("connect applies its timeout to a stalled handshake and closes exactly once", async () => {
+    const stalledServer = new FakeServer(false);
+    let closeCount = 0;
+    const SpyingWebTransport = function (_url: string) {
+      return makeWebTransport(stalledServer, () => {
+        closeCount += 1;
+      });
+    } as unknown as typeof globalThis.WebTransport;
+
+    (globalThis as Record<string, unknown>).WebTransport = SpyingWebTransport;
+    try {
+      await assert.rejects(
+        WovenClient.connect({
+          url: "https://localhost:4433/webtransport",
+          token: "dev-token",
+          connectTimeoutMs: 20,
+        }),
+        (error: unknown) => {
+          const value = error as Error;
+          return value.name === "TimeoutError" && value.message === "WVN1 handshake timed out";
+        },
+      );
+      assert.equal(stalledServer.requests[0]?.messageKind, MessageKind.Hello);
+      assert.equal(closeCount, 1);
+    } finally {
+      delete (globalThis as Record<string, unknown>).WebTransport;
+    }
+  });
+
+  test("connect carries only the remaining deadline into the WVN1 handshake", async (context) => {
+    const stalledServer = new FakeServer(false);
+    let resolveReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let now = 0;
+    const originalNow = performance.now;
+    Object.defineProperty(performance, "now", {
+      configurable: true,
+      value: () => now,
+    });
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+
+    const SpyingWebTransport = function (_url: string) {
+      return { ...makeWebTransport(stalledServer), ready };
+    } as unknown as typeof globalThis.WebTransport;
+    (globalThis as Record<string, unknown>).WebTransport = SpyingWebTransport;
+
+    try {
+      const connection = WovenClient.connect({
+        url: "https://localhost:4433/webtransport",
+        token: "dev-token",
+        connectTimeoutMs: 100,
+      });
+      let settled = false;
+      void connection.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      now = 60;
+      resolveReady();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(stalledServer.requests[0]?.messageKind, MessageKind.Hello);
+
+      context.mock.timers.tick(39);
+      await Promise.resolve();
+      assert.equal(settled, false);
+
+      context.mock.timers.tick(1);
+      await assert.rejects(connection, /WVN1 handshake timed out/);
+    } finally {
+      context.mock.timers.reset();
+      Object.defineProperty(performance, "now", {
+        configurable: true,
+        value: originalNow,
+      });
+      delete (globalThis as Record<string, unknown>).WebTransport;
+    }
+  });
+
+  test("connect rejects invalid timeouts before resolving or constructing WebTransport", async () => {
+    delete (globalThis as Record<string, unknown>).WebTransport;
+    await assert.rejects(
+      WovenClient.connect({
+        url: "https://localhost:4433/webtransport",
+        token: "dev-token",
+        connectTimeoutMs: 0,
+      }),
+      /connectTimeoutMs must be a positive finite number/,
+    );
+
+    let constructorCalls = 0;
+    const SpyingWebTransport = function (_url: string) {
+      constructorCalls += 1;
+      return makeWebTransport(new FakeServer());
+    } as unknown as typeof globalThis.WebTransport;
+
+    (globalThis as Record<string, unknown>).WebTransport = SpyingWebTransport;
+    try {
+      for (const connectTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+        await assert.rejects(
+          WovenClient.connect({
+            url: "https://localhost:4433/webtransport",
+            token: "dev-token",
+            connectTimeoutMs,
+          }),
+          /connectTimeoutMs must be a positive finite number/,
+        );
+      }
+      assert.equal(constructorCalls, 0);
+    } finally {
+      delete (globalThis as Record<string, unknown>).WebTransport;
+    }
+  });
+
+  test("connect forwards validated WebTransport constructor options", async () => {
+    const server = new FakeServer();
+    const seenOptions: (WebTransportOptions | undefined)[] = [];
+    const hash = new Uint8Array(32).fill(7);
+
+    const SpyingWebTransport = function (_url: string, options?: WebTransportOptions) {
+      seenOptions.push(options);
+      return makeWebTransport(server);
+    } as unknown as typeof globalThis.WebTransport;
+
+    (globalThis as Record<string, unknown>).WebTransport = SpyingWebTransport;
+    try {
+      const client = await WovenClient.connect({
+        url: "https://localhost:4433/webtransport",
+        token: "dev-token",
+        webTransportOptions: {
+          allowPooling: false,
+          requireUnreliable: true,
+          congestionControl: "throughput",
+          serverCertificateHashes: [{ algorithm: "sha-256", value: hash }],
+        },
+      });
+      assert.equal(seenOptions[0]?.allowPooling, false);
+      assert.equal(seenOptions[0]?.requireUnreliable, true);
+      assert.equal(seenOptions[0]?.congestionControl, "throughput");
+      assert.deepEqual(
+        seenOptions[0]?.serverCertificateHashes?.[0]?.value,
+        hash,
+      );
+      assert.notEqual(seenOptions[0]?.serverCertificateHashes?.[0]?.value, hash);
+      client.close();
+    } finally {
+      delete (globalThis as Record<string, unknown>).WebTransport;
+    }
+  });
+
+  test("connect rejects malformed or excessive server certificate hashes before construction", async () => {
+    const calls: string[] = [];
+    const SpyingWebTransport = function (url: string) {
+      calls.push(url);
+      return makeWebTransport(new FakeServer());
+    } as unknown as typeof globalThis.WebTransport;
+
+    (globalThis as Record<string, unknown>).WebTransport = SpyingWebTransport;
+    try {
+      await assert.rejects(
+        WovenClient.connect({
+          url: "https://localhost:4433/webtransport",
+          token: "dev-token",
+          webTransportOptions: {
+            serverCertificateHashes: [
+              { algorithm: "sha-256", value: new Uint8Array(31) },
+            ],
+          },
+        }),
+        /must be 32 bytes/,
+      );
+      await assert.rejects(
+        WovenClient.connect({
+          url: "https://localhost:4433/webtransport",
+          token: "dev-token",
+          webTransportOptions: {
+            serverCertificateHashes: Array.from({ length: 9 }, () => ({
+              algorithm: "sha-256" as const,
+              value: new Uint8Array(32),
+            })),
+          },
+        }),
+        /cannot exceed 8/,
+      );
+      assert.deepEqual(calls, []);
     } finally {
       delete (globalThis as Record<string, unknown>).WebTransport;
     }

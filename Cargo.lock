@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "woven-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "libc",
@@ -1867,6 +1867,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "woven-client",
  "woven-core",
  "woven-inference-coordinator",
@@ -1891,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "woven-transport-quic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "quinn",

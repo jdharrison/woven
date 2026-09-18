@@ -88,6 +88,7 @@ async fn host_api_to_managed_node() {
             certificate_file: fixture.join("cert.pem"),
             private_key_file: fixture.join("key.pem"),
             admin_token_file: fixture.join("admin"),
+            webtransport: None,
         })
         .await
         .unwrap();

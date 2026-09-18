@@ -17,6 +17,10 @@ fn settings() -> BTreeMap<&'static str, String> {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table-driven matrix covers all managed environment invariants"
+)]
 fn environment_requires_complete_explicit_nonmixed_configuration() {
     let values = settings();
     assert!(
@@ -50,6 +54,121 @@ fn environment_requires_complete_explicit_nonmixed_configuration() {
             .is_none()
     );
     assert!(ManagedServerConfig::from_lookup(|_| Err(invalid())).is_err());
+
+    for (key, value) in [
+        ("WOVEN_MANAGED_WEBTRANSPORT", "1"),
+        ("WOVEN_WEBTRANSPORT_BIND", "127.0.0.1:0"),
+        ("WOVEN_WEBTRANSPORT_PATH", "/managed-webtransport"),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test",
+        ),
+    ] {
+        let mut incomplete = values.clone();
+        incomplete.insert(key, value.to_owned());
+        assert!(ManagedServerConfig::from_lookup(|key| Ok(incomplete.get(key).cloned())).is_err());
+    }
+
+    let mut with_webtransport = values.clone();
+    with_webtransport.extend([
+        ("WOVEN_MANAGED_WEBTRANSPORT", "1".to_owned()),
+        ("WOVEN_WEBTRANSPORT_BIND", "127.0.0.1:0".to_owned()),
+        (
+            "WOVEN_WEBTRANSPORT_PATH",
+            "/managed-webtransport".to_owned(),
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test,https://operator.example.test:8443".to_owned(),
+        ),
+    ]);
+    let config = ManagedServerConfig::from_lookup(|key| Ok(with_webtransport.get(key).cloned()))
+        .unwrap()
+        .unwrap();
+    let webtransport = config.webtransport.unwrap();
+    assert_eq!(webtransport.path, "/managed-webtransport");
+    assert_eq!(
+        webtransport.allowed_origins,
+        [
+            "https://console.example.test",
+            "https://operator.example.test:8443"
+        ]
+    );
+
+    for (key, value) in [
+        ("WOVEN_MANAGED_WEBTRANSPORT", "0"),
+        ("WOVEN_WEBTRANSPORT_BIND", "invalid"),
+        ("WOVEN_WEBTRANSPORT_PATH", "managed-webtransport"),
+        ("WOVEN_WEBTRANSPORT_PATH", "/managed?query=true"),
+        ("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS", ""),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test/path",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test/",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test?query=true",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test#fragment",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://user@console.example.test",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "HTTPS://console.example.test",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://Console.Example.Test",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test:443",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "http://console.example.test:80",
+        ),
+        (
+            "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+            "https://console.example.test,https://console.example.test",
+        ),
+    ] {
+        let mut invalid_values = with_webtransport.clone();
+        invalid_values.insert(key, value.to_owned());
+        assert!(
+            ManagedServerConfig::from_lookup(|key| Ok(invalid_values.get(key).cloned())).is_err()
+        );
+    }
+
+    let mut oversized_origins = with_webtransport.clone();
+    oversized_origins.insert(
+        "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+        "a".repeat(MAX_WEBTRANSPORT_ORIGIN_ENV_BYTES + 1),
+    );
+    assert!(
+        ManagedServerConfig::from_lookup(|key| Ok(oversized_origins.get(key).cloned())).is_err()
+    );
+
+    let mut too_many_origins = with_webtransport;
+    too_many_origins.insert(
+        "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+        (0..=MAX_WEBTRANSPORT_ORIGINS)
+            .map(|index| format!("https://origin-{index}.example.test"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    assert!(
+        ManagedServerConfig::from_lookup(|key| Ok(too_many_origins.get(key).cloned())).is_err()
+    );
 }
 
 #[tokio::test]
@@ -60,6 +179,7 @@ async fn admin_limits_and_secret_separation_are_enforced_before_dispatch() {
         worker,
         "node".into(),
         "test-admin-credential-0123456789012345",
+        None,
     ));
     for _ in 0..32 {
         assert!(state.rate_permitted());

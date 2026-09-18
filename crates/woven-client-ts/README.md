@@ -5,19 +5,33 @@ The browser client for Woven, generated FlatBuffers bindings plus a real
 API. Per ADR 0014, browsers connect over **WebTransport** (QUIC over HTTPS/HTTP-3),
 so this is the full native client path for web runtimes — not just a codec.
 
-## Managed admission compatibility
+## Managed admission
 
-Generated WVN1 bindings include RequestAdmission, AdmissionResult, QueueStatusRequest,
-QueueHeartbeat, QueueClaim, QueueCancel, and QueueUpdate. `EnvelopeCodec` parses them
-and validates managed scope, correlation, union/kind matching, IDs and result fields.
-Tickets remain `bigint`; polling advice and remaining lifetimes are numbers in ms.
-Zero remaining lifetime means unavailable, not a fresh TTL. Public exports include
-managed payload classes and AdmissionStatus/AdmissionRejectionCode/QueueState enums.
+The WebTransport client supports the managed WVN1 admission flow with the same bounds
+and fail-closed behavior as the Rust client:
 
-This is **wire codec compatibility only**: no managed browser WebTransport composition,
-queue runner, or remote managed browser support is provided. Do not infer a managed
-WebTransport endpoint from a Host-provided native QUIC endpoint. The Rust native
-client owns this slice's managed connection/admission API.
+- `requestAdmission`, `queueStatus`, `queueHeartbeat`, `queueClaim`, and `queueCancel`
+  perform one request/reply exchange with caller-supplied nonzero correlation IDs;
+- `admitWithCancellation` starts at correlation ID 1, polls with monotone IDs, clamps
+  server polling advice to 1–5 seconds, and never retries transport operations;
+- each exchange is limited to 10 seconds and the caller's total timeout must be positive
+  and no greater than 15 minutes;
+- cancellation, timeout, malformed current replies, or ticket mismatches close the
+  WebTransport session because partial stream I/O cannot safely be replayed;
+- replies are dispatched by exact namespace/session/correlation; bounded stale replies remain
+  available to `recv()`, and a `ProtocolError` is current only when its scope, correlation, and
+  related request kind all match the active exchange;
+- admission and queue replies are returned as normalized `AdmissionResult` and
+  `QueueUpdate` objects. Tickets remain `bigint`; polling advice and remaining lifetimes
+  are numbers in milliseconds. Zero remaining lifetime means unavailable, not a fresh TTL.
+
+Use a fresh authenticated client before subscriptions or publishing. During a managed
+exchange or runner, that operation exclusively owns the control-stream reader. A semantic
+`Rejected`, `Paused`, `Cancelled`, `Expired`, or `Missing` response is returned as data,
+not retried or converted into a transport error.
+
+A Host-provided endpoint still must be an actual browser WebTransport endpoint. The
+client does not convert a native-only managed QUIC listener into WebTransport support.
 
 ## What's here
 
@@ -40,15 +54,16 @@ The encoder is validated for wire compatibility in both directions:
 ## Using the client (browser)
 
 ```sh
-npm install @signalweave/woven-client
+npm install @signalweave/woven-client@^0.2.0
 ```
 
 ```ts
-import { WovenClient } from "@signalweave/woven-client";
+import { AuthenticationScheme, WovenClient } from "@signalweave/woven-client";
 
 const client = await WovenClient.connect({
   url: "quic://host:4433",
   token: "<bearer-token>",
+  authenticationScheme: AuthenticationScheme.Bearer,
 });
 
 await client.joinSession(1n, 1n);
@@ -61,7 +76,31 @@ if (envelope.messageKind === MessageKind.ReliableEvent) {
 ```
 
 The client requires a runtime that implements the WHATWG `WebTransport` API (any
-modern browser, or a Node shim).
+modern browser, or a Node shim). `authenticationScheme` defaults to
+`AuthenticationScheme.Development` for compatibility with local development nodes;
+remote managed deployments can explicitly select `AuthenticationScheme.Bearer`.
+Bearer credentials are opaque server/Host-issued values, not a client-side JWT contract.
+`connectTimeoutMs` defaults to 10 seconds and is one total monotonic deadline covering
+WebTransport readiness, bidirectional stream creation, and the complete WVN1 handshake.
+`maxFrameBytes` and `maxPayloadBytes` default to 64 KiB, must be positive bounded integers with
+payload no larger than frame, and are enforced on incoming traffic. Frame limits are checked from
+the four-byte prefix before body accumulation; partial input is capped at one frame and the
+decoded control-stream inbox is capped at 64 envelopes. Any framing, payload, or inbox-bound
+violation closes the connection.
+
+Safe WHATWG constructor options can be supplied through `webTransportOptions`. At most eight
+SHA-256 certificate hashes are accepted; each is validated as exactly 32 bytes and defensively
+copied before the constructor is called:
+
+```ts
+const client = await WovenClient.connect({
+  url: "https://127.0.0.1:4434/webtransport",
+  token: "dev-token",
+  webTransportOptions: {
+    serverCertificateHashes: [{ algorithm: "sha-256", value: certificateHash }],
+  },
+});
+```
 
 ## Standardized `quic://` URL and the deterministic port convention
 
@@ -86,6 +125,9 @@ convention is a default that deployments can override.
 `WovenClient` mirrors `woven-client`:
 
 - `connect(config)` / `fromTransport(transport, stream, config)`
+- `requestAdmission(namespaceId, sessionId, correlationId, idempotencyKey)`
+- `queueStatus(...)` / `queueHeartbeat(...)` / `queueClaim(...)` / `queueCancel(...)`
+- `admitWithCancellation(namespaceId, sessionId, idempotencyKey, timeoutMs, signal)`
 - `joinSession(namespaceId, sessionId)`
 - `subscribeSpace(namespaceId, sessionId, spaceId, spaceEpoch, channelId)`
 - `transitionEntity(...)`
@@ -98,6 +140,28 @@ convention is a default that deployments can override.
 
 All IDs are `bigint`. `recv()` returns a normalized `DecodedEnvelope` (message kind,
 delivery class, scoping IDs, payload, and the typed control payload when present).
+
+A bounded managed admission flow looks like this:
+
+```ts
+const cancellation = new AbortController();
+const outcome = await client.admitWithCancellation(
+  1n,
+  1n,
+  crypto.randomUUID(),
+  60_000,
+  cancellation.signal,
+);
+
+if (outcome.kind === "admission") {
+  console.log(outcome.result.status);
+} else {
+  console.log(outcome.update.state);
+}
+```
+
+Calling `cancellation.abort()` closes the connection. Create a fresh client before
+attempting another admission operation.
 
 ## Running the tests
 

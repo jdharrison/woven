@@ -4,6 +4,25 @@ import {
   DeliveryClass,
   MessageKind,
   ControlPayload,
+  CapabilitiesPayload,
+  AuthenticatedPayload,
+  HelloPayload,
+  AuthenticatePayload,
+  JoinSessionPayload,
+  LeaveSessionPayload,
+  SubscriptionRejectedPayload,
+  ProtocolErrorPayload,
+  ProtocolErrorCode,
+  InferenceRequestedPayload,
+  InferenceStreamChunkPayload,
+  InferenceCompletedPayload,
+  InferenceFailedPayload,
+  InferenceCancelledPayload,
+  InferenceExpiredPayload,
+  ToolCallProposedPayload,
+  ToolCallAcceptedPayload,
+  ToolCallRejectedPayload,
+  ToolCallCompletedPayload,
   RequestAdmissionPayload, AdmissionResultPayload, AdmissionStatus, AdmissionRejectionCode,
   QueueStatusRequestPayload, QueueHeartbeatPayload, QueueClaimPayload, QueueCancelPayload,
   QueueUpdatePayload, QueueState,
@@ -12,9 +31,12 @@ import { unionToControlPayload } from "../generated/woven/protocol/v1/control-pa
 
 export const PROTOCOL_VERSION = 1;
 export const FILE_IDENTIFIER = "WVN1";
+export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+export const DEFAULT_MAX_PAYLOAD_BYTES = 256 * 1024;
 
 /** Minimum frame length: 4-byte size prefix + root table offset. */
 const MIN_FRAME_LENGTH = 12;
+const MAX_SIZE_PREFIX = 0xffff_ffff;
 
 /** A framing or decoding error, mirroring the Rust `CodecError` variants. */
 export class CodecError extends Error {
@@ -69,22 +91,54 @@ export interface DecodedEnvelope {
  * N - 4. This is byte-for-byte compatible with the Rust `Codec`.
  */
 export class EnvelopeCodec {
+  readonly maxFrameBytes: number;
+  readonly maxPayloadBytes: number;
+
+  constructor(
+    maxFrameBytes = DEFAULT_MAX_FRAME_BYTES,
+    maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES,
+  ) {
+    validateLimits(maxFrameBytes, maxPayloadBytes);
+    this.maxFrameBytes = maxFrameBytes;
+    this.maxPayloadBytes = maxPayloadBytes;
+  }
+
+  /** Return the complete frame length as soon as a four-byte prefix is available. */
+  expectedFrameLength(prefixBytes: Uint8Array): number | null {
+    if (prefixBytes.length < 4) return null;
+    const prefix = readUint32LE(prefixBytes, 0);
+    if (prefix < 8) {
+      throw new CodecError("InvalidSizePrefix", `invalid size prefix ${prefix}`);
+    }
+    const frameLength = prefix + 4;
+    if (frameLength > this.maxFrameBytes) {
+      throw new CodecError(
+        "FrameTooLarge",
+        `frame length ${frameLength} exceeds limit ${this.maxFrameBytes}`,
+      );
+    }
+    return frameLength;
+  }
+
   /** Decode a full size-prefixed frame into a {@link DecodedEnvelope}. */
   decode(frame: Uint8Array): DecodedEnvelope {
-    if (frame.length < MIN_FRAME_LENGTH) {
+    const expectedLength = this.expectedFrameLength(frame);
+    if (expectedLength === null) {
       throw new CodecError(
         "TruncatedFrame",
         `frame too short: ${frame.length} bytes`,
       );
     }
-    const prefix = readUint32LE(frame, 0);
-    if (prefix < 8) {
-      throw new CodecError("InvalidSizePrefix", `invalid size prefix ${prefix}`);
+    if (expectedLength !== frame.length) {
+      throw new CodecError(
+        frame.length < expectedLength ? "TruncatedFrame" : "TrailingBytes",
+        `expected ${expectedLength} bytes frame, got ${frame.length}`,
+      );
     }
-    if (prefix !== frame.length - 4) {
+    if (frame.length < MIN_FRAME_LENGTH) {
       throw new CodecError(
         "TruncatedFrame",
-        `expected ${prefix + 4} bytes frame, got ${frame.length}`,
+        `frame too short: ${frame.length} bytes`,
       );
     }
     if (
@@ -100,11 +154,27 @@ export class EnvelopeCodec {
         `missing ${FILE_IDENTIFIER} file identifier`,
       );
     }
-    const bb = new flatbuffers.ByteBuffer(
-      new Uint8Array(frame.buffer, frame.byteOffset, frame.length),
-    );
-    const envelope = FbEnvelope.getSizePrefixedRootAsEnvelope(bb);
-    return decodeEnvelope(envelope);
+    try {
+      const bb = new flatbuffers.ByteBuffer(
+        new Uint8Array(frame.buffer, frame.byteOffset, frame.length),
+      );
+      const envelope = decodeEnvelope(FbEnvelope.getSizePrefixedRootAsEnvelope(bb));
+      const payloadLength =
+        (envelope.payload?.byteLength ?? 0) + controlVariableLength(envelope.control);
+      if (payloadLength > this.maxPayloadBytes) {
+        throw new CodecError(
+          "PayloadTooLarge",
+          `payload length ${payloadLength} exceeds limit ${this.maxPayloadBytes}`,
+        );
+      }
+      return envelope;
+    } catch (error) {
+      if (error instanceof CodecError) throw error;
+      throw new CodecError(
+        "InvalidFlatbuffer",
+        error instanceof Error ? error.message : "invalid FlatBuffer envelope",
+      );
+    }
   }
 
   /**
@@ -115,13 +185,68 @@ export class EnvelopeCodec {
   decodeStream(
     acc: Uint8Array,
   ): { envelope: DecodedEnvelope; consumed: number } | null {
-    if (acc.length < 4) return null;
-    const prefix = readUint32LE(acc, 0);
-    if (prefix < 8) throw new CodecError("InvalidSizePrefix", `invalid size prefix ${prefix}`);
-    const frameLength = prefix + 4;
-    if (acc.length < frameLength) return null;
+    const frameLength = this.expectedFrameLength(acc);
+    if (frameLength === null || acc.length < frameLength) return null;
     const frame = acc.subarray(0, frameLength);
     return { envelope: this.decode(frame), consumed: frameLength };
+  }
+}
+
+function encodedStringLength(value: string | null): number {
+  return value === null ? 0 : new TextEncoder().encode(value).byteLength;
+}
+
+function vectorLength(value: Uint8Array | null): number {
+  return value?.byteLength ?? 0;
+}
+
+function controlVariableLength(control: unknown): number {
+  if (control instanceof HelloPayload) {
+    return encodedStringLength(control.clientName()) + encodedStringLength(control.clientVersion());
+  }
+  if (control instanceof CapabilitiesPayload) {
+    return encodedStringLength(control.serverName()) + encodedStringLength(control.serverVersion());
+  }
+  if (control instanceof RequestAdmissionPayload) {
+    return encodedStringLength(control.idempotencyKey());
+  }
+  if (control instanceof AuthenticatePayload) return vectorLength(control.credentialsArray());
+  if (control instanceof JoinSessionPayload) return vectorLength(control.resumeTokenArray());
+  if (control instanceof LeaveSessionPayload) return encodedStringLength(control.reason());
+  if (control instanceof SubscriptionRejectedPayload) {
+    return encodedStringLength(control.reason());
+  }
+  if (control instanceof ProtocolErrorPayload) return encodedStringLength(control.message());
+  if (control instanceof InferenceRequestedPayload) {
+    return encodedStringLength(control.capability()) + vectorLength(control.inputArray());
+  }
+  if (control instanceof InferenceStreamChunkPayload) return vectorLength(control.chunkArray());
+  if (control instanceof InferenceCompletedPayload) return vectorLength(control.resultArray());
+  if (control instanceof InferenceFailedPayload) return encodedStringLength(control.reason());
+  if (control instanceof InferenceCancelledPayload) return encodedStringLength(control.reason());
+  if (control instanceof InferenceExpiredPayload) return encodedStringLength(control.reason());
+  if (control instanceof ToolCallProposedPayload) {
+    return encodedStringLength(control.toolId()) + vectorLength(control.argumentsArray());
+  }
+  if (control instanceof ToolCallAcceptedPayload) return encodedStringLength(control.toolId());
+  if (control instanceof ToolCallRejectedPayload) return encodedStringLength(control.reason());
+  if (control instanceof ToolCallCompletedPayload) return vectorLength(control.resultArray());
+  return 0;
+}
+
+function validateLimits(maxFrameBytes: number, maxPayloadBytes: number): void {
+  const valid =
+    Number.isInteger(maxFrameBytes) &&
+    Number.isInteger(maxPayloadBytes) &&
+    maxFrameBytes >= MIN_FRAME_LENGTH &&
+    maxFrameBytes <= MAX_SIZE_PREFIX + 4 &&
+    maxPayloadBytes > 0 &&
+    maxPayloadBytes <= maxFrameBytes;
+  if (!valid) {
+    throw new CodecError(
+      "InvalidLimits",
+      `invalid codec limits: frame=${maxFrameBytes}, payload=${maxPayloadBytes}`,
+    );
   }
 }
 
@@ -148,17 +273,127 @@ function decodeEnvelope(envelope: FbEnvelope): DecodedEnvelope {
         ? null
         : unionToControlPayload(controlType, (obj) => envelope.control(obj)),
   };
+  validateCommon(decoded);
+  validateHandshake(decoded);
+  validateProtocolError(decoded);
   validateManaged(decoded);
   return decoded;
 }
 
-/** Managed controls are codec-compatible only; this does not enable a managed browser transport. */
+function requireSemantics(valid: boolean, message: string): void {
+  if (!valid) throw new CodecError("InvalidSemantics", message);
+}
+
+function hasNoDomainPayload(e: DecodedEnvelope): boolean {
+  return e.payloadTypeId === 0n && (e.payload === null || e.payload.length === 0);
+}
+
+function isConnectionScoped(e: DecodedEnvelope): boolean {
+  return (
+    e.namespaceId === 0n &&
+    e.sessionId === 0n &&
+    e.spaceId === 0n &&
+    e.spaceEpoch === 0n &&
+    e.channelId === null &&
+    e.entityId === null
+  );
+}
+
+function validateCommon(e: DecodedEnvelope): void {
+  requireSemantics(
+    e.protocolVersion === PROTOCOL_VERSION,
+    `unsupported protocol version ${e.protocolVersion}`,
+  );
+}
+
+function validateHandshake(e: DecodedEnvelope): void {
+  const handshakeKind =
+    e.messageKind === MessageKind.Capabilities || e.messageKind === MessageKind.Authenticated;
+  const handshakeUnion =
+    e.controlType === ControlPayload.CapabilitiesPayload ||
+    e.controlType === ControlPayload.AuthenticatedPayload;
+  if (!handshakeKind && !handshakeUnion) return;
+
+  requireSemantics(
+    e.deliveryClass === DeliveryClass.ReliableOrdered &&
+      isConnectionScoped(e) &&
+      hasNoDomainPayload(e),
+    "invalid handshake envelope scope, delivery, or domain payload",
+  );
+  if (e.messageKind === MessageKind.Capabilities) {
+    if (
+      e.controlType !== ControlPayload.CapabilitiesPayload ||
+      !(e.control instanceof CapabilitiesPayload)
+    ) {
+      throw new CodecError(
+        "InvalidSemantics",
+        "Capabilities message must carry CapabilitiesPayload",
+      );
+    }
+    const capabilities = e.control;
+    requireSemantics(
+      capabilities.selectedProtocolVersion() === PROTOCOL_VERSION,
+      "Capabilities must select protocol v1",
+    );
+    requireSemantics(
+      capabilities.maxFrameSize() > 0 &&
+        capabilities.maxPayloadSize() > 0 &&
+        capabilities.maxPayloadSize() <= capabilities.maxFrameSize(),
+      "Capabilities advertised limits must be positive and payload-bounded by frame size",
+    );
+  } else {
+    if (
+      e.controlType !== ControlPayload.AuthenticatedPayload ||
+      !(e.control instanceof AuthenticatedPayload)
+    ) {
+      throw new CodecError(
+        "InvalidSemantics",
+        "Authenticated message must carry AuthenticatedPayload",
+      );
+    }
+    requireSemantics(
+      e.control.principalId() !== 0n,
+      "Authenticated principal ID must be nonzero",
+    );
+  }
+}
+
+function validateProtocolError(e: DecodedEnvelope): void {
+  const errorKind = e.messageKind === MessageKind.ProtocolError;
+  const errorUnion = e.controlType === ControlPayload.ProtocolErrorPayload;
+  if (!errorKind && !errorUnion) return;
+  if (!errorKind || !errorUnion || !(e.control instanceof ProtocolErrorPayload)) {
+    throw new CodecError(
+      "InvalidSemantics",
+      "ProtocolError message must carry ProtocolErrorPayload",
+    );
+  }
+  requireSemantics(
+    e.deliveryClass === DeliveryClass.ReliableOrdered && hasNoDomainPayload(e),
+    "invalid ProtocolError delivery or domain payload",
+  );
+  requireSemantics(
+    e.control.code() !== ProtocolErrorCode.Unknown &&
+      e.control.relatedMessageKind() !== MessageKind.Unknown,
+    "ProtocolError code and related message kind must be known",
+  );
+  const hasSpaceDetail =
+    e.spaceId !== 0n || e.spaceEpoch !== 0n || e.channelId !== null || e.entityId !== null;
+  requireSemantics(
+    !(e.namespaceId === 0n && (e.sessionId !== 0n || hasSpaceDetail)) &&
+      !(e.sessionId === 0n && hasSpaceDetail) &&
+      !(e.spaceId === 0n && (e.spaceEpoch !== 0n || e.channelId !== null || e.entityId !== null)),
+    "invalid ProtocolError optional scope",
+  );
+}
+
+/** Enforce managed-admission wire semantics before exposing an envelope to callers. */
 function validateManaged(e: DecodedEnvelope): void {
   const kindManaged = e.messageKind >= MessageKind.RequestAdmission && e.messageKind <= MessageKind.QueueUpdate;
   const unionManaged = e.controlType >= ControlPayload.RequestAdmissionPayload && e.controlType <= ControlPayload.QueueUpdatePayload;
   if (!kindManaged && !unionManaged) return;
   const require = (valid: boolean): void => {
-    if (!valid) throw new CodecError("InvalidSemantics", "invalid managed admission envelope or fields");
+    requireSemantics(valid, "invalid managed admission envelope or fields");
   };
   require(kindManaged && unionManaged && e.messageKind - e.controlType === 3);
   require(e.protocolVersion === PROTOCOL_VERSION && e.deliveryClass === DeliveryClass.ReliableOrdered);
