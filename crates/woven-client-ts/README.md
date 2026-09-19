@@ -136,7 +136,7 @@ convention is a default that deployments can override.
 - `publishState(...)` (LatestValue/entity state)
 - `requestInference(...)`
 - `recv()` / `recvTimeout(ms)`
-- `close(closeCode?, reason?)`
+- `close(closeCode?, reason?)` / `closeGracefully(timeoutMs?, closeCode?, reason?)`
 
 All IDs are `bigint`. `recv()` returns a normalized `DecodedEnvelope` (message kind,
 delivery class, scoping IDs, payload, and the typed control payload when present).
@@ -175,6 +175,17 @@ npm test          # unit tests (codec + mocked WebTransport client)
 npm run build
 npm run test:decode-fixture
 npm run test:decode-tool-call-completed
+npm run test:browser # real managed Woven + headless Chromium/WebTransport smoke
+```
+
+The browser test requires `cargo`, `openssl`, and Playwright's Chromium installation
+(`npx playwright install chromium`). It creates disposable loopback credentials and TLS files,
+provisions one managed scope, and verifies connect, Bearer authentication, admission,
+subscription, publish/echo, graceful disconnect, and CCU release. Longer runs remain bounded:
+
+```sh
+npm run test:browser -- --iterations=300
+npm run test:browser -- --duration-seconds=900
 ```
 
 ## Regenerating bindings

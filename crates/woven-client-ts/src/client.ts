@@ -106,6 +106,7 @@ function isProtocolError(envelope: DecodedEnvelope): boolean {
 
 const ADMISSION_EXCHANGE_TIMEOUT_MS = 10_000;
 const MAX_ADMISSION_WAIT_MS = 15 * 60 * 1_000;
+const MAX_GRACEFUL_CLOSE_TIMEOUT_MS = 10_000;
 const MAX_PENDING_ENVELOPES = 64;
 
 type Lifecycle = "handshaking" | "ready" | "closed";
@@ -136,6 +137,7 @@ export class WovenClient {
   private admissionExchangeActive = false;
   private admissionRunnerActive = false;
   private deferredReceive: Promise<DecodedEnvelope> | null = null;
+  private closeInitiated = false;
 
   private constructor(
     transport: WebTransport,
@@ -562,11 +564,32 @@ export class WovenClient {
     );
   }
 
-  /** Close the WebTransport session gracefully. */
+  /** Initiate WebTransport session closure without waiting for transport shutdown. */
   close(closeCode = 0, reason = "client closed"): void {
-    if (this.lifecycle === "closed") return;
-    this.lifecycle = "closed";
-    this.transport.close({ closeCode, reason });
+    if (this.closeInitiated) return;
+    this.initiateClose(closeCode, reason);
+  }
+
+  /** Close the WebTransport session and wait a bounded time for transport shutdown. */
+  async closeGracefully(
+    timeoutMs = 2_000,
+    closeCode = 0,
+    reason = "client closed",
+  ): Promise<void> {
+    const timeout = validatedGracefulCloseTimeout(timeoutMs);
+    try {
+      if (!this.closeInitiated) this.initiateClose(closeCode, reason);
+      await withTimeout(this.transport.closed, timeout, "WebTransport close timed out");
+    } catch (error) {
+      if (isWovenError(error)) throw error;
+      if (error && (error as { name?: string }).name === "TimeoutError") {
+        throw err("transport", `WebTransport close timed out after ${timeout}ms`);
+      }
+      throw err(
+        "transport",
+        `WebTransport close failed: ${runtimeErrorMessage(error, "unknown transport error")}`,
+      );
+    }
   }
 
   private async handshake(config: WovenConfig): Promise<void> {
@@ -950,10 +973,16 @@ export class WovenClient {
     }
   }
 
-  private shutdown(reason: string): void {
-    if (this.lifecycle === "closed") return;
+  private initiateClose(closeCode: number, reason: string): void {
     this.lifecycle = "closed";
-    this.transport.close({ closeCode: 0, reason });
+    if (this.closeInitiated) return;
+    this.transport.close({ closeCode, reason });
+    this.closeInitiated = true;
+  }
+
+  private shutdown(reason: string): void {
+    if (this.closeInitiated) return;
+    this.initiateClose(0, reason);
   }
 }
 
@@ -1064,6 +1093,15 @@ function validatedConnectionTimeout(value: number | undefined): number {
   return timeout;
 }
 
+function validatedGracefulCloseTimeout(value: number): number {
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_GRACEFUL_CLOSE_TIMEOUT_MS) {
+    throw new Error(
+      `timeoutMs must be a positive finite number no greater than ${MAX_GRACEFUL_CLOSE_TIMEOUT_MS}`,
+    );
+  }
+  return value;
+}
+
 function connectionNow(): number {
   return performance.now();
 }
@@ -1152,6 +1190,13 @@ function isWovenError(error: unknown): error is WovenError {
       value.kind === "handshake" ||
       value.kind === "closed")
   );
+}
+
+function runtimeErrorMessage(error: unknown, fallback: string): string {
+  if (!(error instanceof Error)) return fallback;
+  const message = error.message.replace(/[\r\n\t]+/g, " ").trim();
+  if (message.length === 0) return fallback;
+  return message.slice(0, 256);
 }
 
 function kindName(kind: MessageKind): string {

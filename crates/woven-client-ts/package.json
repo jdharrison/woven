@@ -28,6 +28,7 @@
     "lint": "npm run typecheck",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "test:browser": "node scripts/browser-e2e.mjs",
     "build": "tsc --project tsconfig.build.json",
     "prepack": "npm run build",
     "test:decode-fixture": "tsx test/decode-fixture.ts",
@@ -38,6 +39,8 @@
   },
   "devDependencies": {
     "@types/node": "22.15.3",
+    "esbuild": "0.25.9",
+    "playwright": "1.63.0",
     "tsx": "4.19.3",
     "typescript": "5.8.3"
   }

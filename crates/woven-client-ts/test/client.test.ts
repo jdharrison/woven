@@ -65,6 +65,10 @@ class FakeServer {
     else this.pushQueue.push(frame);
   }
 
+  closeStream(): void {
+    this.controller?.close();
+  }
+
   private ingest(chunk: Uint8Array): void {
     const merged = new Uint8Array(this.acc.length + chunk.length);
     merged.set(this.acc);
@@ -88,10 +92,14 @@ class FakeServer {
   }
 }
 
-function makeWebTransport(server: FakeServer, onClose: () => void = () => {}): WebTransport {
+function makeWebTransport(
+  server: FakeServer,
+  onClose: () => void = () => {},
+  closed: Promise<{ closeCode?: number; reason?: string }> = Promise.resolve({ closeCode: 0 }),
+): WebTransport {
   return {
     ready: Promise.resolve(),
-    closed: Promise.resolve({ closeCode: 0 }),
+    closed,
     datagrams: {
       readable: new ReadableStream(),
       writable: new WritableStream(),
@@ -328,6 +336,157 @@ describe("WovenClient handshake over mocked WebTransport", () => {
       const value = error as { kind?: string; message?: string };
       return value.kind === "protocol" && value.message?.includes("pending envelope queue") === true;
     });
+    assert.equal(closeCount, 1);
+  });
+});
+
+describe("WovenClient graceful close", () => {
+  test("waits for transport closure and closes exactly once", async () => {
+    const server = new FakeServer();
+    let closeCount = 0;
+    let resolveClosed!: (value: { closeCode: number }) => void;
+    const closed = new Promise<{ closeCode: number }>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(
+        server,
+        () => {
+          closeCount += 1;
+        },
+        closed,
+      ),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+
+    let settled = false;
+    const closing = client.closeGracefully().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    assert.equal(closeCount, 1);
+    assert.equal(settled, false);
+
+    resolveClosed({ closeCode: 0 });
+    await closing;
+    await client.closeGracefully();
+    client.close();
+    assert.equal(closeCount, 1);
+  });
+
+  test("still closes the transport after the control stream ends", async () => {
+    const server = new FakeServer();
+    let closeCount = 0;
+    let resolveClosed!: (value: { closeCode: number }) => void;
+    const closed = new Promise<{ closeCode: number }>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(
+        server,
+        () => {
+          closeCount += 1;
+          resolveClosed({ closeCode: 0 });
+        },
+        closed,
+      ),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+
+    server.closeStream();
+    await assert.rejects(client.recv(), (error: unknown) => {
+      const value = error as { kind?: string; message?: string };
+      return value.kind === "closed" && value.message === "control stream ended";
+    });
+    await client.closeGracefully();
+    assert.equal(closeCount, 1);
+  });
+
+  test("allows close initiation to be retried after a synchronous runtime exception", async () => {
+    const server = new FakeServer();
+    let closeCount = 0;
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(server, () => {
+        closeCount += 1;
+        if (closeCount === 1) throw new Error("runtime close failed");
+      }),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+
+    assert.throws(() => client.close(), /runtime close failed/);
+    client.close();
+    assert.equal(closeCount, 2);
+  });
+
+  test("returns a bounded Woven transport error when closure stalls", async () => {
+    const server = new FakeServer();
+    let closeCount = 0;
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(
+        server,
+        () => {
+          closeCount += 1;
+        },
+        new Promise(() => {}),
+      ),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+
+    await assert.rejects(client.closeGracefully(10), (error: unknown) => {
+      const value = error as { kind?: string; message?: string };
+      return value.kind === "transport" && value.message === "WebTransport close timed out after 10ms";
+    });
+    client.close();
+    assert.equal(closeCount, 1);
+  });
+
+  test("normalizes transport closure failures", async () => {
+    const server = new FakeServer();
+    let rejectClosed!: (reason: Error) => void;
+    const closed = new Promise<{ closeCode: number }>((_resolve, reject) => {
+      rejectClosed = reject;
+    });
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(server, () => {}, closed),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+
+    const closing = client.closeGracefully();
+    rejectClosed(new Error("runtime failure\nwith detail"));
+    await assert.rejects(closing, (error: unknown) => {
+      const value = error as { kind?: string; message?: string };
+      return (
+        value.kind === "transport" &&
+        value.message === "WebTransport close failed: runtime failure with detail"
+      );
+    });
+  });
+
+  test("rejects invalid timeouts before closing the client", async () => {
+    const server = new FakeServer();
+    let closeCount = 0;
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(server, () => {
+        closeCount += 1;
+      }),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 10_001]) {
+      await assert.rejects(
+        client.closeGracefully(timeoutMs),
+        /timeoutMs must be a positive finite number no greater than 10000/,
+      );
+    }
+    assert.equal(closeCount, 0);
+    await client.joinSession(1n, 1n);
+    client.close();
     assert.equal(closeCount, 1);
   });
 });
