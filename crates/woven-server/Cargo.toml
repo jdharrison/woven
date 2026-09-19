@@ -44,7 +44,7 @@ url.workspace = true
 libc = "=0.2.189"
 
 [dev-dependencies]
-woven-client = { path = "../woven-client-rust", version = "0.1.2" }
+woven-client = { path = "../woven-client-rust", version = "0.2.0" }
 tower.workspace = true
 
 [lints]
