@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 loader = importlib.machinery.SourceFileLoader("deploy_woven", str(Path(__file__).with_name("deploy-woven")))
 spec = importlib.util.spec_from_loader(loader.name, loader)
+if spec is None:
+    raise RuntimeError("failed to load deployment helper specification")
 deploy = importlib.util.module_from_spec(spec)
 loader.exec_module(deploy)
 A, B, C = (character * 40 for character in "abc")

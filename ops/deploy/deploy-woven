@@ -131,7 +131,7 @@ def healthy(target):
             run(["/usr/bin/systemctl", "is-active", "--quiet", UNIT], seconds=3)
             pid = run(["/usr/bin/systemctl", "show", "--property=MainPID", "--value", UNIT],
                       seconds=3, capture=True)
-            if not pid.isdecimal() or int(pid) <= 1:
+            if pid is None or not pid.isdecimal() or int(pid) <= 1:
                 raise DeployError("no service process")
             if os.readlink("/proc/" + pid + "/exe") != str(ROOT / target / "woven-server"):
                 raise DeployError("service is not running requested release")
@@ -139,8 +139,10 @@ def healthy(target):
                                          ("-Hltnp", "127.0.0.1:8080", "8080")]:
                 sockets = run(["/usr/bin/ss", flags, "sport = :" + port],
                               seconds=3, capture=True)
-                if not any(address in line.split() and "pid=" + pid + "," in line
-                           for line in sockets.splitlines()):
+                if sockets is None or not any(
+                    address in line.split() and "pid=" + pid + "," in line
+                    for line in sockets.splitlines()
+                ):
                     raise DeployError("service listener missing")
             run(["/usr/bin/curl", "--disable", "--noproxy", "*", "--fail", "--silent",
                  "--connect-timeout", "1", "--max-time", "2", "--output", "/dev/null",
