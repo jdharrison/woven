@@ -126,6 +126,7 @@ jobs:
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           cargo test --locked --workspace --all-targets --all-features
           cargo build --locked --workspace
+          RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --no-deps
       - name: Validate TypeScript package
         working-directory: crates/woven-client-ts
         run: |
@@ -134,6 +135,12 @@ jobs:
           npm run typecheck
           npm run test
           npm run build
+      - name: Install Chromium for the browser E2E
+        working-directory: crates/woven-client-ts
+        run: npx playwright install --with-deps chromium
+      - name: Test real browser WebTransport path
+        working-directory: crates/woven-client-ts
+        run: npm run test:browser -- --iterations=1
 
   security-audit:
     name: Audit release dependencies
@@ -151,7 +158,13 @@ jobs:
 
   publish:
     name: Publish selected artifact
-    needs: [prepare, validate, security-audit]
+    needs: [prepare, validate, security-audit, binaries]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.validate.result == 'success' &&
+      needs.security-audit.result == 'success' &&
+      (needs.binaries.result == 'success' || needs.binaries.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -215,7 +228,7 @@ jobs:
   binaries:
     if: needs.prepare.outputs.artifact == 'woven-server'
     name: Build ${{ matrix.target }} server binary
-    needs: [prepare, validate, publish]
+    needs: [prepare, validate, security-audit]
     strategy:
       fail-fast: false
       matrix:
@@ -250,7 +263,7 @@ jobs:
           mkdir -p release/woven-server
           cp "target/$TARGET/release/$BINARY" release/woven-server/
           cp LICENSE release/woven-server/
-          cp README.md release/woven-server/README.md
+          cp crates/woven-server/README.md release/woven-server/README.md
           tar -czf "$ARCHIVE" -C release woven-server
       - name: Package Windows archive
         if: matrix.format == 'zip'
@@ -259,7 +272,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release/woven-server | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" release/woven-server/
           Copy-Item LICENSE release/woven-server/
-          Copy-Item README.md release/woven-server/README.md
+          Copy-Item crates/woven-server/README.md release/woven-server/README.md
           Compress-Archive -Path release/woven-server -DestinationPath ${{ matrix.archive }}
       - uses: actions/upload-artifact@v4
         with:

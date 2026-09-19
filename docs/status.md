@@ -88,11 +88,15 @@ clients expose bounded admission/queue APIs and cancellation helpers. Admission 
 exclusive pre-subscription operations with ten-second timeouts; helper deadlines are positive,
 capped at 15 minutes, and perform zero transport retries. Wire remaining-lifetime fields are
 currently zero (unavailable), not fresh TTLs. The TypeScript admission implementation is covered
-with a mock WHATWG transport plus Rust/TypeScript wire compatibility, not a real browser E2E.
-Validation includes the local Host API-to-native-QUIC-client path and Rust-driven real
-WebTransport sockets, but not browser UI, a real TS-to-managed-node network path, Host-provided
-WebTransport descriptors, Weaver integration, external deployment, production Firebase/App
-Check, durable recovery/failover, or production per-user identity. See
+with a mock WHATWG transport, Rust/TypeScript wire compatibility, and a bounded real
+headless-Chromium E2E that connects the public client API to a disposable managed Woven
+WebTransport listener. It provisions one scope and verifies Bearer authentication, admission,
+subscription, publish/echo,
+graceful disconnect, and CCU release. CI and release validation install Playwright Chromium and
+gate on one bounded iteration. Validation also includes the local Host API-to-native-QUIC-client
+path and Rust-driven real WebTransport sockets, but not an application browser UI,
+Host-provided WebTransport descriptors, Weaver integration, external deployment, production
+Firebase/App Check, durable recovery/failover, or production per-user identity. See
 [managed sessions](managed-sessions.md).
 
 **Interest management** (`woven-core` + `woven-loadtest`) — bounded 2D/3D
@@ -125,8 +129,8 @@ wire-compatible in both directions against the same checked-in golden fixtures, 
 cross-language loop. These two are the focused validation surface for now; additional
 client languages (previously codec-only C# and Python bindings) are deferred and will be
 expanded one at a time after the two stable clients are hardened. Live transport behavior is
-exercised by the Rust client (QUIC + WebTransport) and the TypeScript client
-(WebTransport).
+exercised by the Rust client (QUIC + WebTransport) and by the TypeScript client in the bounded
+headless-Chromium WebTransport E2E that gates CI and release validation.
 
 See [`docs/adr`](adr) for the architecture decisions behind these choices, and
 [`AGENTS.md`](../AGENTS.md) for exact public APIs.

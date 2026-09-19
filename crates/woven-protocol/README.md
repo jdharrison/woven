@@ -103,11 +103,9 @@ VENDORED_FLATC=$(find target/debug/build -path '*/out/bin/flatc' -type f -print 
 "$VENDORED_FLATC" --version
 "$VENDORED_FLATC" --rust -o /tmp/woven-rust schemas/woven_v1.fbs
 "$VENDORED_FLATC" --ts -o /tmp/woven-ts schemas/woven_v1.fbs
-"$VENDORED_FLATC" --csharp -o /tmp/woven-csharp schemas/woven_v1.fbs
-"$VENDORED_FLATC" --python -o /tmp/woven-python schemas/woven_v1.fbs
 ```
 
-A separately installed compiler may be substituted only when `flatc --version` reports `25.12.19`. TypeScript generation, bindings, and cross-language golden-fixture decode tests are implemented in `crates/woven-client-ts`. C# generation, bindings, and golden-fixture decode tests are implemented in `crates/woven-client-csharp`, which vendors a matching FlatBuffers C# runtime rather than depending on NuGet's `Google.FlatBuffers` package (its published releases lag behind the pinned `25.12.19` compiler). Python generation, bindings, and golden-fixture decode tests are implemented in `crates/woven-client-python`, which depends directly on PyPI's `flatbuffers==25.12.19` package — no version mismatch to work around there, unlike C#.
+A separately installed compiler may be substituted only when `flatc --version` reports `25.12.19`. TypeScript generation, bindings, and cross-language golden-fixture decode tests are implemented in `crates/woven-client-ts`. C# and Python client packages are not currently shipped from this repository; both remain deferred until the Rust and TypeScript clients are hardened.
 
 ## Compatibility rules
 

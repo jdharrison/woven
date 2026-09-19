@@ -32,6 +32,10 @@ jobs:
         run: cargo test --locked --workspace --all-targets --all-features
       - name: Build
         run: cargo build --locked --workspace
+      - name: Build documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: "-Dwarnings"
+        run: cargo doc --locked --workspace --no-deps
 
   security-audit:
     name: Dependency audit
@@ -54,6 +58,8 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: crates/woven-client-ts/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         working-directory: crates/woven-client-ts
         run: npm ci
@@ -72,3 +78,11 @@ jobs:
       - name: Build package
         working-directory: crates/woven-client-ts
         run: npm run build
+      - name: Install Chromium for the browser E2E
+        working-directory: crates/woven-client-ts
+        run: npx playwright install --with-deps chromium
+      - name: Cache Rust dependencies for the offline browser E2E build
+        run: cargo fetch --locked
+      - name: Test real browser WebTransport path
+        working-directory: crates/woven-client-ts
+        run: npm run test:browser -- --iterations=1

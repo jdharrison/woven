@@ -2,6 +2,7 @@
   "name": "@signalweave/woven-client",
   "version": "0.2.0",
   "description": "Browser WebTransport client for Woven",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jdharrison/woven.git"
@@ -20,6 +21,7 @@
   },
   "files": [
     "dist",
+    "LICENSE",
     "README.md"
   ],
   "scripts": {

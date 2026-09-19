@@ -197,4 +197,4 @@ FLATC=$(find target/debug/build -path '*/out/bin/flatc' -type f -print -quit)
 ```
 
 Regenerating produces only a diff when the protocol schema changes; commit it
-alongside the schema change like the Rust, C#, and Python bindings.
+alongside the schema change and the corresponding Rust bindings.

@@ -94,8 +94,8 @@ WebTransport coverage for Bearer authentication, Development-scheme rejection, d
 queue claim, atomic admission/join followed by subscription, wrong token/scope, exact-origin
 rejection, leaf-fingerprint metadata, scope deletion, and server-drop teardown. The TypeScript
 WebTransport client exposes the same bounded admission/queue operations and cancellation helper;
-its tests use a mock WHATWG transport and Rust wire-compatibility fixtures, not a real browser
-connected to this managed listener.
+its coverage includes a mock WHATWG transport, Rust wire-compatibility fixtures, and a bounded
+headless-Chromium E2E connected to a disposable managed listener.
 
 The cross-repository `tests/host_managed_local.rs` E2E has also passed via
 `npm run test:local` from the sibling `../woven-host` checkout (relative to Woven's root).

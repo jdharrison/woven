@@ -38,24 +38,37 @@ npm install @signalweave/woven-client
 
 `woven-server` is the self-hosted server executable. `woven-client` is the native Rust library, and `@signalweave/woven-client` is the browser/WebTransport client.
 
-## Rust 0.2 migration
+## Current release versions and publication order
 
-The core, transport, inference, and server crates move together to `0.2.0` because
-`PersistenceClass::Stateful` is now `PersistenceClass::Stateful { ttl: None }`
-(or `ttl: Some(duration)` for expiry). Update constructors and pattern matches,
-and upgrade all dependencies that exchange core or inference types together;
-`0.1` and `0.2` types are not interchangeable. The minor-version boundary prevents
-existing `^0.1` consumers from resolving the breaking core API automatically.
-The wire protocol and native/browser client versions are unchanged.
-`woven-loadtest` remains workspace-only (`publish = false`).
+The current release line is `0.3.0` for `woven-core`, `woven-transport`,
+`woven-transport-quic`, all four `woven-inference-*` crates, and `woven-server`.
+`woven-protocol`, the native `woven-client`, and `@signalweave/woven-client` are
+`0.2.0`. `woven-loadtest` is also `0.3.0` but remains workspace-only
+(`publish = false`). See the [changelog](CHANGELOG.md) for current release notes.
 
-For releases, verify and publish registry dependencies before their consumers:
-core; transport and inference-core; transport-quic, inference-tools, and
-inference-test-provider; inference-coordinator; server. Run `cargo package --locked
--p <crate>` before tagging each artifact, once its dependencies are available on
-crates.io. Workspace tests alone do not verify registry dependency compatibility.
-Each artifact uses its own `release/<crate>/v<version>` tag; several tags may
-legitimately refer to the same commit.
+Publish one artifact per `release/<artifact>/v<version>` tag and wait for each
+crates.io version to become available before packaging or publishing a dependent.
+The complete dependency-first sequential order for the current manifests is:
+
+| Step | Artifact and version | Internal registry prerequisites |
+|---:|---|---|
+| 1 | `woven-core` `0.3.0` | none |
+| 2 | `woven-protocol` `0.2.0` | none |
+| 3 | `woven-client` `0.2.0` | `woven-protocol` |
+| 4 | `npm-woven-client` / `@signalweave/woven-client` `0.2.0` | current WVN1 schema and generated bindings |
+| 5 | `woven-inference-core` `0.3.0` | `woven-core` |
+| 6 | `woven-transport` `0.3.0` | `woven-core`, `woven-protocol` |
+| 7 | `woven-inference-test-provider` `0.3.0` | `woven-core` (dev), `woven-inference-core` |
+| 8 | `woven-inference-tools` `0.3.0` | `woven-core`, `woven-transport`, `woven-inference-core` |
+| 9 | `woven-transport-quic` `0.3.0` | `woven-core`, `woven-protocol`, `woven-transport` |
+| 10 | `woven-inference-coordinator` `0.3.0` | `woven-core`, `woven-protocol`, `woven-transport`, `woven-inference-core`, `woven-inference-tools` |
+| 11 | `woven-server` `0.3.0` | every Rust crate above, including `woven-client` as a dev dependency |
+
+Before tagging each Rust artifact, run `cargo package --locked -p <crate> --list`
+after its prerequisites are visible on crates.io. Before tagging the npm artifact,
+run `npm pack --dry-run` from `crates/woven-client-ts`. Workspace tests alone do not
+verify registry dependency compatibility. Several artifact tags may legitimately
+refer to the same commit.
 
 ## Local development
 
@@ -73,6 +86,8 @@ npm run lint
 npm run typecheck
 npm run test
 npm run build
+npx playwright install chromium
+npm run test:browser -- --iterations=1
 ```
 
 `run-dev.sh` starts the development-only composition on `127.0.0.1:8080` (HTTP control plane),
@@ -102,7 +117,7 @@ cargo fmt --all -- --check
 cargo check-all
 cargo lint
 cargo test-all
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --no-deps
 cargo run -p woven-protocol --example write_golden
 cargo run -p woven-protocol --example write_tool_call_completed_fixture
 ```
@@ -127,14 +142,14 @@ The two `write_*_fixture` commands regenerate the checked-in protocol golden fix
 
 ## CI and releases
 
-Pull requests and pushes to `main` run Rust formatting, Clippy, tests, and workspace builds, plus TypeScript formatting, static checks, tests, and package builds. CI never publishes packages, creates releases, or requires registry credentials.
+Pull requests and pushes to `main` run Rust formatting, Clippy, tests, workspace builds, and rustdoc with warnings denied, plus TypeScript formatting, static checks, tests, package builds, and one bounded real-Chromium WebTransport E2E iteration. CI never publishes packages, creates releases, or requires registry credentials.
 
 Pushing a `release/<artifact>/vX.Y.Z` tag starts an artifact release automatically. Each package owns its version; the workflow verifies the selected package matches the tag, validates the full workspace, and refuses an already-published registry version. It publishes only that artifact. `woven-server` releases additionally create a GitHub Release with server archives and SHA-256 checksums. Manual dispatch remains available for an existing artifact tag and requires `confirm=publish`.
 
 Required GitHub Actions secrets:
 
 - `CARGO_REGISTRY_TOKEN` — crates.io token authorized to publish the Woven crates.
-- `NPM_TOKEN` — npm automation token when npm trusted publishing is not configured. Trusted publishing uses the workflow OIDC identity and provenance instead.
+- `NPM_TOKEN` — required npm automation or granular access token authorized to publish `@signalweave/woven-client`. The current workflow uses OIDC for provenance, but it does not implement tokenless trusted publishing.
 
 Supported `woven-server` binary platform:
 
@@ -144,11 +159,12 @@ Other platforms can build `woven-server` from source with Cargo; prebuilt binari
 
 ### Maintainer release checklist
 
-1. Bump only the package being released.
-2. Confirm changelog/release notes.
-3. Push `release/<artifact>/vX.Y.Z` (for example, `release/woven-client/v0.1.3`).
-4. Monitor the release workflow; only `woven-server` releases create binary assets and a GitHub Release.
-5. Verify the selected registry package, and for server releases, checksums and downloaded binaries.
+1. Bump only the package being released and update [`CHANGELOG.md`](CHANGELOG.md).
+2. Follow the dependency-first order above and confirm every prerequisite is visible in its registry.
+3. Run the full validation suite plus `cargo package --locked -p <crate> --list` or `npm pack --dry-run` for the selected artifact.
+4. Push `release/<artifact>/vX.Y.Z` (for example, `release/woven-client/v0.2.0`).
+5. Monitor the release workflow; only `woven-server` releases create binary assets and a GitHub Release.
+6. Verify the selected registry package, and for server releases, checksums and downloaded binaries.
 
 Cloud deployment and engine distributions are intentionally not part of this pipeline yet.
 
