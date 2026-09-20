@@ -20,6 +20,10 @@ class ValidationTests(unittest.TestCase):
     def test_unit_skips_start_without_an_executable_release(self):
         unit = Path(__file__).with_name("woven-server.service").read_text()
         self.assertIn("ConditionFileIsExecutable=/opt/woven/current/woven-server\n", unit)
+        self.assertIn("Environment=WOVEN_MANAGED_QUIC=1\n", unit)
+        self.assertIn("Environment=WOVEN_MANAGED_WEBTRANSPORT=1\n", unit)
+        self.assertIn("Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083\n", unit)
+        self.assertNotIn("WOVEN_REMOTE_QUIC", unit)
         self.assertNotIn("ConditionPathIsExecutable", unit)
 
     def test_exact_sha_only(self):
@@ -490,7 +494,12 @@ class HealthTests(unittest.TestCase):
                     if "show" in args:
                         return observe("show", "123")
                     if args[0] == "/usr/bin/ss":
-                        address = "0.0.0.0:8081" if args[1] == "-Hlunp" else "127.0.0.1:8080"
+                        port = args[-1].rsplit(":", 1)[-1]
+                        address = (
+                            "0.0.0.0:" + port
+                            if args[1] == "-Hlunp"
+                            else "127.0.0.1:" + port
+                        )
                         return observe(args[1], 'UNCONN 0 0 ' + address + ' * users:(("woven",pid=123,fd=9))')
                     return observe("curl")
 
@@ -509,7 +518,12 @@ class HealthTests(unittest.TestCase):
             if "show" in args:
                 return "123"
             if args[0] == "/usr/bin/ss":
-                address = "0.0.0.0:8081" if "-Hlunp" in args else "127.0.0.1:8080"
+                port = args[-1].rsplit(":", 1)[-1]
+                address = (
+                    "0.0.0.0:" + port
+                    if "-Hlunp" in args
+                    else "127.0.0.1:" + port
+                )
                 return 'UNCONN 0 0 ' + address + ' 0.0.0.0:* users:(("woven-server",pid=123,fd=9))'
             return None
 
