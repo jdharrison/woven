@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -I
 """Install the public api.woven.host certificate and safely restart Woven."""
+import grp
 import hashlib
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ import tempfile
 import time
 
 HOSTNAME = "api.woven.host"
+SERVICE_ACCOUNT = "woven"
+SERVICE_GROUP = "woven"
 SOURCE = Path("/etc/letsencrypt/live") / HOSTNAME
 ARCHIVE = Path("/etc/letsencrypt/archive") / HOSTNAME
 DESTINATION = Path("/etc/woven/tls")
@@ -49,13 +52,17 @@ def run(args, *, capture=False, accepted=(0,)):
     return result.stdout if capture else result.returncode
 
 
-def trusted_directory(path, group_id):
+def trusted_directory(path, group_id, *, managed=True):
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
         raise InstallError("certificate directories must be root-owned and non-writable")
-    group_can_traverse = info.st_gid == group_id and info.st_mode & stat.S_IXGRP
-    if not group_can_traverse and not info.st_mode & stat.S_IXOTH:
-        raise InstallError("certificate directories must be traversable by the service account")
+    if managed:
+        if info.st_gid != group_id or stat.S_IMODE(info.st_mode) != 0o750:
+            raise InstallError("managed certificate directories must be root:service-group mode 0750")
+    else:
+        group_can_traverse = info.st_gid == group_id and info.st_mode & stat.S_IXGRP
+        if not group_can_traverse and not info.st_mode & stat.S_IXOTH:
+            raise InstallError("certificate directories must be traversable by the service account")
 
 
 def sync_directory(path):
@@ -74,16 +81,16 @@ def sync_file(path):
         os.close(descriptor)
 
 
-def validate_admin_credential(group_id):
+def validate_admin_credential(user_id, group_id):
     info = ADMIN_TOKEN.lstat()
     if (
         not stat.S_ISREG(info.st_mode)
-        or info.st_uid != ROOT_UID
+        or info.st_uid != user_id
         or info.st_gid != group_id
-        or stat.S_IMODE(info.st_mode) != 0o640
+        or stat.S_IMODE(info.st_mode) != 0o400
         or not 32 <= info.st_size <= 4098
     ):
-        raise InstallError("admin credential must be a bounded root:service-group mode 0640 file")
+        raise InstallError("admin credential must be a bounded service-owned mode 0400 file")
     token = ADMIN_TOKEN.read_bytes().rstrip(b"\r\n")
     if not 32 <= len(token) <= 4096 or not all(33 <= byte <= 126 for byte in token):
         raise InstallError("admin credential must contain bounded non-whitespace ASCII")
@@ -200,7 +207,7 @@ def restart_service():
         raise InstallError("service did not become healthy")
 
 
-def release_link(name, group_id):
+def release_link(name, user_id, group_id):
     path = DESTINATION / name
     if not path.is_symlink():
         if path.exists():
@@ -209,21 +216,21 @@ def release_link(name, group_id):
     target = os.readlink(path)
     if RELEASE_NAME.fullmatch(target) is None:
         raise InstallError("unexpected certificate pointer")
-    trusted_release(DESTINATION / target, group_id)
+    trusted_release(DESTINATION / target, user_id, group_id)
     return target
 
 
-def trusted_release(directory, group_id):
+def trusted_release(directory, user_id, group_id):
     trusted_directory(directory, group_id)
     for filename in ["fullchain.pem", "privkey.pem"]:
         info = (directory / filename).lstat()
         if (
             not stat.S_ISREG(info.st_mode)
-            or info.st_uid != ROOT_UID
+            or info.st_uid != user_id
             or info.st_gid != group_id
-            or stat.S_IMODE(info.st_mode) != 0o640
+            or stat.S_IMODE(info.st_mode) != 0o400
         ):
-            raise InstallError("installed certificate files must be root:service-group mode 0640")
+            raise InstallError("installed certificate files must be service-owned mode 0400")
 
 
 def point(name, target):
@@ -239,12 +246,12 @@ def point(name, target):
     sync_directory(DESTINATION)
 
 
-def stage_release(certificate_data, private_key_data, group_id):
+def stage_release(certificate_data, private_key_data, user_id, group_id):
     digest = hashlib.sha256(certificate_data).hexdigest()
     target = "releases/" + digest
     destination = DESTINATION / target
     if destination.exists():
-        trusted_release(destination, group_id)
+        trusted_release(destination, user_id, group_id)
         if (destination / "fullchain.pem").read_bytes() != certificate_data:
             raise InstallError("existing certificate release differs from source")
         if (destination / "privkey.pem").read_bytes() != private_key_data:
@@ -259,8 +266,8 @@ def stage_release(certificate_data, private_key_data, group_id):
         certificate.write_bytes(certificate_data)
         private_key.write_bytes(private_key_data)
         for path in [certificate, private_key]:
-            path.chmod(0o640)
-            os.chown(path, ROOT_UID, group_id)
+            path.chmod(0o400)
+            os.chown(path, user_id, group_id)
             sync_file(path)
         staging.chmod(0o750)
         os.chown(staging, ROOT_UID, group_id)
@@ -273,8 +280,11 @@ def stage_release(certificate_data, private_key_data, group_id):
     return target
 
 
-def prune(group_id):
-    keep = {release_link("current", group_id), release_link("previous", group_id)}
+def prune(user_id, group_id):
+    keep = {
+        release_link("current", user_id, group_id),
+        release_link("previous", user_id, group_id),
+    }
     for path in RELEASES.iterdir():
         if re.fullmatch(r"[0-9a-f]{64}", path.name) and "releases/" + path.name not in keep:
             trusted_directory(path, group_id)
@@ -282,13 +292,13 @@ def prune(group_id):
             sync_directory(RELEASES)
 
 
-def activate(target, group_id, was_active):
-    old = release_link("current", group_id)
-    previous = release_link("previous", group_id)
+def activate(target, user_id, group_id, was_active):
+    old = release_link("current", user_id, group_id)
+    previous = release_link("previous", user_id, group_id)
     if old == target:
         if was_active and not healthy():
             raise InstallError("current certificate is installed but Woven is unhealthy")
-        prune(group_id)
+        prune(user_id, group_id)
         return
     if was_active and old is None:
         raise InstallError("active service has no managed certificate rollback target")
@@ -307,33 +317,36 @@ def activate(target, group_id, was_active):
                 raise InstallError(
                     "certificate activation and service rollback failed; releases retained"
                 ) from rollback_failure
-        prune(group_id)
+        prune(user_id, group_id)
         raise InstallError("certificate activation failed; previous release restored") from failure
-    prune(group_id)
+    prune(user_id, group_id)
 
 
 def install():
     if os.geteuid() != 0:
         raise InstallError("install-woven-tls must run as root")
-    account = pwd.getpwnam("this")
-    for path in [
-        DESTINATION.parent.parent,
-        DESTINATION.parent,
-        DESTINATION,
-        RELEASES,
-        CREDENTIALS,
-    ]:
-        trusted_directory(path, account.pw_gid)
-    validate_admin_credential(account.pw_gid)
-    current = release_link("current", account.pw_gid)
-    release_link("previous", account.pw_gid)
+    account = pwd.getpwnam(SERVICE_ACCOUNT)
+    group = grp.getgrnam(SERVICE_GROUP)
+    if account.pw_gid != group.gr_gid:
+        raise InstallError("woven runtime user and group identity do not match")
+    trusted_directory(DESTINATION.parent.parent, group.gr_gid, managed=False)
+    for path in [DESTINATION.parent, DESTINATION, RELEASES, CREDENTIALS]:
+        trusted_directory(path, group.gr_gid)
+    validate_admin_credential(account.pw_uid, group.gr_gid)
+    current = release_link("current", account.pw_uid, group.gr_gid)
+    release_link("previous", account.pw_uid, group.gr_gid)
     certificate_data = read_source("fullchain.pem", MAX_CERTIFICATE_BYTES)
     private_key_data = read_source("privkey.pem", MAX_PRIVATE_KEY_BYTES, private=True)
     active = service_active()
     if active and current is None:
         raise InstallError("active service has no managed certificate release")
-    target = stage_release(certificate_data, private_key_data, account.pw_gid)
-    activate(target, account.pw_gid, active)
+    target = stage_release(
+        certificate_data,
+        private_key_data,
+        account.pw_uid,
+        group.gr_gid,
+    )
+    activate(target, account.pw_uid, group.gr_gid, active)
 
 
 def main():

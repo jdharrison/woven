@@ -119,6 +119,17 @@ fn scope() -> SessionKey {
 async fn host_contract_and_quic_scope_revocation() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let fixture = Fixture::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["key.pem", "admin"] {
+                std::fs::set_permissions(
+                    fixture.path.join(name),
+                    std::fs::Permissions::from_mode(0o400),
+                )
+                .unwrap();
+            }
+        }
         let server = start_managed(fixture.config()).await.unwrap();
         assert_eq!(server.worker.live_counts().await.unwrap().sessions_active, 0);
         assert!(server.webtransport_address.is_none());

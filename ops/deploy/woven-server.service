@@ -7,8 +7,8 @@ ConditionFileIsExecutable=/opt/woven/current/woven-server
 
 [Service]
 Type=simple
-User=this
-Group=this
+User=woven
+Group=woven
 WorkingDirectory=/opt/woven
 ExecStart=/opt/woven/current/woven-server --log-none
 Environment=WOVEN_MANAGED_QUIC=1

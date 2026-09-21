@@ -86,8 +86,24 @@ def fetch_source():
 
 def trusted_directory(path):
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-        raise DeployError("deployment directories must be real root-owned, non-writable directories")
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o755
+    ):
+        raise DeployError(
+            "deployment directories must be real root-owned mode 0755 directories"
+        )
+
+
+def trusted_binary(path):
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o755
+    ):
+        raise DeployError("release binary must be a regular root-owned mode 0755 file")
 
 
 def release_link(name):
@@ -101,10 +117,7 @@ def release_link(name):
         raise DeployError("unexpected release pointer")
     directory = ROOT / target
     trusted_directory(directory)
-    binary = directory / "woven-server"
-    info = binary.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-        raise DeployError("release binary must be a regular root-owned, non-writable file")
+    trusted_binary(directory / "woven-server")
     return target
 
 

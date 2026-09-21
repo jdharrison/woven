@@ -89,13 +89,17 @@ Prepare root-controlled destinations before issuance:
 /etc/woven/credentials/admin-token
 ```
 
-`/etc/woven`, `tls`, `tls/releases`, and `credentials` must be real root-owned,
-`this`-group directories with mode `0750`; `/etc` must remain traversable. The hook
-fails closed if the service account cannot traverse every configured parent.
-Certificate releases contain regular `root:this` mode-`0640` files and are selected
-through the atomic `/etc/woven/tls/current` symlink. The admin token is also
-root-owned and readable by the service group. Never print token or private-key
-contents.
+`woven` is a dedicated locked system account with no login shell or home directory;
+it is never used for checkout access, builds, or operator SSH. `/etc/woven`, `tls`,
+`tls/releases`, and `credentials` must be exactly `root:woven` mode `0750`; `/etc`
+must remain traversable. The hook fails closed on any other managed-directory
+metadata. Certificate releases contain regular `woven:woven` mode-`0400` files and
+are selected through the atomic `/etc/woven/tls/current` symlink. The admin token
+uses the same owner and mode. Woven deliberately rejects group/other access on
+private keys and credentials; `0640` is invalid even when the group is the service
+group. Root-owned directories plus systemd `ProtectSystem=strict` keep these files
+read-only to the runtime, while build scripts running as `this` cannot access them.
+Never print token or private-key contents.
 
 The hook accepts material only from Certbot's fixed
 `/etc/letsencrypt/archive/api.woven.host` lineage. It requires exactly one DNS SAN,
@@ -137,7 +141,7 @@ The admin credential is independent of every client/server token. It authorizes
 only the loopback admin API and must never be accepted by QUIC, returned to clients,
 placed in the systemd unit, or stored in the repository. Generate it once with at
 least 32 random bytes, write it directly to
-`/etc/woven/credentials/admin-token`, and set owner `root:this`, mode `0640`.
+`/etc/woven/credentials/admin-token`, and set owner `woven:woven`, mode `0400`.
 
 Host-managed client tokens are generated per provisioned scope and stored by Woven
 only in memory. Woven Host persists only generation-bound AES-GCM ciphertext. A
@@ -161,7 +165,26 @@ ops/deploy/deploy-woven
 ops/deploy/install-woven-tls
 ```
 
-Installed files must be root-owned and not writable by the service account:
+Create the locked `woven` system user/group before installing credentials or the
+unit. It must use `/usr/sbin/nologin`, have no usable password, and own no checkout
+or build directory. The service unit must run as `User=woven` and `Group=woven`.
+
+For an installation created before the dedicated account, perform one reviewed
+migration while the service is stopped: change the four managed parent directories
+and every 64-hex certificate release directory reachable through `current` or
+`previous` to `root:woven` mode `0750`; change the admin token and both files in each
+of those releases to `woven:woven` mode `0400`. Validate regular-file, directory,
+and symlink targets before changing metadata. The TLS hook intentionally refuses legacy `root:this 0640` or
+`this:this 0400` material instead of silently migrating it.
+
+The runtime must also be able to traverse `/opt`, `/opt/woven`,
+`/opt/woven/releases`, and every selected SHA release directory. The deployment
+wrapper now requires each of those directories to be exactly root-owned mode
+`0755`; the selected binary remains root-owned mode `0755`. This prevents a legacy
+`root:this 0750` path from passing deployment checks while blocking the dedicated
+runtime account.
+
+Installed tooling must be root-owned and not writable by the service account:
 
 ```text
 /etc/systemd/system/woven-server.service  0644

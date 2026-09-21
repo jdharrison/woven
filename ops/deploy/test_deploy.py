@@ -20,6 +20,8 @@ class ValidationTests(unittest.TestCase):
     def test_unit_skips_start_without_an_executable_release(self):
         unit = Path(__file__).with_name("woven-server.service").read_text()
         self.assertIn("ConditionFileIsExecutable=/opt/woven/current/woven-server\n", unit)
+        self.assertIn("User=woven\n", unit)
+        self.assertIn("Group=woven\n", unit)
         self.assertIn("Environment=WOVEN_MANAGED_QUIC=1\n", unit)
         self.assertIn("Environment=WOVEN_MANAGED_WEBTRANSPORT=1\n", unit)
         self.assertIn("Environment=WOVEN_QUIC_BIND=0.0.0.0:4433\n", unit)
@@ -28,7 +30,10 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem\n", unit)
         self.assertIn("Environment=WOVEN_TLS_KEY_FILE=/etc/woven/tls/current/privkey.pem\n", unit)
         self.assertIn("Environment=WOVEN_ADMIN_TOKEN_FILE=/etc/woven/credentials/admin-token\n", unit)
+        self.assertIn("ProtectSystem=strict\n", unit)
         self.assertIn("ProtectHome=true\n", unit)
+        self.assertIn("ReadOnlyPaths=/etc/woven\n", unit)
+        self.assertNotIn("User=this\n", unit)
         self.assertNotIn("WOVEN_REMOTE_QUIC", unit)
         self.assertNotIn("ConditionPathIsExecutable", unit)
 
@@ -154,6 +159,8 @@ class PreflightAndFetchTests(unittest.TestCase):
     def test_root_directory_metadata_guard(self):
         for uid, mode, accepted in [(0, deploy.stat.S_IFDIR | 0o755, True),
                                     (1000, deploy.stat.S_IFDIR | 0o755, False),
+                                    (0, deploy.stat.S_IFDIR | 0o750, False),
+                                    (0, deploy.stat.S_IFDIR | 0o700, False),
                                     (0, deploy.stat.S_IFDIR | 0o775, False),
                                     (0, deploy.stat.S_IFDIR | 0o757, False),
                                     (0, deploy.stat.S_IFLNK | 0o755, False),
@@ -165,6 +172,24 @@ class PreflightAndFetchTests(unittest.TestCase):
                 else:
                     with self.assertRaises(deploy.DeployError):
                         deploy.trusted_directory(Path("/opt/woven"))
+
+    def test_release_binary_requires_exact_runtime_executable_metadata(self):
+        path = Path("/opt/woven/releases/mock/woven-server")
+        for uid, mode, accepted in [
+            (0, deploy.stat.S_IFREG | 0o755, True),
+            (1000, deploy.stat.S_IFREG | 0o755, False),
+            (0, deploy.stat.S_IFREG | 0o750, False),
+            (0, deploy.stat.S_IFREG | 0o700, False),
+            (0, deploy.stat.S_IFREG | 0o644, False),
+            (0, deploy.stat.S_IFDIR | 0o755, False),
+        ]:
+            info = SimpleNamespace(st_uid=uid, st_mode=mode)
+            with self.subTest(uid=uid, mode=mode), patch.object(Path, "lstat", return_value=info):
+                if accepted:
+                    deploy.trusted_binary(path)
+                else:
+                    with self.assertRaises(deploy.DeployError):
+                        deploy.trusted_binary(path)
 
     def test_bad_root_path_prevents_fetch(self):
         with patch.object(deploy.os, "geteuid", return_value=0), \
