@@ -26,15 +26,18 @@ Zone:          us-central1-f
 Reserved IPv4: 104.198.144.33 (woven-api-ip, us-central1)
 ```
 
-The managed service is deliberately stopped and disabled until DNS, public TLS,
-firewall changes, and the reviewed unit are installed. Deployment automation also
-remains disabled through `WOVEN_DEPLOY_ENABLED=false` and the disabled
-`woven-node-github` Workload Identity provider.
+As of September 21, 2026, `woven-server.service` is active and enabled at exact
+release `71ab09418ae17f4d52de5441b44f4c83a7127984`, running as the locked `woven`
+account. The retained rollback release is
+`73eb431aedaf894feec09c604793f35528f59a4f`. Deployment automation remains disabled
+through `WOVEN_DEPLOY_ENABLED=false` and the disabled `woven-node-github` Workload
+Identity provider.
 
-The VM contains a root-owned exact-SHA deployment wrapper at
-`/usr/local/sbin/deploy-woven`, a root-owned systemd unit, and the seeded release
-for commit `73eb431aedaf894feec09c604793f35528f59a4f`. Re-verify this state before
-activation rather than relying on this document as live inventory.
+DNS resolves `api.woven.host` to the reserved address. Let's Encrypt issued the
+single-name public certificate, Certbot's timer is active/enabled, and its renewal
+simulation plus deploy hook passed. Public firewall exposure is limited to TCP `80`
+for ACME HTTP-01 and UDP `4433–4434` for Woven; the old UDP `8081/8082` QA rule was
+removed. Re-verify live state rather than relying on this document as inventory.
 
 ## Network boundary
 
@@ -258,15 +261,23 @@ attach identities merely to complete TLS setup.
 
 ## Production acceptance
 
-Before calling the node production-ready:
+Validated on September 21, 2026:
 
-1. Confirm public DNS and system/browser trust for `api.woven.host`.
-2. Confirm UDP `4433` and `4434` externally and remove UDP `8081`/`8082` exposure.
-3. Provision a disposable managed scope through the authenticated loopback admin API.
-4. Run a 10-second native managed smoke test using the system CA bundle.
-5. Run a 600-second managed native soak at the approved bounded rate.
-6. Require every sent publish to be echoed, with zero errors or disconnects.
-7. Confirm active CCU returns to zero and scope deletion succeeds.
-8. Run the real browser WebTransport E2E against the production hostname and allowed origin.
-9. Configure and test the private Woven Host management path.
-10. Only then enable deployment automation and publish release artifacts in dependency order.
+- public DNS and standard system trust for native QUIC at `api.woven.host:4433`;
+- externally reachable UDP `4433`, with UDP `8081/8082` exposure removed;
+- disposable managed scope provisioning through authenticated loopback admin;
+- a 10-second Weaver native managed smoke: 98 sent, 98 confirmed, zero errors or disconnects;
+- a 600-second Weaver native managed soak at 10 Hz: 5,870 sent, 5,870 confirmed,
+  zero errors or disconnects;
+- zero active CCU, zero queue depth, successful `204` teardown, and subsequent `404`;
+- post-soak node metrics: 5,968 publishes/deliveries, 855,354 bytes received/delivered,
+  and zero authentication rejects, join rejects, drops, or evictions.
+
+Still required before the complete hosted product is production-ready:
+
+1. Run the real browser WebTransport E2E against the production hostname and allowed origin.
+2. Configure and test a private Woven Host management path; never expose TCP `8083`.
+3. Configure Host's public client descriptors as `api.woven.host:4433` and
+   `https://api.woven.host:4434/webtransport` without a private CA or certificate hash.
+4. Enable deployment automation only after its disabled WIF provider and narrow sudo path are rehearsed.
+5. Publish release artifacts in dependency order only after the Host path and browser gate pass.
