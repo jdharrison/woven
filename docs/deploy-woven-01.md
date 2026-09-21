@@ -35,9 +35,13 @@ Identity provider.
 
 DNS resolves `api.woven.host` to the reserved address. Let's Encrypt issued the
 single-name public certificate, Certbot's timer is active/enabled, and its renewal
-simulation plus deploy hook passed. Public firewall exposure is limited to TCP `80`
-for ACME HTTP-01 and UDP `4433–4434` for Woven; the old UDP `8081/8082` QA rule was
-removed. Re-verify live state rather than relying on this document as inventory.
+simulation plus deploy hook passed. Public data-plane exposure is limited to TCP
+`80` for ACME HTTP-01 and UDP `4433–4434` for Woven; the old UDP `8081/8082` QA
+rule and generic `http-server`/`https-server` VM tags were removed. A targeted
+priority-800 rule permits TCP `22` only from Google IAP `35.235.240.0/20`, and a
+priority-900 targeted deny blocks every other SSH source before the project's broad
+default rule. IAP access was verified after applying both rules. Re-verify live
+state rather than relying on this document as inventory.
 
 ## Network boundary
 
