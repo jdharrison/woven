@@ -50,15 +50,45 @@ class ValidationTests(unittest.TestCase):
                 deploy.main(["main"])
             command.assert_not_called()
 
-    def test_reset_failed_reloads_a_garbage_collected_unit_first(self):
-        with patch.object(deploy, "run") as command:
+    def test_run_returns_accepted_nonzero_status_and_rejects_other_status(self):
+        with patch.object(deploy.subprocess, "Popen") as popen:
+            process = popen.return_value.__enter__.return_value
+            process.communicate.return_value = (b"", b"")
+            for status in [1, 3, 4]:
+                process.returncode = status
+                with self.subTest(status=status):
+                    self.assertEqual(
+                        deploy.run(["mock-command"], accepted=(0, 1, 3, 4)),
+                        status,
+                    )
+            process.returncode = 2
+            with self.assertRaises(deploy.DeployError):
+                deploy.run(["mock-command"], accepted=(0, 1, 3, 4))
+
+    def test_reset_failed_skips_unloaded_or_nonfailed_unit_after_reload(self):
+        for state in [1, 3, 4]:
+            with self.subTest(state=state), patch.object(
+                deploy, "run", side_effect=[0, state]
+            ) as command:
+                deploy.service("reset-failed")
+                self.assertEqual(
+                    command.call_args_list,
+                    [
+                        call(["/usr/bin/systemctl", "daemon-reload"], seconds=45),
+                        call(
+                            ["/usr/bin/systemctl", "is-failed", "--quiet", deploy.UNIT],
+                            seconds=45,
+                            accepted=(0, 1, 3, 4),
+                        ),
+                    ],
+                )
+
+    def test_reset_failed_resets_an_actually_failed_unit(self):
+        with patch.object(deploy, "run", side_effect=[0, 0, 0]) as command:
             deploy.service("reset-failed")
         self.assertEqual(
-            command.call_args_list,
-            [
-                call(["/usr/bin/systemctl", "daemon-reload"], seconds=45),
-                call(["/usr/bin/systemctl", "reset-failed", deploy.UNIT], seconds=45),
-            ],
+            command.call_args_list[-1],
+            call(["/usr/bin/systemctl", "reset-failed", deploy.UNIT], seconds=45),
         )
 
     def test_dirty_source_fails_before_build(self):

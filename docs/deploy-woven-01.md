@@ -228,9 +228,11 @@ three consecutive observations of:
 - TCP `127.0.0.1:8080` and `127.0.0.1:8083` owned by that PID;
 - a bounded successful `http://127.0.0.1:8080/metrics` request.
 
-The wrapper reloads systemd before resetting a failed unit so a never-started unit
-cannot be garbage-collected during the bounded build. Candidate failure restores
-the prior release and repeats health checks. Rollback failure is nonzero and retains
+The wrapper reloads systemd, queries the unit's failed state, and calls
+`reset-failed` only when the unit is actually failed. An inactive disabled unit may
+be garbage-collected during the bounded build; treating its expected unloaded state
+as an error would block both activation and rollback before restart. Candidate
+failure restores the prior release and repeats health checks. Rollback failure is nonzero and retains
 all release artifacts for operator recovery.
 
 These checks prove process/listener/metrics readiness only. They do not prove public
