@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 loader = importlib.machinery.SourceFileLoader("deploy_woven", str(Path(__file__).with_name("deploy-woven")))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -22,7 +22,13 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("ConditionFileIsExecutable=/opt/woven/current/woven-server\n", unit)
         self.assertIn("Environment=WOVEN_MANAGED_QUIC=1\n", unit)
         self.assertIn("Environment=WOVEN_MANAGED_WEBTRANSPORT=1\n", unit)
+        self.assertIn("Environment=WOVEN_QUIC_BIND=0.0.0.0:4433\n", unit)
+        self.assertIn("Environment=WOVEN_WEBTRANSPORT_BIND=0.0.0.0:4434\n", unit)
         self.assertIn("Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083\n", unit)
+        self.assertIn("Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem\n", unit)
+        self.assertIn("Environment=WOVEN_TLS_KEY_FILE=/etc/woven/tls/current/privkey.pem\n", unit)
+        self.assertIn("Environment=WOVEN_ADMIN_TOKEN_FILE=/etc/woven/credentials/admin-token\n", unit)
+        self.assertIn("ProtectHome=true\n", unit)
         self.assertNotIn("WOVEN_REMOTE_QUIC", unit)
         self.assertNotIn("ConditionPathIsExecutable", unit)
 
@@ -38,6 +44,17 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(deploy.DeployError):
                 deploy.main(["main"])
             command.assert_not_called()
+
+    def test_reset_failed_reloads_a_garbage_collected_unit_first(self):
+        with patch.object(deploy, "run") as command:
+            deploy.service("reset-failed")
+        self.assertEqual(
+            command.call_args_list,
+            [
+                call(["/usr/bin/systemctl", "daemon-reload"], seconds=45),
+                call(["/usr/bin/systemctl", "reset-failed", deploy.UNIT], seconds=45),
+            ],
+        )
 
     def test_dirty_source_fails_before_build(self):
         with patch.object(deploy, "git", return_value=" M Cargo.toml") as git:
@@ -546,7 +563,7 @@ class HealthTests(unittest.TestCase):
             if "show" in args:
                 return "123"
             if args[0] == "/usr/bin/ss":
-                return 'UNCONN 0 0 0.0.0.0:8081 0.0.0.0:* users:(("other",pid=456,fd=9))'
+                return 'UNCONN 0 0 0.0.0.0:4433 0.0.0.0:* users:(("other",pid=456,fd=9))'
             return None
 
         with patch.object(deploy, "run", side_effect=command) as run, \

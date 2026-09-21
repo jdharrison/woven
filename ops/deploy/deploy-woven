@@ -120,6 +120,9 @@ def point(name, target):
 
 
 def service(action):
+    if action == "reset-failed":
+        # A never-started unit can be garbage-collected during the bounded release build.
+        run(["/usr/bin/systemctl", "daemon-reload"], seconds=45)
     run(["/usr/bin/systemctl", action, UNIT], seconds=45)
 
 
@@ -136,8 +139,8 @@ def healthy(target):
             if os.readlink("/proc/" + pid + "/exe") != str(ROOT / target / "woven-server"):
                 raise DeployError("service is not running requested release")
             for flags, address, port in [
-                ("-Hlunp", "0.0.0.0:8081", "8081"),
-                ("-Hlunp", "0.0.0.0:8082", "8082"),
+                ("-Hlunp", "0.0.0.0:4433", "4433"),
+                ("-Hlunp", "0.0.0.0:4434", "4434"),
                 ("-Hltnp", "127.0.0.1:8080", "8080"),
                 ("-Hltnp", "127.0.0.1:8083", "8083"),
             ]:

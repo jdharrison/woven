@@ -1,0 +1,350 @@
+#!/usr/bin/python3 -I
+"""Install the public api.woven.host certificate and safely restart Woven."""
+import hashlib
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+HOSTNAME = "api.woven.host"
+SOURCE = Path("/etc/letsencrypt/live") / HOSTNAME
+ARCHIVE = Path("/etc/letsencrypt/archive") / HOSTNAME
+DESTINATION = Path("/etc/woven/tls")
+RELEASES = DESTINATION / "releases"
+CREDENTIALS = Path("/etc/woven/credentials")
+ADMIN_TOKEN = CREDENTIALS / "admin-token"
+UNIT = "woven-server.service"
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C"}
+MAX_CERTIFICATE_BYTES = 256 * 1024
+MAX_PRIVATE_KEY_BYTES = 64 * 1024
+ROOT_UID = 0
+RELEASE_NAME = re.compile(r"releases/[0-9a-f]{64}", re.ASCII)
+
+
+class InstallError(Exception):
+    pass
+
+
+def run(args, *, capture=False, accepted=(0,)):
+    try:
+        result = subprocess.run(
+            args,
+            env=ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise InstallError("bounded certificate command failed") from error
+    if result.returncode not in accepted:
+        raise InstallError("bounded certificate command failed")
+    return result.stdout if capture else result.returncode
+
+
+def trusted_directory(path, group_id):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
+        raise InstallError("certificate directories must be root-owned and non-writable")
+    group_can_traverse = info.st_gid == group_id and info.st_mode & stat.S_IXGRP
+    if not group_can_traverse and not info.st_mode & stat.S_IXOTH:
+        raise InstallError("certificate directories must be traversable by the service account")
+
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sync_file(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def validate_admin_credential(group_id):
+    info = ADMIN_TOKEN.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != ROOT_UID
+        or info.st_gid != group_id
+        or stat.S_IMODE(info.st_mode) != 0o640
+        or not 32 <= info.st_size <= 4098
+    ):
+        raise InstallError("admin credential must be a bounded root:service-group mode 0640 file")
+    token = ADMIN_TOKEN.read_bytes().rstrip(b"\r\n")
+    if not 32 <= len(token) <= 4096 or not all(33 <= byte <= 126 for byte in token):
+        raise InstallError("admin credential must contain bounded non-whitespace ASCII")
+
+
+def read_source(name, maximum, *, private=False):
+    path = SOURCE / name
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(ARCHIVE)
+        info = resolved.stat()
+    except (OSError, ValueError) as error:
+        raise InstallError("certificate source is outside the expected Certbot archive") from error
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or not 0 < info.st_size <= maximum:
+        raise InstallError("certificate source metadata is invalid")
+    if private and info.st_mode & 0o077:
+        raise InstallError("private key permissions are too broad")
+    data = resolved.read_bytes()
+    if len(data) != info.st_size:
+        raise InstallError("certificate source changed while reading")
+    return data
+
+
+def validate_pair(certificate, private_key):
+    run(["/usr/bin/openssl", "x509", "-in", str(certificate), "-noout", "-checkhost", HOSTNAME])
+    run(["/usr/bin/openssl", "x509", "-in", str(certificate), "-noout", "-checkend", "1209600"])
+    alternative_names = run(
+        ["/usr/bin/openssl", "x509", "-in", str(certificate), "-noout", "-ext", "subjectAltName"],
+        capture=True,
+    ).decode("ascii", errors="strict")
+    lines = [line.strip() for line in alternative_names.splitlines() if line.strip()]
+    if len(lines) != 2 or not lines[0].startswith("X509v3 Subject Alternative Name:"):
+        raise InstallError("certificate must contain exactly one DNS subject alternative name")
+    if [item.strip() for item in lines[1].split(",")] != ["DNS:" + HOSTNAME]:
+        raise InstallError("certificate must contain only the api.woven.host DNS name")
+    certificate_public_key = run(
+        ["/usr/bin/openssl", "x509", "-in", str(certificate), "-pubkey", "-noout"],
+        capture=True,
+    )
+    private_public_key = run(
+        ["/usr/bin/openssl", "pkey", "-in", str(private_key), "-pubout"],
+        capture=True,
+    )
+    if certificate_public_key != private_public_key:
+        raise InstallError("certificate and private key do not match")
+
+
+def service_active():
+    return run(
+        ["/usr/bin/systemctl", "is-active", "--quiet", UNIT],
+        accepted=(0, 3),
+    ) == 0
+
+
+def healthy():
+    consecutive = 0
+    for _ in range(12):
+        try:
+            run(["/usr/bin/systemctl", "is-active", "--quiet", UNIT])
+            pid_bytes = run(
+                ["/usr/bin/systemctl", "show", "--property=MainPID", "--value", UNIT],
+                capture=True,
+            )
+            pid = pid_bytes.decode("ascii", errors="strict").strip()
+            if not pid.isdecimal() or int(pid) <= 1:
+                raise InstallError("no service process")
+            expected = str(Path("/opt/woven/current/woven-server").resolve(strict=True))
+            if os.readlink("/proc/" + pid + "/exe") != expected:
+                raise InstallError("service is not running the current release")
+            for flags, address, port in [
+                ("-Hlunp", "0.0.0.0:4433", "4433"),
+                ("-Hlunp", "0.0.0.0:4434", "4434"),
+                ("-Hltnp", "127.0.0.1:8080", "8080"),
+                ("-Hltnp", "127.0.0.1:8083", "8083"),
+            ]:
+                sockets = run(
+                    ["/usr/bin/ss", flags, "sport = :" + port],
+                    capture=True,
+                ).decode("utf-8", errors="strict")
+                if not any(
+                    address in line.split() and "pid=" + pid + "," in line
+                    for line in sockets.splitlines()
+                ):
+                    raise InstallError("service listener missing")
+            run(
+                [
+                    "/usr/bin/curl",
+                    "--disable",
+                    "--noproxy",
+                    "*",
+                    "--fail",
+                    "--silent",
+                    "--connect-timeout",
+                    "1",
+                    "--max-time",
+                    "2",
+                    "--output",
+                    "/dev/null",
+                    "http://127.0.0.1:8080/metrics",
+                ]
+            )
+            consecutive += 1
+            if consecutive == 3:
+                return True
+        except (InstallError, OSError, UnicodeError):
+            consecutive = 0
+        time.sleep(1)
+    return False
+
+
+def restart_service():
+    run(["/usr/bin/systemctl", "restart", UNIT])
+    if not healthy():
+        raise InstallError("service did not become healthy")
+
+
+def release_link(name, group_id):
+    path = DESTINATION / name
+    if not path.is_symlink():
+        if path.exists():
+            raise InstallError("certificate pointer must be a symlink")
+        return None
+    target = os.readlink(path)
+    if RELEASE_NAME.fullmatch(target) is None:
+        raise InstallError("unexpected certificate pointer")
+    trusted_release(DESTINATION / target, group_id)
+    return target
+
+
+def trusted_release(directory, group_id):
+    trusted_directory(directory, group_id)
+    for filename in ["fullchain.pem", "privkey.pem"]:
+        info = (directory / filename).lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != ROOT_UID
+            or info.st_gid != group_id
+            or stat.S_IMODE(info.st_mode) != 0o640
+        ):
+            raise InstallError("installed certificate files must be root:service-group mode 0640")
+
+
+def point(name, target):
+    path = DESTINATION / name
+    if target is None:
+        path.unlink(missing_ok=True)
+        sync_directory(DESTINATION)
+        return
+    staging = DESTINATION / ("." + name + ".next")
+    staging.unlink(missing_ok=True)
+    staging.symlink_to(target)
+    os.replace(staging, path)
+    sync_directory(DESTINATION)
+
+
+def stage_release(certificate_data, private_key_data, group_id):
+    digest = hashlib.sha256(certificate_data).hexdigest()
+    target = "releases/" + digest
+    destination = DESTINATION / target
+    if destination.exists():
+        trusted_release(destination, group_id)
+        if (destination / "fullchain.pem").read_bytes() != certificate_data:
+            raise InstallError("existing certificate release differs from source")
+        if (destination / "privkey.pem").read_bytes() != private_key_data:
+            raise InstallError("existing private key release differs from source")
+        validate_pair(destination / "fullchain.pem", destination / "privkey.pem")
+        return target
+
+    staging = Path(tempfile.mkdtemp(prefix=".tls-", dir=RELEASES))
+    try:
+        certificate = staging / "fullchain.pem"
+        private_key = staging / "privkey.pem"
+        certificate.write_bytes(certificate_data)
+        private_key.write_bytes(private_key_data)
+        for path in [certificate, private_key]:
+            path.chmod(0o640)
+            os.chown(path, ROOT_UID, group_id)
+            sync_file(path)
+        staging.chmod(0o750)
+        os.chown(staging, ROOT_UID, group_id)
+        validate_pair(certificate, private_key)
+        sync_directory(staging)
+        os.rename(staging, destination)
+        sync_directory(RELEASES)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def prune(group_id):
+    keep = {release_link("current", group_id), release_link("previous", group_id)}
+    for path in RELEASES.iterdir():
+        if re.fullmatch(r"[0-9a-f]{64}", path.name) and "releases/" + path.name not in keep:
+            trusted_directory(path, group_id)
+            shutil.rmtree(path)
+            sync_directory(RELEASES)
+
+
+def activate(target, group_id, was_active):
+    old = release_link("current", group_id)
+    previous = release_link("previous", group_id)
+    if old == target:
+        if was_active and not healthy():
+            raise InstallError("current certificate is installed but Woven is unhealthy")
+        prune(group_id)
+        return
+    if was_active and old is None:
+        raise InstallError("active service has no managed certificate rollback target")
+    try:
+        point("previous", old)
+        point("current", target)
+        if was_active:
+            restart_service()
+    except BaseException as failure:
+        point("current", old)
+        point("previous", previous)
+        if was_active and old is not None:
+            try:
+                restart_service()
+            except BaseException as rollback_failure:
+                raise InstallError(
+                    "certificate activation and service rollback failed; releases retained"
+                ) from rollback_failure
+        prune(group_id)
+        raise InstallError("certificate activation failed; previous release restored") from failure
+    prune(group_id)
+
+
+def install():
+    if os.geteuid() != 0:
+        raise InstallError("install-woven-tls must run as root")
+    account = pwd.getpwnam("this")
+    for path in [
+        DESTINATION.parent.parent,
+        DESTINATION.parent,
+        DESTINATION,
+        RELEASES,
+        CREDENTIALS,
+    ]:
+        trusted_directory(path, account.pw_gid)
+    validate_admin_credential(account.pw_gid)
+    current = release_link("current", account.pw_gid)
+    release_link("previous", account.pw_gid)
+    certificate_data = read_source("fullchain.pem", MAX_CERTIFICATE_BYTES)
+    private_key_data = read_source("privkey.pem", MAX_PRIVATE_KEY_BYTES, private=True)
+    active = service_active()
+    if active and current is None:
+        raise InstallError("active service has no managed certificate release")
+    target = stage_release(certificate_data, private_key_data, account.pw_gid)
+    activate(target, account.pw_gid, active)
+
+
+def main():
+    try:
+        install()
+    except (InstallError, KeyError, OSError, UnicodeError) as error:
+        print("install-woven-tls: " + str(error), file=sys.stderr)
+        return 1
+    print("Installed validated public TLS material for api.woven.host.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

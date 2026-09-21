@@ -12,17 +12,16 @@ Group=this
 WorkingDirectory=/opt/woven
 ExecStart=/opt/woven/current/woven-server --log-none
 Environment=WOVEN_MANAGED_QUIC=1
-Environment=WOVEN_QUIC_BIND=0.0.0.0:8081
+Environment=WOVEN_QUIC_BIND=0.0.0.0:4433
 Environment=WOVEN_MANAGEMENT_BIND=127.0.0.1:8080
 Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083
 Environment=WOVEN_MANAGED_WEBTRANSPORT=1
-Environment=WOVEN_WEBTRANSPORT_BIND=0.0.0.0:8082
+Environment=WOVEN_WEBTRANSPORT_BIND=0.0.0.0:4434
 Environment=WOVEN_WEBTRANSPORT_PATH=/webtransport
 Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=https://woven.host,https://signalweave-112358.web.app
-# Paths verified by operator metadata inspection; never put secret contents in this unit.
-Environment=WOVEN_TLS_CERT_FILE=/home/this/.local/share/woven-managed/chain.pem
-Environment=WOVEN_TLS_KEY_FILE=/home/this/.local/share/woven-managed/key.pem
-Environment=WOVEN_ADMIN_TOKEN_FILE=/home/this/.local/share/woven-managed/admin-token
+Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem
+Environment=WOVEN_TLS_KEY_FILE=/etc/woven/tls/current/privkey.pem
+Environment=WOVEN_ADMIN_TOKEN_FILE=/etc/woven/credentials/admin-token
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=30
@@ -32,7 +31,7 @@ KillSignal=SIGINT
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
@@ -44,7 +43,7 @@ LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadOnlyPaths=/home/this/.local/share/woven-managed
+ReadOnlyPaths=/etc/woven
 StandardOutput=journal
 StandardError=journal
 
