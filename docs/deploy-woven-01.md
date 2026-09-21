@@ -28,7 +28,8 @@ Reserved IPv4: 104.198.144.33 (woven-api-ip, us-central1)
 
 As of September 21, 2026, `woven-server.service` is active and enabled at exact
 release `71ab09418ae17f4d52de5441b44f4c83a7127984`, running as the locked `woven`
-account. The retained rollback release is
+account. The private `nginx.service` management gateway is also active and enabled.
+The retained Woven rollback release is
 `73eb431aedaf894feec09c604793f35528f59a4f`. Deployment automation remains disabled
 through `WOVEN_DEPLOY_ENABLED=false` and the disabled `woven-node-github` Workload
 Identity provider.
@@ -53,6 +54,7 @@ The reviewed unit requires these listeners:
 | UDP `0.0.0.0:4434` | Public | Browser WebTransport |
 | TCP `127.0.0.1:8080` | Loopback only | Read-only telemetry |
 | TCP `127.0.0.1:8083` | Loopback only | Authenticated managed admin API |
+| TCP `10.128.0.2:8443` | Private VPC, tagged Host source only | TLS gateway to telemetry and admin |
 
 The browser endpoint permits only these exact origins:
 
@@ -113,11 +115,14 @@ The hook accepts material only from Certbot's fixed
 `api.woven.host`, at least fourteen days of remaining validity, and a matching
 private key. It synchronizes both files and the release directory before atomically
 switching and synchronizing one symlink, so process or host interruption cannot
-publish a mixed or non-durable certificate/key pair. If Woven is active, it
-requires three complete PID/listener/metrics health observations
-after restart; failure atomically restores and verifies the previous release.
-Uncertain rollback retains both complete releases for operator recovery. If Woven
-is inactive, the hook installs the pair without starting it.
+publish a mixed or non-durable certificate/key pair. If Woven is active, it requires
+three complete PID/listener/metrics health observations after restart. If the Nginx
+gateway is active, the hook validates its configuration, reloads it, verifies three
+public-trust TLS handshakes against the exact selected leaf certificate on the
+private listener, and treats any mismatch as failure. Activation failure restores
+the prior pointers and re-verifies every active TLS consumer; uncertain rollback
+retains both complete releases for operator recovery. Inactive consumers are not
+started by the hook.
 
 Issue the single-name certificate only after DNS and TCP `80` are externally
 reachable:
@@ -156,11 +161,12 @@ client must present the token using managed Bearer admission and join the numeri
 namespace/session provisioned for its registered product. Product IDs are not used
 as Woven namespace IDs, and guessing a product ID does not grant admission.
 
-Production Host integration additionally needs a private, authenticated path from
-Cloud Run to TCP `8083` plus protected mounts for the admin token and Host credential
-encryption key. Do not make `8083` public as a shortcut. Until that path and Host
-environment are configured, the portal can retain registrations but cannot safely
-provision this node.
+Production Host integration uses Direct VPC egress and private split-horizon DNS to
+reach the Nginx gateway at `https://api.woven.host:8443`. The gateway exposes only
+`/metrics` and `/v1/*`, then proxies to the loopback listeners. A source-tag allow
+permits the Host service and a higher-priority targeted deny blocks every other
+source. Host mounts pinned Secret Manager files for the admin token and credential
+encryption key. Do not expose `8080`, `8083`, or `8443` publicly as a shortcut.
 
 ## Reviewed service installation
 
@@ -170,6 +176,7 @@ Repository files:
 ops/deploy/woven-server.service
 ops/deploy/deploy-woven
 ops/deploy/install-woven-tls
+ops/deploy/woven-admin-gateway.nginx.conf
 ```
 
 Create the locked `woven` system user/group before installing credentials or the
@@ -195,12 +202,16 @@ Installed tooling must be root-owned and not writable by the service account:
 
 ```text
 /etc/systemd/system/woven-server.service  0644
+/etc/nginx/nginx.conf                      0644
 /usr/local/sbin/deploy-woven               0755
 /usr/local/sbin/install-woven-tls          0755
 ```
 
-Run `systemd-analyze verify` and `systemctl daemon-reload` after installing the
-reviewed unit. `ProtectHome=true` prevents the runtime from reading home-directory
+Install the reviewed Nginx file only on `woven-01`, verify it with `nginx -t`, and
+require it to bind only `10.128.0.2:8443`; it must not listen on public TCP `80` or
+proxy any route other than exact `/metrics` and `/v1/*`. Run `systemd-analyze verify`
+and `systemctl daemon-reload` after installing the reviewed Woven unit.
+`ProtectHome=true` prevents the runtime from reading home-directory
 material. `/etc/woven` is explicitly read-only to the service, and the process has
 no Linux capabilities or privilege escalation.
 

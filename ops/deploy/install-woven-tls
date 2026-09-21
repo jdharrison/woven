@@ -1,5 +1,8 @@
 #!/usr/bin/python3 -I
-"""Install the public api.woven.host certificate and safely restart Woven."""
+"""Install the public api.woven.host certificate and reload active TLS consumers."""
+import base64
+import binascii
+import fcntl
 import grp
 import hashlib
 import os
@@ -7,6 +10,8 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -22,16 +27,51 @@ DESTINATION = Path("/etc/woven/tls")
 RELEASES = DESTINATION / "releases"
 CREDENTIALS = Path("/etc/woven/credentials")
 ADMIN_TOKEN = CREDENTIALS / "admin-token"
+LOCK = Path("/run/lock/install-woven-tls.lock")
 UNIT = "woven-server.service"
+GATEWAY_UNIT = "nginx.service"
+GATEWAY_ADDRESS = "10.128.0.2"
+GATEWAY_PORT = 8443
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C"}
 MAX_CERTIFICATE_BYTES = 256 * 1024
 MAX_PRIVATE_KEY_BYTES = 64 * 1024
 ROOT_UID = 0
 RELEASE_NAME = re.compile(r"releases/[0-9a-f]{64}", re.ASCII)
+PEM_CERTIFICATE = re.compile(
+    rb"-----BEGIN CERTIFICATE-----\s+([A-Za-z0-9+/=\s]+?)-----END CERTIFICATE-----",
+    re.ASCII,
+)
 
 
 class InstallError(Exception):
     pass
+
+
+def acquire_lock():
+    try:
+        descriptor = os.open(
+            LOCK,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as error:
+        raise InstallError("cannot open certificate installation lock") from error
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != ROOT_UID
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise InstallError("certificate installation lock metadata is invalid")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise InstallError("certificate installation is already running") from error
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def run(args, *, capture=False, accepted=(0,)):
@@ -145,6 +185,51 @@ def service_active():
     ) == 0
 
 
+def gateway_active():
+    return run(
+        ["/usr/bin/systemctl", "is-active", "--quiet", GATEWAY_UNIT],
+        accepted=(0, 3, 4),
+    ) == 0
+
+
+def certificate_leaf_der(data):
+    match = PEM_CERTIFICATE.search(data)
+    if match is None:
+        raise InstallError("certificate chain has no leaf certificate")
+    try:
+        return base64.b64decode(b"".join(match.group(1).split()), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise InstallError("certificate chain leaf is malformed") from error
+
+
+def gateway_peer_leaf():
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    with socket.create_connection((GATEWAY_ADDRESS, GATEWAY_PORT), timeout=2) as connection:
+        with context.wrap_socket(connection, server_hostname=HOSTNAME) as tls:
+            certificate = tls.getpeercert(binary_form=True)
+    if not certificate:
+        raise InstallError("gateway did not present a certificate")
+    return certificate
+
+
+def gateway_healthy(target):
+    expected = certificate_leaf_der((DESTINATION / target / "fullchain.pem").read_bytes())
+    consecutive = 0
+    for _ in range(12):
+        try:
+            run(["/usr/bin/systemctl", "is-active", "--quiet", GATEWAY_UNIT])
+            if gateway_peer_leaf() != expected:
+                raise InstallError("gateway is serving an unexpected certificate")
+            consecutive += 1
+            if consecutive == 3:
+                return True
+        except (InstallError, OSError, ssl.SSLError):
+            consecutive = 0
+        time.sleep(1)
+    return False
+
+
 def healthy():
     consecutive = 0
     for _ in range(12):
@@ -205,6 +290,13 @@ def restart_service():
     run(["/usr/bin/systemctl", "restart", UNIT])
     if not healthy():
         raise InstallError("service did not become healthy")
+
+
+def reload_gateway(target):
+    run(["/usr/sbin/nginx", "-t"])
+    run(["/usr/bin/systemctl", "reload", GATEWAY_UNIT])
+    if not gateway_healthy(target):
+        raise InstallError("gateway did not load the selected certificate")
 
 
 def release_link(name, user_id, group_id):
@@ -292,32 +384,78 @@ def prune(user_id, group_id):
             sync_directory(RELEASES)
 
 
-def activate(target, user_id, group_id, was_active):
+def apply_consumers(target, woven_active, gateway_is_active):
+    if woven_active:
+        restart_service()
+    if gateway_is_active:
+        reload_gateway(target)
+
+
+def restore(
+    current_target,
+    previous_target,
+    user_id,
+    group_id,
+    woven_active,
+    gateway_is_active,
+):
+    failures = []
+    for name, target in [("current", current_target), ("previous", previous_target)]:
+        try:
+            point(name, target)
+        except BaseException as failure:
+            failures.append(failure)
+    if current_target is not None:
+        if woven_active:
+            try:
+                restart_service()
+            except BaseException as failure:
+                failures.append(failure)
+        if gateway_is_active:
+            try:
+                reload_gateway(current_target)
+            except BaseException as failure:
+                failures.append(failure)
+    if failures:
+        raise InstallError("TLS consumer rollback failed; releases retained") from failures[-1]
+    prune(user_id, group_id)
+
+
+def activate(target, user_id, group_id, woven_active, gateway_is_active):
     old = release_link("current", user_id, group_id)
     previous = release_link("previous", user_id, group_id)
     if old == target:
-        if was_active and not healthy():
-            raise InstallError("current certificate is installed but Woven is unhealthy")
+        try:
+            apply_consumers(target, woven_active, gateway_is_active)
+        except BaseException as failure:
+            if previous is None or previous == target:
+                raise InstallError(
+                    "certificate reconciliation failed without a rollback target"
+                ) from failure
+            try:
+                restore(previous, old, user_id, group_id, woven_active, gateway_is_active)
+            except BaseException as rollback_failure:
+                raise InstallError(
+                    "certificate reconciliation and rollback failed; releases retained"
+                ) from rollback_failure
+            raise InstallError(
+                "certificate reconciliation failed; previous release restored"
+            ) from failure
         prune(user_id, group_id)
         return
-    if was_active and old is None:
-        raise InstallError("active service has no managed certificate rollback target")
+    if (woven_active or gateway_is_active) and old is None:
+        raise InstallError("active TLS consumer has no managed certificate rollback target")
     try:
         point("previous", old)
         point("current", target)
-        if was_active:
-            restart_service()
+        apply_consumers(target, woven_active, gateway_is_active)
     except BaseException as failure:
-        point("current", old)
-        point("previous", previous)
-        if was_active and old is not None:
-            try:
-                restart_service()
-            except BaseException as rollback_failure:
-                raise InstallError(
-                    "certificate activation and service rollback failed; releases retained"
-                ) from rollback_failure
-        prune(user_id, group_id)
+        try:
+            restore(old, previous, user_id, group_id, woven_active, gateway_is_active)
+        except BaseException as rollback_failure:
+            raise InstallError(
+                "certificate activation and rollback failed; releases retained"
+            ) from rollback_failure
         raise InstallError("certificate activation failed; previous release restored") from failure
     prune(user_id, group_id)
 
@@ -325,28 +463,35 @@ def activate(target, user_id, group_id, was_active):
 def install():
     if os.geteuid() != 0:
         raise InstallError("install-woven-tls must run as root")
-    account = pwd.getpwnam(SERVICE_ACCOUNT)
-    group = grp.getgrnam(SERVICE_GROUP)
-    if account.pw_gid != group.gr_gid:
-        raise InstallError("woven runtime user and group identity do not match")
-    trusted_directory(DESTINATION.parent.parent, group.gr_gid, managed=False)
-    for path in [DESTINATION.parent, DESTINATION, RELEASES, CREDENTIALS]:
-        trusted_directory(path, group.gr_gid)
-    validate_admin_credential(account.pw_uid, group.gr_gid)
-    current = release_link("current", account.pw_uid, group.gr_gid)
-    release_link("previous", account.pw_uid, group.gr_gid)
-    certificate_data = read_source("fullchain.pem", MAX_CERTIFICATE_BYTES)
-    private_key_data = read_source("privkey.pem", MAX_PRIVATE_KEY_BYTES, private=True)
-    active = service_active()
-    if active and current is None:
-        raise InstallError("active service has no managed certificate release")
-    target = stage_release(
-        certificate_data,
-        private_key_data,
-        account.pw_uid,
-        group.gr_gid,
-    )
-    activate(target, account.pw_uid, group.gr_gid, active)
+    lock = acquire_lock()
+    try:
+        account = pwd.getpwnam(SERVICE_ACCOUNT)
+        group = grp.getgrnam(SERVICE_GROUP)
+        if account.pw_gid != group.gr_gid:
+            raise InstallError("woven runtime user and group identity do not match")
+        trusted_directory(DESTINATION.parent.parent, group.gr_gid, managed=False)
+        for path in [DESTINATION.parent, DESTINATION, RELEASES, CREDENTIALS]:
+            trusted_directory(path, group.gr_gid)
+        validate_admin_credential(account.pw_uid, group.gr_gid)
+        current = release_link("current", account.pw_uid, group.gr_gid)
+        release_link("previous", account.pw_uid, group.gr_gid)
+        certificate_data = read_source("fullchain.pem", MAX_CERTIFICATE_BYTES)
+        private_key_data = read_source("privkey.pem", MAX_PRIVATE_KEY_BYTES, private=True)
+        active = service_active()
+        gateway_is_active = gateway_active()
+        if active and current is None:
+            raise InstallError("active service has no managed certificate release")
+        if gateway_is_active and current is None:
+            raise InstallError("active gateway has no managed certificate release")
+        target = stage_release(
+            certificate_data,
+            private_key_data,
+            account.pw_uid,
+            group.gr_gid,
+        )
+        activate(target, account.pw_uid, group.gr_gid, active, gateway_is_active)
+    finally:
+        os.close(lock)
 
 
 def main():
