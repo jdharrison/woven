@@ -26,6 +26,19 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("Environment=WOVEN_MANAGED_WEBTRANSPORT=1\n", unit)
         self.assertIn("Environment=WOVEN_QUIC_BIND=0.0.0.0:4433\n", unit)
         self.assertIn("Environment=WOVEN_WEBTRANSPORT_BIND=0.0.0.0:4434\n", unit)
+        origin_lines = [
+            line
+            for line in unit.splitlines()
+            if line.startswith("Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=")
+        ]
+        self.assertEqual(
+            origin_lines,
+            [
+                "Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS="
+                "https://woven.host,https://signalweave-112358.web.app,"
+                "http://127.0.0.1:8000,http://localhost:8000"
+            ],
+        )
         self.assertIn("Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083\n", unit)
         self.assertIn("Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem\n", unit)
         self.assertIn("Environment=WOVEN_TLS_KEY_FILE=/etc/woven/tls/current/privkey.pem\n", unit)

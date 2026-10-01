@@ -61,11 +61,16 @@ The browser endpoint permits only these exact origins:
 ```text
 https://woven.host
 https://signalweave-112358.web.app
+http://127.0.0.1:8000
+http://localhost:8000
 ```
 
-Certificate hostname coverage does not authorize browser origins. Do not add
-arbitrary origins, expose either loopback listener, or infer client endpoints from
-the management address.
+The two HTTP entries are narrowly scoped local-development origins for browser
+validation against the hosted data plane; they do not authorize arbitrary ports or
+non-loopback HTTP sites. A future portfolio deployment must add its exact HTTPS
+origin before browser clients can connect. Certificate hostname coverage does not
+authorize browser origins. Do not add wildcard or arbitrary origins, expose either
+loopback listener, or infer client endpoints from the management address.
 
 The production firewall should permit public UDP `4433` and `4434`. ACME HTTP-01
 also requires public TCP `80`; Certbot binds it only while issuing or renewing.

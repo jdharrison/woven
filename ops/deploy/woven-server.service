@@ -18,7 +18,7 @@ Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083
 Environment=WOVEN_MANAGED_WEBTRANSPORT=1
 Environment=WOVEN_WEBTRANSPORT_BIND=0.0.0.0:4434
 Environment=WOVEN_WEBTRANSPORT_PATH=/webtransport
-Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=https://woven.host,https://signalweave-112358.web.app
+Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=https://woven.host,https://signalweave-112358.web.app,http://127.0.0.1:8000,http://localhost:8000
 Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem
 Environment=WOVEN_TLS_KEY_FILE=/etc/woven/tls/current/privkey.pem
 Environment=WOVEN_ADMIN_TOKEN_FILE=/etc/woven/credentials/admin-token
