@@ -76,6 +76,10 @@ Applies to `woven-protocol`, the native Rust `woven-client`, and the npm package
 
 ### Compatibility and release sequencing
 
+Rust packages now require Rust 1.98, matching the verified pinned 1.98.0 toolchain.
+The previously declared 1.88 minimum does not compile the current usage-spool async
+implementation; this release does not claim compatibility with that compiler.
+
 Added Rust fields and enum variants, plus removed `Eq` derives, are source-compatibility changes;
 rebuild consuming clients and synchronize internal dependency requirements. Host consumers of
 managed channels, spatial definitions, capabilities, and limits must use the matching strict

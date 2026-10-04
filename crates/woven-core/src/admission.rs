@@ -53,7 +53,7 @@ impl Default for QueuePolicy {
         Self {
             enabled: true,
             max_depth: 1_024,
-            ticket_ttl: Duration::from_secs(15 * 60),
+            ticket_ttl: Duration::from_mins(15),
             offer_ttl: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(30),
             reconnect_grace: Duration::from_secs(20),

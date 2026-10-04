@@ -24,7 +24,7 @@ See [`docs/status.md`](docs/status.md) and [`docs/adr`](docs/adr) for what's imp
 
 ## Prerequisites
 
-- The pinned current-stable Rust 1.98.0 toolchain with rustfmt and Clippy. [`rust-toolchain.toml`](rust-toolchain.toml) installs these automatically through rustup.
+- Rust 1.98 or newer; the workspace declares this minimum supported Rust version. The pinned Rust 1.98.0 toolchain includes rustfmt and Clippy, and [`rust-toolchain.toml`](rust-toolchain.toml) installs it automatically through rustup.
 - A C++ compiler and CMake for the pinned vendored FlatBuffers compiler used during protocol builds.
 - Node.js 22+, only if you're working on the TypeScript browser client.
 

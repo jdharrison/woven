@@ -2142,7 +2142,7 @@ fn stateful_entries_without_ttl_never_expire() {
     .expect("stateful publish");
 
     // Advance far past any plausible TTL and sweep: an untouched `ttl: None` entry must survive.
-    let far_future = now + Duration::from_secs(365 * 24 * 60 * 60);
+    let far_future = now + Duration::from_hours(8760);
     let swept = core.sweep_expired_state(far_future);
     assert_eq!(swept, 0, "ttl: None entries must never be swept");
 

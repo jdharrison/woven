@@ -619,7 +619,7 @@ as historical context rather than an active plan for this repo.
 
 ```
 Rust: 1.98.0 stable (rust-toolchain.toml pins this)
-Cargo workspace resolver: 3, edition: 2024, rust-version: 1.88
+Cargo workspace resolver: 3, edition: 2024, rust-version: 1.98
 Available: cargo, rustfmt, clippy, Node 22.23.2, npm 10.9.8, .NET SDK 10.0.111, Python 3.12.3, Docker 29.7.2, gh 2.98.0
 Absent: system flatc (vendored via Cargo), Terraform, OpenTofu
 GitHub: jdharrison/woven (public), SSH remote, gh authenticated

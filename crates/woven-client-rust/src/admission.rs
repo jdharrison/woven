@@ -10,7 +10,7 @@ use woven_protocol::{
 use crate::{Client, ClientError, Transport};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_WAIT: Duration = Duration::from_secs(15 * 60);
+const MAX_WAIT: Duration = Duration::from_mins(15);
 
 /// A semantic outcome is returned as data, never automatically retried.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
