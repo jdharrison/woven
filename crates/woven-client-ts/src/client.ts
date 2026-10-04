@@ -1,14 +1,30 @@
-import { CodecError, EnvelopeCodec, DecodedEnvelope, PROTOCOL_VERSION } from "./codec.js";
+import {
+  CAPABILITY_POSITIONED_ENTITY_STATE,
+  CAPABILITY_CLIENT_LOG,
+  CodecError,
+  DEFAULT_MAX_FRAME_BYTES,
+  DEFAULT_MAX_PAYLOAD_BYTES,
+  EnvelopeCodec,
+  DecodedEnvelope,
+  PROTOCOL_VERSION,
+  RoutingPosition3D,
+  validatePayloadLength,
+  validateUnreliableEntityState,
+  validateLogMessage,
+} from "./codec.js";
 import {
   encodeHello,
   encodeAuthenticate,
   encodeJoinSession,
+  encodeLeaveSession,
+  encodeClientLog,
   encodeSubscribeSpace,
   encodeSnapshotRequest,
   encodeSpaceTransition,
   encodeInferenceRequested,
   encodeReliableEvent,
   encodeEntityState,
+  encodeUnreliableEntityState,
   encodeRequestAdmission,
   encodeQueueStatusRequest,
   encodeQueueHeartbeat,
@@ -18,6 +34,7 @@ import {
 import {
   WebTransport,
   WebTransportBidirectionalStream,
+  WebTransportDatagramDuplexStream,
   WebTransportOptions,
   normalizeWebTransportOptions,
   resolveWebTransportConstructor,
@@ -34,6 +51,8 @@ import {
   DeliveryClass,
   MessageKind,
   ProtocolErrorPayload,
+  ProtocolErrorCode,
+  LogLevel,
   QueueState,
   QueueUpdatePayload,
 } from "../generated/woven/protocol/v1.js";
@@ -52,9 +71,9 @@ export interface WovenConfig {
   url: string;
   /** Opaque credential sent during `Authenticate` under the selected scheme. */
   token: string;
-  /** Maximum frame size advertised in `Hello` (bytes). */
+  /** Maximum incoming frame size advertised in `Hello` (bytes). Defaults to 1 MiB. */
   maxFrameBytes?: number;
-  /** Maximum payload size advertised in `Hello` (bytes). */
+  /** Incoming payload limit in bytes (default 64 KiB); smaller values also limit publishing. */
   maxPayloadBytes?: number;
   /** WVN1 authentication scheme. Defaults to Development for existing local deployments. */
   authenticationScheme?: AuthenticationScheme;
@@ -62,6 +81,8 @@ export interface WovenConfig {
   webTransportOptions?: WebTransportOptions;
   /** Total milliseconds allowed for readiness, stream creation, and the WVN1 handshake. */
   connectTimeoutMs?: number;
+  /** Optional incoming/outgoing datagram queue expiry in milliseconds; default null (no expiry). */
+  datagramMaxAgeMs?: number;
 }
 
 /** Normalized result of a managed admission request. */
@@ -88,6 +109,13 @@ export type ManagedAdmissionOutcome =
   | { kind: "admission"; result: AdmissionResult }
   | { kind: "queue"; update: QueueUpdate };
 
+/** Session logs are sent once; completion is not a persistence acknowledgement. */
+export interface ClientLogger {
+  info(message: string): Promise<void>;
+  warn(message: string): Promise<void>;
+  error(message: string): Promise<void>;
+}
+
 /** Errors surfaced by the Woven TypeScript WebTransport client. */
 export type WovenError =
   | { kind: "transport"; message: string }
@@ -108,8 +136,20 @@ const ADMISSION_EXCHANGE_TIMEOUT_MS = 10_000;
 const MAX_ADMISSION_WAIT_MS = 15 * 60 * 1_000;
 const MAX_GRACEFUL_CLOSE_TIMEOUT_MS = 10_000;
 const MAX_PENDING_ENVELOPES = 64;
+const DATAGRAM_INCOMING_HIGH_WATER_MARK = 8;
+const DATAGRAM_OUTGOING_HIGH_WATER_MARK = 1;
 
 type Lifecycle = "handshaking" | "ready" | "closed";
+
+type DatagramOutcome =
+  | { ok: true; envelope: DecodedEnvelope | null }
+  | { ok: false; error: unknown };
+
+type PendingDatagramReceive = {
+  promise: Promise<DecodedEnvelope | null>;
+  outcome: DatagramOutcome | null;
+  notify: (() => void) | null;
+};
 
 type ClientLimits = {
   maxFrameBytes: number;
@@ -128,7 +168,26 @@ type ClientLimits = {
 export class WovenClient {
   readonly transport: WebTransport;
   readonly stream: WebTransportBidirectionalStream;
+  readonly logger: ClientLogger = {
+    info: (message) => this.sendLog(LogLevel.Info, message),
+    warn: (message) => this.sendLog(LogLevel.Warn, message),
+    error: (message) => this.sendLog(LogLevel.Error, message),
+  };
+  private sessionScope: { namespaceId: bigint; sessionId: bigint } | null = null;
   private readonly codec: EnvelopeCodec;
+  private maxPublishPayloadBytes: number;
+  private maxPublishFrameBytes: number;
+  private negotiatedCapabilityBits = 0n;
+  private datagramLane: WebTransportDatagramDuplexStream | null = null;
+  private datagramReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private datagramReceiveActive = false;
+  private datagramReadActive = false;
+  private datagramWriteActive = false;
+  private datagramEnded = false;
+  private pendingDatagramReceive: PendingDatagramReceive | null = null;
+  private stopDatagramRead: (() => void) | null = null;
+  private stopDatagramWrite: (() => void) | null = null;
   private inBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private pending: DecodedEnvelope[] = [];
   private lifecycle: Lifecycle = "handshaking";
@@ -147,6 +206,13 @@ export class WovenClient {
     this.transport = transport;
     this.stream = stream;
     this.codec = codec;
+    this.maxPublishPayloadBytes = Math.min(DEFAULT_MAX_PAYLOAD_BYTES, codec.maxPayloadBytes);
+    this.maxPublishFrameBytes = codec.maxFrameBytes;
+    // One lifecycle observer, not one handler per receive or a background draining loop.
+    void transport.closed.then(
+      () => { this.sessionScope = null; this.stopDatagramLane(); },
+      () => { this.sessionScope = null; this.stopDatagramLane(); },
+    );
   }
 
   /**
@@ -158,6 +224,7 @@ export class WovenClient {
   ): Promise<WovenClient> {
     const connectTimeoutMs = validatedConnectionTimeout(config.connectTimeoutMs);
     const limits = validatedClientLimits(config);
+    validateDatagramMaxAge(config.datagramMaxAgeMs);
     const WebTransportCtor = resolveWebTransportConstructor();
     const url = toWebTransportUrl(config.url);
     const deadline = connectionNow() + connectTimeoutMs;
@@ -201,6 +268,7 @@ export class WovenClient {
   ): Promise<WovenClient> {
     const timeoutMs = validatedConnectionTimeout(config.connectTimeoutMs);
     const limits = validatedClientLimits(config);
+    validateDatagramMaxAge(config.datagramMaxAgeMs);
     return WovenClient.completeHandshake(
       transport,
       stream,
@@ -227,10 +295,12 @@ export class WovenClient {
     try {
       const timeoutMs = remainingConnectionTime(deadline, "WVN1 handshake timed out");
       await withTimeout(client.handshake(config), timeoutMs, "WVN1 handshake timed out");
+      client.configureDatagramLane(config);
       client.lifecycle = "ready";
       return client;
     } catch (error) {
       if (closeOnError) client.shutdown("handshake failed");
+      if (error instanceof CodecError) throw err("protocol", error.message);
       throw error;
     }
   }
@@ -238,6 +308,40 @@ export class WovenClient {
   /** Send a `JoinSession` control envelope. */
   async joinSession(namespaceId: bigint, sessionId: bigint): Promise<void> {
     await this.write(encodeJoinSession({ namespaceId, sessionId }));
+    if (this.lifecycle === "ready") this.sessionScope = { namespaceId, sessionId };
+  }
+
+  /** Leave the remembered session and disable logging until another join/admission. */
+  async leaveSession(reason = "client request"): Promise<void> {
+    this.assertReady();
+    if (this.sessionScope === null) throw err("protocol", "no joined or admitted session");
+    const frame = encodeLeaveSession(this.sessionScope, reason);
+    await this.write(frame);
+    this.sessionScope = null;
+  }
+
+  /** Info-level convenience alias; sends only, without waiting for server persistence. */
+  async log(message: string): Promise<void> {
+    await this.logger.info(message);
+  }
+
+  private async sendLog(level: LogLevel, message: string): Promise<void> {
+    this.assertReady();
+    if (this.sessionScope === null) throw err("protocol", "no joined or admitted session");
+    if ((this.negotiatedCapabilityBits & CAPABILITY_CLIENT_LOG) === 0n) {
+      throw err("protocol", "server did not negotiate ClientLog");
+    }
+    try {
+      validatePayloadLength(validateLogMessage(level, message), this.maxPublishPayloadBytes);
+      const frame = encodeClientLog(this.sessionScope, level, message);
+      if (frame.byteLength > this.maxPublishFrameBytes) {
+        throw new CodecError("FrameTooLarge", `log frame exceeds limit ${this.maxPublishFrameBytes}`);
+      }
+      await this.write(frame);
+    } catch (error) {
+      if (error instanceof CodecError) throw err("protocol", error.message);
+      throw error;
+    }
   }
 
   /** Request managed admission and atomic session join. */
@@ -357,7 +461,8 @@ export class WovenClient {
       this.admissionExchangeActive ||
       this.readActive ||
       this.writeActive ||
-      this.deferredReceive !== null
+      this.deferredReceive !== null ||
+      this.hasDatagramOperation()
     ) {
       throw err("transport", "client already has an active stream or admission operation");
     }
@@ -451,7 +556,7 @@ export class WovenClient {
   }
 
   /**
-   * Send a reliable event opaque payload envelope.
+   * Send a reliable event opaque payload envelope (at most 64 KiB, or a smaller configured/server cap).
    *
    * `sequence` must be strictly monotone per connection × space × epoch × entity × channel.
    */
@@ -466,6 +571,7 @@ export class WovenClient {
     typeId: bigint,
     payload: Uint8Array,
   ): Promise<void> {
+    this.validatePublishPayload(payload);
     await this.write(
       encodeReliableEvent(
         {
@@ -483,7 +589,7 @@ export class WovenClient {
   }
 
   /**
-   * Send a latest-value (entity state) opaque payload envelope.
+   * Send a latest-value (entity state) opaque payload envelope (at most 64 KiB, or a smaller configured/server cap).
    *
    * `sequence` must be strictly monotone per connection × space × epoch × entity × channel.
    */
@@ -498,6 +604,7 @@ export class WovenClient {
     typeId: bigint,
     payload: Uint8Array,
   ): Promise<void> {
+    this.validatePublishPayload(payload);
     await this.write(
       encodeEntityState(
         {
@@ -514,6 +621,140 @@ export class WovenClient {
     );
   }
 
+  /** Publish state with a 3D routing position applied atomically by the server. */
+  async publishPositionedState(
+    namespaceId: bigint,
+    sessionId: bigint,
+    spaceId: bigint,
+    spaceEpoch: bigint,
+    channelId: bigint,
+    entityId: bigint,
+    sequence: bigint,
+    typeId: bigint,
+    position: RoutingPosition3D,
+    payload: Uint8Array,
+  ): Promise<void> {
+    this.requirePositionedState();
+    this.validatePublishPayload(payload);
+    await this.write(
+      encodeEntityState(
+        {
+          namespaceId,
+          sessionId,
+          spaceId,
+          spaceEpoch,
+          channelId,
+          entityId,
+          senderSequence: sequence,
+          routingPosition: position,
+        },
+        { typeId, bytes: payload },
+      ),
+    );
+  }
+
+  /**
+   * Queue one opaque EntityState / UnreliableSequenced datagram. No fragmentation,
+   * retry, reliable fallback, or delivery acknowledgement. Sequence ownership stays with the caller.
+   */
+  async publishUnreliableState(
+    namespaceId: bigint,
+    sessionId: bigint,
+    spaceId: bigint,
+    spaceEpoch: bigint,
+    channelId: bigint,
+    entityId: bigint,
+    sequence: bigint,
+    typeId: bigint,
+    payload: Uint8Array,
+  ): Promise<void> {
+    const lane = this.assertDatagramLane();
+    this.validatePublishPayload(payload);
+    if (this.datagramWriteActive) {
+      throw err("transport", "another datagram write is already active");
+    }
+    try {
+      const frame = encodeUnreliableEntityState(
+        { namespaceId, sessionId, spaceId, spaceEpoch, channelId, entityId, senderSequence: sequence },
+        { typeId, bytes: payload },
+      );
+      if (frame.byteLength > this.maxPublishFrameBytes) {
+        throw err(
+          "protocol",
+          `encoded datagram frame length ${frame.byteLength} bytes exceeds frame limit ${this.maxPublishFrameBytes} bytes`,
+        );
+      }
+      // The transport MTU is dynamic; check the complete frame immediately before writing.
+      if (frame.byteLength > lane.maxDatagramSize) {
+        throw err(
+          "transport",
+          `encoded datagram frame length ${frame.byteLength} bytes exceeds maxDatagramSize ${lane.maxDatagramSize} bytes`,
+        );
+      }
+      await this.writeDatagram(frame, lane);
+    } catch (error) {
+      if (error instanceof CodecError) throw err("protocol", error.message);
+      throw error;
+    }
+  }
+
+  /** Queue positioned unreliable state without retry or reliable fallback. */
+  async publishUnreliablePositionedState(
+    namespaceId: bigint,
+    sessionId: bigint,
+    spaceId: bigint,
+    spaceEpoch: bigint,
+    channelId: bigint,
+    entityId: bigint,
+    sequence: bigint,
+    typeId: bigint,
+    position: RoutingPosition3D,
+    payload: Uint8Array,
+  ): Promise<void> {
+    this.requirePositionedState();
+    const lane = this.assertDatagramLane();
+    this.validatePublishPayload(payload);
+    if (this.datagramWriteActive) {
+      throw err("transport", "another datagram write is already active");
+    }
+    try {
+      const frame = encodeUnreliableEntityState(
+        {
+          namespaceId,
+          sessionId,
+          spaceId,
+          spaceEpoch,
+          channelId,
+          entityId,
+          senderSequence: sequence,
+          routingPosition: position,
+        },
+        { typeId, bytes: payload },
+      );
+      if (frame.byteLength > this.maxPublishFrameBytes) {
+        throw err(
+          "protocol",
+          `encoded datagram frame length ${frame.byteLength} bytes exceeds frame limit ${this.maxPublishFrameBytes} bytes`,
+        );
+      }
+      if (frame.byteLength > lane.maxDatagramSize) {
+        throw err(
+          "transport",
+          `encoded datagram frame length ${frame.byteLength} bytes exceeds maxDatagramSize ${lane.maxDatagramSize} bytes`,
+        );
+      }
+      await this.writeDatagram(frame, lane);
+    } catch (error) {
+      if (error instanceof CodecError) throw err("protocol", error.message);
+      throw error;
+    }
+  }
+
+  /** Whether the handshake negotiated atomic positioned EntityState support. */
+  supportsPositionedState(): boolean {
+    return (this.negotiatedCapabilityBits & CAPABILITY_POSITIONED_ENTITY_STATE) !== 0n;
+  }
+
   /** Send an `InferenceRequested` control envelope addressed to the AI identity's entity. */
   async requestInference(
     namespaceId: bigint,
@@ -525,12 +766,17 @@ export class WovenClient {
     deadlineMs: bigint,
     input: Uint8Array,
   ): Promise<void> {
-    await this.write(
-      encodeInferenceRequested(
-        { namespaceId, sessionId, spaceId, spaceEpoch, entityId: aiEntityId },
-        { capability, deadlineMs, input },
-      ),
-    );
+    try {
+      await this.write(
+        encodeInferenceRequested(
+          { namespaceId, sessionId, spaceId, spaceEpoch, entityId: aiEntityId },
+          { capability, deadlineMs, input },
+        ),
+      );
+    } catch (error) {
+      if (error instanceof CodecError) throw err("protocol", error.message);
+      throw error;
+    }
   }
 
   /**
@@ -562,6 +808,37 @@ export class WovenClient {
         throw error;
       },
     );
+  }
+
+  /**
+   * Receive one opaque unreliable EntityState independently of recv(). Returns null on lane end.
+   * Malformed datagrams consume one packet and reject with kind "protocol"; no ordering is added.
+   */
+  async recvDatagram(): Promise<DecodedEnvelope | null> {
+    const lane = this.assertDatagramLane();
+    this.beginDatagramReceive();
+    try {
+      return await this.waitForDatagramReceive(this.takeOrBeginDatagramReceive(lane));
+    } finally {
+      this.datagramReceiveActive = false;
+    }
+  }
+
+  /** Return null on timeout/lane end, retaining at most one read for the next datagram receive. */
+  async recvDatagramTimeout(timeoutMs: number): Promise<DecodedEnvelope | null> {
+    const lane = this.assertDatagramLane();
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TIMER_TIMEOUT_MS) {
+      throw err(
+        "transport",
+        `datagram timeout must be finite and between 0 and ${MAX_TIMER_TIMEOUT_MS}ms`,
+      );
+    }
+    this.beginDatagramReceive();
+    try {
+      return await this.waitForDatagramReceive(this.takeOrBeginDatagramReceive(lane), timeoutMs);
+    } finally {
+      this.datagramReceiveActive = false;
+    }
   }
 
   /** Initiate WebTransport session closure without waiting for transport shutdown. */
@@ -597,7 +874,7 @@ export class WovenClient {
     await this.writeRaw(
       encodeHello({
         clientName: "woven-client-ts",
-        clientVersion: "0.2.0",
+        clientVersion: "0.3.0",
         maxFrameSize: limits.maxFrameBytes,
         maxPayloadSize: limits.maxPayloadBytes,
       }),
@@ -620,6 +897,15 @@ export class WovenClient {
     ) {
       throw err("handshake", "Capabilities response has invalid protocol version or limits");
     }
+    this.maxPublishPayloadBytes = Math.min(
+      this.maxPublishPayloadBytes,
+      capabilities.control.maxPayloadSize(),
+    );
+    this.maxPublishFrameBytes = Math.min(
+      this.maxPublishFrameBytes,
+      capabilities.control.maxFrameSize(),
+    );
+    this.negotiatedCapabilityBits = capabilities.control.capabilityBits();
 
     await this.writeRaw(
       encodeAuthenticate(
@@ -693,7 +979,11 @@ export class WovenClient {
       this.shutdown("admission protocol mismatch");
       throw err("protocol", "admission reply payload mismatch");
     }
-    return normalizeAdmissionResult(reply.control);
+    const result = normalizeAdmissionResult(reply.control);
+    if (result.status === AdmissionStatus.Admitted && this.lifecycle === "ready") {
+      this.sessionScope = { namespaceId, sessionId };
+    }
+    return result;
   }
 
   private async queueExchange(
@@ -729,6 +1019,9 @@ export class WovenClient {
       this.shutdown("admission protocol mismatch");
       throw err("protocol", "queue reply ticket mismatch");
     }
+    if (update.state === QueueState.Admitted && this.lifecycle === "ready") {
+      this.sessionScope = { namespaceId, sessionId };
+    }
     return update;
   }
 
@@ -748,7 +1041,8 @@ export class WovenClient {
       this.admissionExchangeActive ||
       this.readActive ||
       this.writeActive ||
-      this.deferredReceive !== null
+      this.deferredReceive !== null ||
+      this.hasDatagramOperation()
     ) {
       throw err("transport", "client already has an active stream or admission operation");
     }
@@ -909,8 +1203,26 @@ export class WovenClient {
           `pending envelope queue exceeds limit ${MAX_PENDING_ENVELOPES}`,
         );
       }
-      this.pending.push(this.codec.decode(this.inBuffer));
+      const envelope = this.codec.decode(this.inBuffer);
+      this.observeSessionScope(envelope);
+      this.pending.push(envelope);
       this.inBuffer = new Uint8Array(0);
+    }
+  }
+
+  private observeSessionScope(envelope: DecodedEnvelope): void {
+    const scope = this.sessionScope;
+    if (scope === null) return;
+    const matching = envelope.namespaceId === scope.namespaceId && envelope.sessionId === scope.sessionId;
+    if (envelope.messageKind === MessageKind.LeaveSession && matching) this.sessionScope = null;
+    if (!(envelope.control instanceof ProtocolErrorPayload)) return;
+    const error = envelope.control;
+    const unscoped = envelope.namespaceId === 0n && envelope.sessionId === 0n;
+    if ((matching || unscoped) &&
+        (error.relatedMessageKind() === MessageKind.JoinSession ||
+         (error.relatedMessageKind() === MessageKind.ClientLog &&
+          [ProtocolErrorCode.AuthenticationRequired, ProtocolErrorCode.Unauthorized, ProtocolErrorCode.InvalidScope].includes(error.code())))) {
+      this.sessionScope = null;
     }
   }
 
@@ -931,11 +1243,206 @@ export class WovenClient {
       const { value, done } = await reader.read();
       if (done) {
         this.lifecycle = "closed";
+        this.sessionScope = null;
         throw err("closed", "control stream ended");
       }
       return value;
     } finally {
       reader.releaseLock();
+    }
+  }
+
+  private requirePositionedState(): void {
+    if (!this.supportsPositionedState()) {
+      throw err("protocol", "server did not negotiate positioned EntityState");
+    }
+  }
+
+  private configureDatagramLane(config: WovenConfig): void {
+    const lane = this.transport.datagrams;
+    if (!this.isDatagramLaneAvailable(lane)) {
+      if (config.webTransportOptions?.requireUnreliable) {
+        throw err("transport", "unreliable WebTransport datagrams are not available");
+      }
+      return;
+    }
+    try {
+      lane.incomingHighWaterMark = DATAGRAM_INCOMING_HIGH_WATER_MARK;
+      lane.outgoingHighWaterMark = DATAGRAM_OUTGOING_HIGH_WATER_MARK;
+      lane.incomingMaxAge = config.datagramMaxAgeMs ?? null;
+      lane.outgoingMaxAge = config.datagramMaxAgeMs ?? null;
+      if (
+        lane.incomingHighWaterMark !== DATAGRAM_INCOMING_HIGH_WATER_MARK ||
+        lane.outgoingHighWaterMark !== DATAGRAM_OUTGOING_HIGH_WATER_MARK
+      ) {
+        throw new Error("runtime did not apply datagram queue bounds");
+      }
+      this.datagramLane = lane;
+    } catch (error) {
+      throw err(
+        "transport",
+        `cannot configure bounded WebTransport datagrams: ${runtimeErrorMessage(error, "queue setters unavailable")}`,
+      );
+    }
+  }
+
+  private isDatagramLaneAvailable(
+    lane: WebTransportDatagramDuplexStream | undefined,
+  ): lane is WebTransportDatagramDuplexStream {
+    return this.transport.reliability !== "reliable-only" &&
+      this.transport.reliability !== "pending" && lane !== undefined && lane !== null &&
+      Number.isSafeInteger(lane.maxDatagramSize) && lane.maxDatagramSize > 0 &&
+      typeof lane.readable?.getReader === "function" && typeof lane.writable?.getWriter === "function";
+  }
+
+  private assertDatagramLane(): WebTransportDatagramDuplexStream {
+    this.assertReady();
+    if (this.admissionRunnerActive || this.admissionExchangeActive) {
+      throw err("transport", "datagram lane is unavailable during managed admission");
+    }
+    if (this.datagramLane === null || !this.isDatagramLaneAvailable(this.datagramLane)) {
+      throw err("transport", "unreliable WebTransport datagrams are not available");
+    }
+    return this.datagramLane;
+  }
+
+  private hasDatagramOperation(): boolean {
+    return this.datagramReceiveActive || this.datagramReadActive || this.datagramWriteActive ||
+      this.pendingDatagramReceive !== null;
+  }
+
+  private beginDatagramReceive(): void {
+    if (this.datagramReceiveActive) {
+      throw err("transport", "another datagram receive is already active");
+    }
+    this.datagramReceiveActive = true;
+  }
+
+  private takeOrBeginDatagramReceive(
+    lane: WebTransportDatagramDuplexStream,
+  ): PendingDatagramReceive {
+    if (this.pendingDatagramReceive !== null) return this.pendingDatagramReceive;
+    const receive: PendingDatagramReceive = {
+      promise: this.receiveDatagramExclusive(lane), outcome: null, notify: null,
+    };
+    this.pendingDatagramReceive = receive;
+    // Observe each read only once. Repeated timeouts replace the waiter instead of
+    // accumulating Promise.race handlers on a read that may never receive a packet.
+    const settle = (outcome: DatagramOutcome): void => {
+      receive.outcome = outcome;
+      receive.notify?.();
+    };
+    void receive.promise.then(
+      (envelope) => settle({ ok: true, envelope }),
+      (error) => settle({ ok: false, error }),
+    );
+    return receive;
+  }
+
+  private waitForDatagramReceive(
+    receive: PendingDatagramReceive,
+    timeoutMs?: number,
+  ): Promise<DecodedEnvelope | null> {
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (): void => {
+        const outcome = receive.outcome;
+        if (outcome === null) return;
+        if (timer !== undefined) clearTimeout(timer);
+        receive.notify = null;
+        if (this.pendingDatagramReceive === receive) this.pendingDatagramReceive = null;
+        if (outcome.ok) resolve(outcome.envelope);
+        else reject(outcome.error);
+      };
+      receive.notify = finish;
+      if (receive.outcome !== null) finish();
+      else if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          receive.notify = null;
+          resolve(null);
+        }, timeoutMs);
+      }
+    });
+  }
+
+  private async receiveDatagramExclusive(
+    lane: WebTransportDatagramDuplexStream,
+  ): Promise<DecodedEnvelope | null> {
+    if (this.datagramEnded) return null;
+    if (this.datagramReadActive) throw err("transport", "another datagram read is already active");
+    this.datagramReadActive = true;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    try {
+      reader = lane.readable.getReader();
+      this.datagramReader = reader;
+      const stopped = new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+        this.stopDatagramRead = () => resolve({ done: true, value: undefined });
+      });
+      const { value, done } = await Promise.race([reader.read(), stopped]);
+      if (done || this.datagramEnded) {
+        this.datagramEnded = true;
+        return null;
+      }
+      const envelope = this.codec.decode(value);
+      validateUnreliableEntityState(envelope);
+      return envelope;
+    } catch (error) {
+      if (this.datagramEnded) return null;
+      if (error instanceof CodecError) {
+        throw err("protocol", `invalid datagram (packet discarded): ${error.message}`);
+      }
+      if (isWovenError(error)) throw error;
+      throw err("transport", `datagram receive failed: ${runtimeErrorMessage(error, "unknown transport error")}`);
+    } finally {
+      this.stopDatagramRead = null;
+      this.datagramReader = null;
+      reader?.releaseLock();
+      this.datagramReadActive = false;
+    }
+  }
+
+  private async writeDatagram(
+    frame: Uint8Array,
+    lane: WebTransportDatagramDuplexStream,
+  ): Promise<void> {
+    if (this.datagramEnded) throw err("closed", "datagram lane ended");
+    this.datagramWriteActive = true;
+    let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+    try {
+      writer = lane.writable.getWriter();
+      this.datagramWriter = writer;
+      const stopped = new Promise<never>((_resolve, reject) => {
+        this.stopDatagramWrite = () => reject(err("closed", "datagram lane ended"));
+      });
+      await Promise.race([writer.write(frame), stopped]);
+    } catch (error) {
+      if (isWovenError(error)) throw error;
+      throw err("transport", `datagram write failed: ${runtimeErrorMessage(error, "unknown transport error")}`);
+    } finally {
+      this.stopDatagramWrite = null;
+      this.datagramWriter = null;
+      writer?.releaseLock();
+      this.datagramWriteActive = false;
+    }
+  }
+
+  private stopDatagramLane(): void {
+    this.datagramEnded = true;
+    this.pendingDatagramReceive = null;
+    this.stopDatagramRead?.();
+    this.stopDatagramWrite?.();
+    // Do not await runtime cancellation: a broken shim must not make client shutdown unbounded.
+    void this.datagramReader?.cancel("connection closed").catch(() => {});
+    void this.datagramWriter?.abort("connection closed").catch(() => {});
+  }
+
+  private validatePublishPayload(payload: Uint8Array): void {
+    this.assertReady();
+    try {
+      validatePayloadLength(payload.byteLength, this.maxPublishPayloadBytes);
+    } catch (error) {
+      if (error instanceof CodecError) throw err("protocol", error.message);
+      throw error;
     }
   }
 
@@ -951,6 +1458,12 @@ export class WovenClient {
     if (this.lifecycle === "closed") {
       throw err("closed", "connection closed");
     }
+    if (frame.byteLength > this.maxPublishFrameBytes) {
+      throw err(
+        "protocol",
+        `encoded frame length ${frame.byteLength} bytes exceeds frame limit ${this.maxPublishFrameBytes} bytes`,
+      );
+    }
     if (this.writeActive) {
       throw err("transport", "another control-stream write is already active");
     }
@@ -962,6 +1475,9 @@ export class WovenClient {
       } finally {
         writer.releaseLock();
       }
+    } catch (error) {
+      this.sessionScope = null;
+      throw error;
     } finally {
       this.writeActive = false;
     }
@@ -975,6 +1491,8 @@ export class WovenClient {
 
   private initiateClose(closeCode: number, reason: string): void {
     this.lifecycle = "closed";
+    this.sessionScope = null;
+    this.stopDatagramLane();
     if (this.closeInitiated) return;
     this.transport.close({ closeCode, reason });
     this.closeInitiated = true;
@@ -1066,8 +1584,8 @@ function admissionAbortError(signal: AbortSignal): WovenError {
 const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 
 function validatedClientLimits(config: WovenConfig): ClientLimits {
-  const maxFrameBytes = config.maxFrameBytes ?? 65_536;
-  const maxPayloadBytes = config.maxPayloadBytes ?? 65_536;
+  const maxFrameBytes = config.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+  const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
   if (
     !Number.isInteger(maxFrameBytes) ||
     !Number.isInteger(maxPayloadBytes) ||
@@ -1081,6 +1599,15 @@ function validatedClientLimits(config: WovenConfig): ClientLimits {
     );
   }
   return { maxFrameBytes, maxPayloadBytes };
+}
+
+function validateDatagramMaxAge(value: number | undefined): void {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > MAX_TIMER_TIMEOUT_MS)) {
+    throw err(
+      "transport",
+      `datagramMaxAgeMs must be positive, finite, and no greater than ${MAX_TIMER_TIMEOUT_MS}`,
+    );
+  }
 }
 
 function validatedConnectionTimeout(value: number | undefined): number {

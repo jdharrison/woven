@@ -23,7 +23,7 @@ pub struct RemoteServerConfig {
     /// PEM private key matching the leaf certificate (at most 1 MiB).
     pub private_key_file: PathBuf,
     /// UTF-8 token file; 32–4096 non-whitespace ASCII bytes, optional trailing newline.
-    /// Grants principal 1 access to namespace/session 1, spaces 1/2, channels 1/2 only.
+    /// Grants principal 1 access to namespace/session 1, spaces 1/2/3, channels 1/2/4 only.
     pub auth_token_file: PathBuf,
 }
 

@@ -163,12 +163,14 @@ PersistenceClass: Ephemeral | Stateful | Durable
 RoutingPolicy:    BroadcastAll | SpatialGrid2D{cell_size,interest_radius,exact_distance} | SpatialGrid3D{...} | TopicOnly
 CoordinateFrame:  Logical | Cartesian2D{meters_per_unit} | Cartesian3D{meters_per_unit}
 EntityPosition:   Cartesian2D{x,y} | Cartesian3D{x,y,z}  // finite; must match a spatial space frame
+SpatialBounds3D { min_x,min_y,min_z,max_x,max_y,max_z }    // finite, strict min < max; containment inclusive
 
-SpaceDescriptor { id, local_frame, parent: Option<ParentAnchor>, epoch, routing }
+SpaceDescriptor { id, local_frame, bounds: Option<SpatialBounds3D>, parent: Option<ParentAnchor>, epoch, routing }
 ParentAnchor    { parent_space: SpaceId, anchor_entity: EntityId }
 
 OutboundMessage { namespace, session, space, space_epoch, entity: Option<EntityId>,
-                  channel, sequence, delivery, persistence, coalesce_key: Option<CoalesceKey>, payload: Vec<u8> }
+                  channel, sequence, delivery, persistence, coalesce_key: Option<CoalesceKey>,
+                  routing_position: Option<EntityPosition>, payload: Vec<u8> }
 // outbound_message.scoped_coalesce_key() → Option<ScopedCoalesceKey>  (namespace+session+space+epoch+application)
 
 CoalesceKey { channel, entity: Option<EntityId>, component: u64 }
@@ -200,7 +202,7 @@ let core = WovenCore::new(authenticator, CoreConfig::default())?;
 //   max_connections: 4_096        max_sessions: 1_024
 //   max_channels: 1_024           max_memberships_per_connection: 32
 //   max_subscriptions_per_connection: 128   max_owned_entities_per_connection: 256
-//   max_payload_bytes: 64KB       max_spaces_per_session: 1_024
+//   max_payload_bytes: 64 KiB (65_536 bytes)       max_spaces_per_session: 1_024
 //   max_space_epoch_tombstones_per_session: 4_096
 //   max_entities_per_session: 16_384      max_state_entries_per_session: 65_536
 //   max_state_bytes_per_session: 64MB     max_sequence_keys_per_session: 131_072
@@ -209,13 +211,20 @@ let core = WovenCore::new(authenticator, CoreConfig::default())?;
 
 // Server setup (before any connections)
 core.register_channel(channel_definition)?;   // must be nonzero id, nonzero payload limit
+core.channel_persistence(conn_id, session_key, channel_id)?; // authorized immutable policy lookup
 core.provision_session(session_key)?;         // server provisions sessions; clients cannot create them
+core.set_session_publish_rate_limit(session_key, Some(PublishRateLimit { max_publishes: 60, window: Duration::from_secs(1) }))?;
+// Optional extra per-member budget shared by all session spaces/channels; None retains core limit.
+// Changes and leave/rejoin preserve connection/session windows/counts; no domain ticks.
+// Active memberships + retained detached histories share max_memberships_per_connection slots.
+// Expired detached histories prune on joins; cap-full new scopes return MembershipLimitReached.
 core.install_space(session_key, descriptor)?; // parent anchor must already exist
 
 // Per-connection lifecycle (call in this order)
 let conn_id = core.transport_connected()?;
 let principal_id = core.authenticate(conn_id, &Credentials::new("token"))?;
-core.join_session(conn_id, session_key)?;     // checks grants, session must already exist
+core.join_session(conn_id, session_key)?;     // or join_session_at(conn_id, session_key, Instant)
+// join_session_with_admission_at(conn_id, session_key, lease, Instant) forwards injected time too.
 core.subscribe(conn_id, space_key)?;          // checks grants, session membership, space existence
 let entity_id = core.spawn_entity(conn_id, space_key, epoch)?;  // server-assigns ID
 let outcome = core.publish(publish_request)?; // or core.publish_at(request, Instant)
@@ -223,6 +232,8 @@ let summary = core.unsubscribe(conn_id, space_key)?;            // purges queued
 let summary = core.leave_session(conn_id, session_key)?;        // purges queued session msgs
 core.remove_entity(conn_id, session_key, entity_id)?;
 let messages = core.drain_outbound(conn_id)?;
+// Registered transports retain pending-space messages in the original bounded queue:
+let messages = core.drain_outbound_for_spaces(conn_id, &active_spaces)?;
 let snapshot = core.snapshot(conn_id, session_key)?;            // scoped to subscribed spaces + grants
 let summary = core.transport_lost(conn_id)?;                    // full cleanup, call on disconnect
 
@@ -235,7 +246,11 @@ core.update_entity_position(conn_id, session_key, entity_id, position)?; // owne
 //   connection, session, space, space_epoch, entity: Option<EntityId>, channel,
 //   sequence (must be strictly monotone per connection+space+epoch+entity+channel+component),
 //   delivery (must match ChannelDefinition), persistence (must match ChannelDefinition),
-//   coalesce_key (required for LatestValue/UnreliableSequenced), payload
+//   coalesce_key (required for LatestValue/UnreliableSequenced),
+//   routing_position: Option<EntityPosition>, payload
+// Attached publish routing positions require LatestValue or UnreliableSequenced delivery,
+// are 3D-only and validated against optional inclusive bounds, and update the owned entity
+// position/index atomically with publication before routing.
 
 // Introspection helpers
 core.is_connected(conn_id) → bool
@@ -286,9 +301,10 @@ harness.run_pending() → Vec<Result<CommandResult, CoreError>>
 - `start_remote(config).await -> Result<RemoteServer, ServerError>` exposes actual
   `quic_address`/`management_address`; retain handle, drop to close listeners.
   `serve_remote(config).await` runs until Ctrl-C or listener failure.
-- Remote mode explicitly provisions namespace/session 1, logical broadcast spaces 1/2,
-  epoch 1, channel 1 ReliableOrdered/Ephemeral and channel 2 LatestValue/Stateful (no TTL),
-  64 KiB channel payload ceilings. One externally supplied static credential maps to
+- Remote mode explicitly provisions namespace/session 1, logical broadcast spaces 1/2 and
+  bounded Cartesian3D/SpatialGrid3D space 3, epoch 1, channel 1 ReliableOrdered/Ephemeral,
+  channel 2 LatestValue/Stateful (no TTL),
+  and channel 4 UnreliableSequenced/Ephemeral; 64 KiB channel payload ceilings. One externally supplied static credential maps to
   principal 1 through existing `DevAuthenticator` / WVN1 `Development` auth. No default
   or AI token, remote WebTransport, inference, or production tenant authentication.
 - `woven_client::ClientTlsConfig::from_ca_pem(&[u8]) -> Result<Self, ClientError>`
@@ -303,6 +319,36 @@ harness.run_pending() → Vec<Result<CommandResult, CoreError>>
 - Local integration coverage: `woven-server/tests/remote_quic.rs`. Cloud deployment,
   firewall/IAM/secret operations and remote traffic remain separately approval-gated.
 
+Managed session PUT/PATCH accept optional `tickRateHz` (integer 1..120), implemented as an
+additional publish-admission budget per connected member/session/second, not a simulation tick
+scheduler. PUT omission means no session ceiling; PATCH omission preserves the configured rate.
+Snapshots serialize `tickRateHz` only when configured. Rust `ManagedRequest::{Put, Patch}` and
+`ManagedSnapshot` add `tick_rate_hz: Option<u32>`; same-revision retries include optional-rate
+identity and cannot alter it. Window/count history survives changes/retries and unlimited periods;
+all channels/spaces share a connection-owned limiter retained across LeaveSession/re-admission.
+Active memberships and detached rate histories share max_memberships_per_connection slots (32 by
+default); joins prune expired detached histories, but never evict an unexpired budget. A full
+history cap rejects a new scope with MembershipLimitReached. Never-limited sessions drop history
+on leave, preserving unlimited-only churn; transport loss/managed teardown remove histories.
+Core connection limits still apply.
+No WVN1/schema/binding change. See `docs/managed-sessions.md` for fixed-window semantics.
+
+Managed Lite provisions compatibility/system spaces 1/2 at epoch 1 with exactly channels 1 and 4:
+ReliableOrdered/Ephemeral and UnreliableSequenced/Ephemeral, respectively, both
+with 64 KiB payload ceilings. Authenticated add-only `PUT
+/v1/namespaces/{namespace}/sessions/{session}/spaces/{spaceId}` may add 64 bounded
+Cartesian3D/SpatialGrid3D spaces (66 managed spaces total), fixed epoch 1/no parent/channels 1/4.
+The strict body contains session-wide `revision`, positive finite `metersPerUnit`, `cellSize`,
+`interestRadius`, boolean `exactDistance`, and finite min/max XYZ with strict min < max; runtime
+bounds are inclusive. Exact retries are idempotent; there is no update/delete operation. Adds
+refresh live and future exact grants; unknown/ad-hoc spaces stay unauthorized. `/v1/node` and
+session snapshots expose capabilities, limits, and definitions. Development additionally
+preconfigures spatial space 3, keeps channel 2 Stateful, and reserves channel 3 for the AI status
+principal. Ephemeral state is not cached or
+replayed to late joiners. The encoded frame must fit the negotiated datagram budget; oversize,
+unsupported, or failed sends drop without reliable fallback. No application payload format is
+defined by the server.
+
 ## `woven-transport` public API
 
 Shared by every transport adapter (QUIC, WebTransport) and by the inference
@@ -312,9 +358,13 @@ coordinator, which uses it exactly like a transport does.
 // Cloneable handle to the single bounded core-worker task
 let worker: WorkerHandle = spawn_worker(TransportIndependentWorker::new(core));
 worker.execute(command) → Result<CommandResult, TransportError>
+worker.channel_persistence(connection, session, channel) → Result<PersistenceClass, TransportError>
 worker.register_lifecycle(connection, write_sender, shutdown_sender) → Result<(), TransportError>
 worker.subscribe_and_spawn(connection, space, epoch) → Result<EntityId, TransportError>
 worker.activate_subscription(connection, space) → Result<(), TransportError>
+// Activate only after SubscriptionAccepted and self EntityEntered are queued.
+// Registered transport DrainOutbound emits only active spaces; inactive messages remain bounded.
+// Workers without lifecycle registration retain the ordinary unfiltered drain behavior.
 worker.discard_and_disconnect(connection)   // drains then transport_lost, ignores errors
 
 // Deliver an envelope outside the normal per-connection OutboundQueue, reusing the same
@@ -326,10 +376,17 @@ worker.send_to_connection(connection, envelope) → Result<(), TransportError>
 
 // Shared envelope bridge used by every adapter's post-authentication loop
 handle_authenticated(&worker, connection, envelope, &write_sender, inference_sink: Option<&mpsc::Sender<UnroutedControl>>) → Result<(), ()>
+handle_authenticated_with_capabilities(&worker, connection, envelope, &write_sender, inference_sink, negotiated_bits) → Result<(), ()>
+// Positioned EntityState is rejected unless CAPABILITY_POSITIONED_ENTITY_STATE was negotiated.
 // Forwards InferenceRequested/InferenceCancelled to inference_sink when Some; otherwise
 // falls through to the normal UnsupportedMessage rejection. None when inference is disabled.
 flush_outbound(&worker, connection, &write_sender) → Result<(), ()>
 outbound_envelope(message: OutboundMessage) → Envelope
+// EntityState persistence comes from the registered channel, not the message kind.
+// UnreliableSequenced stale/duplicate updates are rejected without closing the connection.
+// QUIC/WebTransport client datagrams accept only EntityState/UnreliableSequenced.
+// A pinned per-frame read survives datagram processing until the full reliable frame completes.
+// Both timer drains and write queues dispatch UnreliableSequenced as datagrams, never streams.
 send_envelope(&write_sender, envelope) → Result<(), ()>
 send_error(&write_sender, related_kind, code, message)
 
@@ -340,15 +397,35 @@ struct UnroutedControl { connection: ConnectionId, envelope: Envelope }
 
 ---
 
+## Basic client logging
+
+- `ClientLog` (message kind 40) is a ReliableOrdered, session-only control with
+  `LogLevel::{Info,Warn,Error}` and a nonempty message of at most 1,024 UTF-8 bytes.
+  `CAPABILITY_CLIENT_LOG = 2`; it is not channel traffic or peer-broadcast payload.
+- Rust: `client.logger().info/warn/error(message).await`, `client.log(message).await`.
+  TypeScript: `client.logger.info/warn/error(message)`, `client.log(message)`.
+  Join/admission remembers scope; send completion is not a persistence ACK.
+- Transport's single owner validates actual session membership, limits explicit
+  client logs to 10/connection/sec and 1,024/node/sec, attaches metadata and keeps
+  a volatile 2,048-event ring. Successful session membership and disconnects are
+  captured, not ordinary updates/publishes. Malformed wire frames retain the
+  existing fatal decode behavior; oversized SDK messages reject before sending.
+- Managed admin `GET /v1/logs?after=0&limit=32` requires bearer auth and matching
+  `Woven-Node-Incarnation`; responses are capped at 48 KiB including JSON escaping.
+  Host consumes/persists this feed outside Woven; no cloud/DB integration or
+  durable archive is added to the node.
+
 ## `woven-protocol` public API
 
 ```rust
 // Constants
 PROTOCOL_VERSION: u16 = 1
 FILE_IDENTIFIER: &str  = "WVN1"
+CAPABILITY_POSITIONED_ENTITY_STATE: u64 = 1 << 0
+SUPPORTED_CAPABILITY_BITS: u64 = CAPABILITY_POSITIONED_ENTITY_STATE | CAPABILITY_CLIENT_LOG
 
 // Codec — size-prefixed FlatBuffers framing
-let codec = Codec::default();                                      // default limits: 1MB frame, 256KB payload
+let codec = Codec::default();                                      // default limits: 1 MiB frame, 64 KiB payload
 let codec = Codec::new(CodecLimits::new(max_frame, max_payload)?)?;
 codec.encode(&envelope) → Result<Vec<u8>, CodecError>
 codec.decode(frame: &[u8]) → Result<Envelope, CodecError>
@@ -368,6 +445,7 @@ struct Envelope {
     server_tick: u64,
     sender_sequence: u64,
     correlation_id: Option<u64>,
+    routing_position: Option<RoutingPosition3D>, // finite; EntityState only
     message: MessagePayload,
 }
 // Constructors: Envelope::control(delivery, ControlPayload) | ::entity_state | ::reliable_event | ::snapshot
@@ -422,6 +500,8 @@ ToolCallCompleted(..)           (32)  — space+entity-scoped, delivery=Reliable
 // - Authenticate: scheme != Unknown, credentials nonempty
 // - Authenticated: principal_id nonzero
 // - DeliveryClass must be compatible with MessageKind (see semantics.rs)
+// - routing_position is optional additive metadata only on EntityState; x/y/z must be finite
+// - Hello/Capabilities negotiate capability bits by intersection; positioned APIs require bit 0
 
 // CodecError variants (for ProtocolError mapping):
 // InvalidLimits | FrameTooLarge | PayloadTooLarge | TruncatedFrame | TrailingBytes

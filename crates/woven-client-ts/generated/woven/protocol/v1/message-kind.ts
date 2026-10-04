@@ -42,5 +42,6 @@ export enum MessageKind {
   QueueHeartbeat = 36,
   QueueClaim = 37,
   QueueCancel = 38,
-  QueueUpdate = 39
+  QueueUpdate = 39,
+  ClientLog = 40
 }

@@ -16,6 +16,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{StatusCode, header},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde::Serialize;
@@ -80,6 +81,7 @@ struct AppState {
     webtransport_endpoint: Option<String>,
     inference_enabled: bool,
     worker: WorkerHandle,
+    node_incarnation: Option<header::HeaderValue>,
     max_connections: usize,
     max_sessions: usize,
 }
@@ -98,6 +100,24 @@ fn router_with_transports(
     inference_enabled: bool,
     worker: WorkerHandle,
 ) -> Router {
+    router_with_transports_and_incarnation(
+        quic_enabled,
+        webtransport_enabled,
+        webtransport_endpoint,
+        inference_enabled,
+        worker,
+        None,
+    )
+}
+
+fn router_with_transports_and_incarnation(
+    quic_enabled: bool,
+    webtransport_enabled: bool,
+    webtransport_endpoint: Option<String>,
+    inference_enabled: bool,
+    worker: WorkerHandle,
+    node_incarnation: Option<header::HeaderValue>,
+) -> Router {
     let default_core_config = CoreConfig::default();
     let state = Arc::new(AppState {
         quic_enabled,
@@ -105,6 +125,7 @@ fn router_with_transports(
         webtransport_endpoint,
         inference_enabled,
         worker,
+        node_incarnation,
         max_connections: default_core_config.max_connections,
         max_sessions: default_core_config.max_sessions,
     });
@@ -422,9 +443,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
 /// connection/session counts are read directly from core state and the rest are relaxed
 /// atomic counters maintained on the hot path regardless of build profile — unlike the
 /// debug-only activity log, this is meant to run in production.
-async fn metrics(
-    State(state): State<Arc<AppState>>,
-) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let live = state.worker.live_counts().await.unwrap_or_default();
     let counters = state.worker.metrics().snapshot();
     let mut body = String::new();
@@ -514,13 +533,24 @@ async fn metrics(
         counters.queue_evicted_total,
     );
 
-    (
+    metrics_response(body, state.node_incarnation.as_ref())
+}
+
+fn metrics_response(body: String, node_incarnation: Option<&header::HeaderValue>) -> Response {
+    let mut response = (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         body,
     )
+        .into_response();
+    if let Some(incarnation) = node_incarnation {
+        response
+            .headers_mut()
+            .insert("woven-node-incarnation", incarnation.clone());
+    }
+    response
 }
 
 fn write_gauge(body: &mut String, name: &str, help: &str, value: u64) {
@@ -567,8 +597,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<CapabilitiesRe
         protocol_version: woven_protocol::PROTOCOL_VERSION,
         transports,
         features,
-        max_frame_bytes: 1_048_576,
-        max_payload_bytes: 262_144,
+        max_frame_bytes: woven_transport::MAX_FRAME_BYTES,
+        max_payload_bytes: woven_transport::MAX_PAYLOAD_BYTES,
         webtransport: state.webtransport_endpoint.clone(),
     })
 }
@@ -609,7 +639,7 @@ fn scoped_core(
     let mut grants = AuthorizationGrants::new();
     grants.grant_namespace(namespace, AccessGrant::ReadWrite);
     grants.grant_session(session, AccessGrant::ReadWrite);
-    for space_id in [1, 2] {
+    for space_id in [1, 2, 3] {
         grants.grant_space(
             SpaceKey {
                 session,
@@ -618,7 +648,7 @@ fn scoped_core(
             AccessGrant::ReadWrite,
         );
     }
-    for channel_id in [1, 2] {
+    for channel_id in [1, 2, 4] {
         grants.grant_channel(
             ChannelScope::new(session, ChannelId::new(channel_id)),
             AccessGrant::ReadWrite,
@@ -663,6 +693,12 @@ fn scoped_core(
         PersistenceClass::Stateful { ttl: None },
         64 * 1024,
     ))?;
+    core.register_channel(ChannelDefinition::relay_owned(
+        ChannelId::new(4),
+        woven_core::DeliveryClass::UnreliableSequenced,
+        PersistenceClass::Ephemeral,
+        64 * 1024,
+    ))?;
     if include_ai {
         core.register_channel(ChannelDefinition::relay_owned(
             ChannelId::new(AI_STATUS_CHANNEL_ID),
@@ -678,13 +714,45 @@ fn scoped_core(
             SpaceDescriptor {
                 id: SpaceId::new(space_id),
                 local_frame: CoordinateFrame::Logical,
+                bounds: None,
                 parent: None,
                 epoch: SpaceEpoch::new(1),
                 routing: RoutingPolicy::BroadcastAll,
             },
         )?;
     }
+    install_development_spatial_space(&mut core, session)?;
     Ok(core)
+}
+
+fn install_development_spatial_space(
+    core: &mut WovenCore<DevAuthenticator>,
+    session: SessionKey,
+) -> Result<(), woven_core::CoreError> {
+    core.install_space(
+        session,
+        SpaceDescriptor {
+            id: SpaceId::new(3),
+            local_frame: CoordinateFrame::Cartesian3D {
+                meters_per_unit: 1.0,
+            },
+            bounds: Some(woven_core::SpatialBounds3D {
+                min_x: -1000.0,
+                min_y: -100.0,
+                min_z: -1000.0,
+                max_x: 1000.0,
+                max_y: 500.0,
+                max_z: 1000.0,
+            }),
+            parent: None,
+            epoch: SpaceEpoch::new(1),
+            routing: RoutingPolicy::SpatialGrid3D {
+                cell_size: 10.0,
+                interest_radius: 25.0,
+                exact_distance: true,
+            },
+        },
+    )
 }
 
 #[cfg(test)]
@@ -697,12 +765,153 @@ mod tests {
     use woven_core::TransportIndependentWorker;
     use woven_transport::spawn_worker;
 
-    use super::{development_core, router_with_transports};
+    use super::{development_core, router_with_transports, router_with_transports_and_incarnation};
 
     fn test_worker() -> woven_transport::WorkerHandle {
         spawn_worker(TransportIndependentWorker::new(
             development_core().expect("development core"),
         ))
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one composition probe checks unchanged channels and the new channel across spaces"
+    )]
+    fn development_and_static_compositions_grant_ephemeral_unreliable_channel_four() {
+        use super::*;
+        use woven_core::{CoalesceKey, Credentials, PublishRequest};
+
+        let session = SessionKey::new(NamespaceId::new(1), SessionId::new(1));
+        for include_ai in [false, true] {
+            let mut core = scoped_core("test-token", include_ai).unwrap();
+            let connection = core.transport_connected().unwrap();
+            core.authenticate(connection, &Credentials::new("test-token"))
+                .unwrap();
+            core.join_session(connection, session).unwrap();
+            for space_id in [1, 2] {
+                let space = SpaceId::new(space_id);
+                core.subscribe(connection, SpaceKey::new(session, space))
+                    .unwrap();
+                let entity = core
+                    .spawn_entity(
+                        connection,
+                        SpaceKey::new(session, space),
+                        SpaceEpoch::new(1),
+                    )
+                    .unwrap();
+                for (channel_id, delivery, persistence) in [
+                    (
+                        1,
+                        woven_core::DeliveryClass::ReliableOrdered,
+                        PersistenceClass::Ephemeral,
+                    ),
+                    (
+                        2,
+                        woven_core::DeliveryClass::LatestValue,
+                        PersistenceClass::Stateful { ttl: None },
+                    ),
+                    (
+                        4,
+                        woven_core::DeliveryClass::UnreliableSequenced,
+                        PersistenceClass::Ephemeral,
+                    ),
+                ] {
+                    let channel = ChannelId::new(channel_id);
+                    assert_eq!(
+                        core.channel_persistence(connection, session, channel)
+                            .unwrap(),
+                        persistence
+                    );
+                    core.publish(PublishRequest {
+                        connection,
+                        session,
+                        space,
+                        space_epoch: SpaceEpoch::new(1),
+                        entity: Some(entity),
+                        channel,
+                        sequence: 1,
+                        delivery,
+                        persistence,
+                        coalesce_key: delivery.is_replaceable().then_some(CoalesceKey::new(
+                            channel,
+                            Some(entity),
+                            1,
+                        )),
+                        routing_position: None,
+                        payload: vec![7; 25],
+                    })
+                    .unwrap();
+                }
+            }
+            let spatial = SpaceId::new(3);
+            core.subscribe(connection, SpaceKey::new(session, spatial))
+                .unwrap();
+            core.spawn_entity(
+                connection,
+                SpaceKey::new(session, spatial),
+                SpaceEpoch::new(1),
+            )
+            .unwrap();
+            let snapshot = core.snapshot(connection, session).unwrap();
+            assert_eq!(snapshot.spaces.len(), 3);
+            let spatial_descriptor = snapshot
+                .spaces
+                .iter()
+                .find(|snapshot| snapshot.descriptor.id == spatial)
+                .unwrap();
+            assert_eq!(
+                spatial_descriptor.descriptor.local_frame,
+                CoordinateFrame::Cartesian3D {
+                    meters_per_unit: 1.0
+                }
+            );
+            assert_eq!(
+                spatial_descriptor.descriptor.bounds,
+                Some(woven_core::SpatialBounds3D {
+                    min_x: -1000.0,
+                    min_y: -100.0,
+                    min_z: -1000.0,
+                    max_x: 1000.0,
+                    max_y: 500.0,
+                    max_z: 1000.0,
+                })
+            );
+            assert_eq!(
+                spatial_descriptor.descriptor.routing,
+                RoutingPolicy::SpatialGrid3D {
+                    cell_size: 10.0,
+                    interest_radius: 25.0,
+                    exact_distance: true,
+                }
+            );
+            assert_eq!(snapshot.state.len(), 2);
+            assert!(
+                snapshot
+                    .state
+                    .iter()
+                    .all(|state| state.channel == ChannelId::new(2))
+            );
+            assert_eq!(core.journal_outbox_len(), 0);
+            assert!(matches!(
+                core.channel_persistence(connection, session, ChannelId::new(3)),
+                Err(woven_core::CoreError::ChannelWriteAccessDenied(_))
+            ));
+            if include_ai {
+                let ai = core.transport_connected().unwrap();
+                core.authenticate(ai, &Credentials::new(AI_DEV_TOKEN))
+                    .unwrap();
+                assert_eq!(
+                    core.channel_persistence(ai, session, ChannelId::new(AI_STATUS_CHANNEL_ID))
+                        .unwrap(),
+                    PersistenceClass::Stateful { ttl: None }
+                );
+                assert!(matches!(
+                    core.channel_persistence(ai, session, ChannelId::new(4)),
+                    Err(woven_core::CoreError::ChannelWriteAccessDenied(_))
+                ));
+            }
+        }
     }
 
     #[tokio::test]
@@ -789,6 +998,60 @@ mod tests {
         assert!(body.contains("# TYPE woven_connections_active gauge"));
         assert!(body.contains("# TYPE woven_publishes_total counter"));
         assert!(body.contains("# TYPE woven_queue_dropped_total counter"));
+    }
+
+    #[tokio::test]
+    async fn metrics_incarnation_header_preserves_exposition() {
+        let worker = test_worker();
+        worker
+            .execute(woven_core::Command::TransportConnected)
+            .await
+            .expect("connection is accepted");
+        let incarnation = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let apps = [
+            router_with_transports(true, false, None, false, worker.clone()),
+            router_with_transports_and_incarnation(
+                true,
+                false,
+                None,
+                false,
+                worker,
+                Some(incarnation.parse().expect("valid incarnation header")),
+            ),
+        ];
+        let mut bodies = Vec::with_capacity(2);
+        for (app, expected_incarnation) in apps.into_iter().zip([None, Some(incarnation)]) {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .expect("valid metrics request"),
+                )
+                .await
+                .expect("metrics response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("woven-node-incarnation")
+                    .map(|value| value.to_str().expect("ASCII incarnation")),
+                expected_incarnation
+            );
+            bodies.push(
+                to_bytes(response.into_body(), 16 * 1024)
+                    .await
+                    .expect("bounded metrics body"),
+            );
+        }
+        assert_eq!(bodies[0], bodies[1]);
+        let body = std::str::from_utf8(&bodies[0]).expect("UTF-8 metrics");
+        assert!(body.lines().any(|line| line == "woven_connections_total 1"));
+        assert!(!body.contains(incarnation));
     }
 
     #[tokio::test]

@@ -8,14 +8,15 @@ use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 
 use crate::generated::woven::protocol::v1 as wire;
 use crate::{
-    Authenticate, Authenticated, AuthenticationScheme, Capabilities, ControlPayload, DeliveryClass,
-    EntityEntered, EntityLeaveReason, EntityLeft, Envelope, FILE_IDENTIFIER, Hello,
+    Authenticate, Authenticated, AuthenticationScheme, Capabilities, ClientLog, ControlPayload,
+    DeliveryClass, EntityEntered, EntityLeaveReason, EntityLeft, Envelope, FILE_IDENTIFIER, Hello,
     InferenceAccepted, InferenceCancelled, InferenceCompleted, InferenceExpired, InferenceFailed,
     InferenceProgress, InferenceRequested, InferenceStreamChunk, JoinSession, LeaveSession,
-    MessageKind, MessagePayload, OpaquePayload, PROTOCOL_VERSION, Ping, Pong, ProtocolError,
-    ProtocolErrorCode, SnapshotRequest, SpaceTransition, SubscribeSpace, SubscriptionAccepted,
-    SubscriptionRejected, SubscriptionRejectionCode, ToolCallAccepted, ToolCallCompleted,
-    ToolCallProposed, ToolCallRejected, ToolCallRejectionCode, UnsubscribeSpace,
+    LogLevel, MessageKind, MessagePayload, OpaquePayload, PROTOCOL_VERSION, Ping, Pong,
+    ProtocolError, ProtocolErrorCode, RoutingPosition3D, SnapshotRequest, SpaceTransition,
+    SubscribeSpace, SubscriptionAccepted, SubscriptionRejected, SubscriptionRejectionCode,
+    ToolCallAccepted, ToolCallCompleted, ToolCallProposed, ToolCallRejected, ToolCallRejectionCode,
+    UnsubscribeSpace,
 };
 
 const SIZE_PREFIX_LEN: usize = 4;
@@ -52,7 +53,7 @@ impl Default for CodecLimits {
     fn default() -> Self {
         Self {
             max_frame_len: 1024 * 1024,
-            max_payload_len: 256 * 1024,
+            max_payload_len: 64 * 1024,
         }
     }
 }
@@ -228,6 +229,16 @@ impl Codec {
             .message
             .opaque()
             .map_or(0, |payload| payload.type_id);
+        let routing_position = envelope.routing_position.map(|position| {
+            wire::RoutingPosition3D::create(
+                &mut builder,
+                &wire::RoutingPosition3DArgs {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                },
+            )
+        });
         let root = wire::Envelope::create(
             &mut builder,
             &wire::EnvelopeArgs {
@@ -247,6 +258,7 @@ impl Codec {
                 control_type,
                 control,
                 channel_id: envelope.channel_id.unwrap_or(0),
+                routing_position,
             },
         );
         wire::finish_size_prefixed_envelope_buffer(&mut builder, root);
@@ -355,6 +367,13 @@ impl Codec {
             server_tick: envelope.server_tick(),
             sender_sequence: envelope.sender_sequence(),
             correlation_id: nonzero(envelope.correlation_id()),
+            routing_position: envelope
+                .routing_position()
+                .map(|position| RoutingPosition3D {
+                    x: position.x(),
+                    y: position.y(),
+                    z: position.z(),
+                }),
             message,
         };
         crate::semantics::validate(&decoded)?;
@@ -418,6 +437,20 @@ fn encode_control(
     channel_id: u64,
 ) -> (wire::ControlPayload, WIPOffset<UnionWIPOffset>) {
     match payload {
+        ControlPayload::ClientLog(value) => {
+            let message = builder.create_string(&value.message);
+            let offset = wire::ClientLogPayload::create(
+                builder,
+                &wire::ClientLogPayloadArgs {
+                    level: wire::LogLevel(value.level.value()),
+                    message: Some(message),
+                },
+            );
+            (
+                wire::ControlPayload::ClientLogPayload,
+                offset.as_union_value(),
+            )
+        }
         ControlPayload::Hello(value) => {
             let client_name = builder.create_string(&value.client_name);
             let client_version = builder.create_string(&value.client_version);
@@ -912,6 +945,21 @@ fn decode_control(
     kind: MessageKind,
 ) -> Result<ControlPayload, CodecError> {
     Ok(match kind {
+        MessageKind::ClientLog => {
+            require_control(envelope, kind, wire::ControlPayload::ClientLogPayload)?;
+            let value = envelope
+                .control_as_client_log_payload()
+                .ok_or_else(|| control_mismatch(envelope, kind))?;
+            ControlPayload::ClientLog(ClientLog {
+                level: LogLevel::from_wire(value.level().0).ok_or(
+                    CodecError::UnsupportedEnumValue {
+                        name: "LogLevel",
+                        value: u64::from(value.level().0),
+                    },
+                )?,
+                message: checked_control_string(codec, value.message())?,
+            })
+        }
         MessageKind::Hello => {
             require_control(envelope, kind, wire::ControlPayload::HelloPayload)?;
             let value = envelope
@@ -1469,6 +1517,60 @@ const fn nonzero(value: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_log_decode_rejects_invalid_wire_fields_scope_and_union() {
+        for invalid in 0..14 {
+            let mut builder = FlatBufferBuilder::new();
+            let text = match invalid {
+                2 => String::new(),
+                3 => format!("{}x", "🧶".repeat(256)),
+                _ => "hello".to_owned(),
+            };
+            let message = builder.create_string(&text);
+            let payload = wire::ClientLogPayload::create(
+                &mut builder,
+                &wire::ClientLogPayloadArgs {
+                    level: wire::LogLevel(match invalid {
+                        0 => 0,
+                        1 => 255,
+                        _ => 1,
+                    }),
+                    message: if invalid == 13 { None } else { Some(message) },
+                },
+            );
+            let root = wire::Envelope::create(
+                &mut builder,
+                &wire::EnvelopeArgs {
+                    namespace_id: u64::from(invalid != 4),
+                    session_id: u64::from(invalid != 5),
+                    space_id: u64::from(invalid == 6),
+                    channel_id: u64::from(invalid == 7),
+                    entity_id: u64::from(invalid == 8),
+                    space_epoch: u64::from(invalid == 9),
+                    message_kind: if invalid == 11 {
+                        wire::MessageKind::JoinSession
+                    } else {
+                        wire::MessageKind::ClientLog
+                    },
+                    delivery_class: if invalid == 10 {
+                        wire::DeliveryClass::ReliableUnordered
+                    } else {
+                        wire::DeliveryClass::ReliableOrdered
+                    },
+                    control_type: wire::ControlPayload::ClientLogPayload,
+                    control: Some(payload.as_union_value()),
+                    payload_type_id: u64::from(invalid == 12),
+                    ..Default::default()
+                },
+            );
+            wire::finish_size_prefixed_envelope_buffer(&mut builder, root);
+            assert!(
+                Codec::default().decode(builder.finished_data()).is_err(),
+                "case {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn managed_decode_rejects_invalid_wire_semantics_and_enums() {

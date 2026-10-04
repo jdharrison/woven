@@ -219,6 +219,7 @@ pub fn run(config: LoadConfig) -> Result<Measurement, LoadError> {
                 delivery: DeliveryClass::LatestValue,
                 persistence: PersistenceClass::Stateful { ttl: None },
                 coalesce_key: Some(CoalesceKey::new(STATE_CHANNEL, Some(participant.entity), 1)),
+                routing_position: None,
                 payload: PAYLOAD.to_vec(),
             })?;
             attempted_publishes += 1;
@@ -315,6 +316,7 @@ fn descriptor(scenario: Scenario) -> SpaceDescriptor {
     SpaceDescriptor {
         id: SPACE_ID,
         local_frame,
+        bounds: None,
         parent: None,
         epoch: EPOCH,
         routing,

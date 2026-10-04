@@ -9,16 +9,27 @@ pub(crate) fn validate(envelope: &Envelope) -> Result<(), CodecError> {
     validate_delivery(envelope)?;
 
     match &envelope.message {
-        MessagePayload::Control(control) => validate_control(envelope, control),
+        MessagePayload::Control(control) => {
+            reject_routing_position(envelope)?;
+            validate_control(envelope, control)
+        }
         MessagePayload::EntityState(payload) => {
             require_space_scope(envelope, true, true)?;
             require(
                 payload.type_id,
                 envelope,
                 "payload_type_id must be non-zero",
-            )
+            )?;
+            if envelope
+                .routing_position
+                .is_some_and(|position| !position.is_finite())
+            {
+                return invalid(envelope, "routing position coordinates must be finite");
+            }
+            Ok(())
         }
         MessagePayload::ReliableEvent(payload) | MessagePayload::Snapshot(payload) => {
+            reject_routing_position(envelope)?;
             require_space_scope(envelope, true, false)?;
             require(
                 payload.type_id,
@@ -26,6 +37,15 @@ pub(crate) fn validate(envelope: &Envelope) -> Result<(), CodecError> {
                 "payload_type_id must be non-zero",
             )
         }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn reject_routing_position(envelope: &Envelope) -> Result<(), CodecError> {
+    if envelope.routing_position.is_some() {
+        invalid(envelope, "routing position is valid only on EntityState")
+    } else {
+        Ok(())
     }
 }
 
@@ -63,6 +83,19 @@ fn validate_control(envelope: &Envelope, control: &ControlPayload) -> Result<(),
                 envelope,
                 "assigned_entity_id cannot be Some(0)",
             )
+        }
+        ControlPayload::ClientLog(value) => {
+            require_session_scope(envelope)?;
+            if value.level == crate::LogLevel::Unknown {
+                return invalid(envelope, "client log level cannot be Unknown");
+            }
+            if value.message.is_empty() || value.message.len() > crate::MAX_LOG_MESSAGE_BYTES {
+                return invalid(
+                    envelope,
+                    "client log message must contain 1 to 1024 UTF-8 bytes",
+                );
+            }
+            Ok(())
         }
         ControlPayload::JoinSession(_) | ControlPayload::LeaveSession(_) => {
             require_session_scope(envelope)

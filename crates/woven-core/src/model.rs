@@ -60,6 +60,42 @@ pub enum CoordinateFrame {
     Cartesian3D { meters_per_unit: f64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpatialBounds3D {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub min_z: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    pub max_z: f64,
+}
+
+impl SpatialBounds3D {
+    #[must_use]
+    pub const fn contains(self, x: f64, y: f64, z: f64) -> bool {
+        x >= self.min_x
+            && x <= self.max_x
+            && y >= self.min_y
+            && y <= self.max_y
+            && z >= self.min_z
+            && z <= self.max_z
+    }
+
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.min_x.is_finite()
+            && self.min_y.is_finite()
+            && self.min_z.is_finite()
+            && self.max_x.is_finite()
+            && self.max_y.is_finite()
+            && self.max_z.is_finite()
+            && self.min_x < self.max_x
+            && self.min_y < self.max_y
+            && self.min_z < self.max_z
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EntityPosition {
     Cartesian2D { x: f64, y: f64 },
@@ -105,6 +141,7 @@ pub enum PositionValidationError {
     LogicalFrame,
     DimensionMismatch,
     NonFiniteCoordinate,
+    OutOfBounds,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +170,7 @@ pub enum RoutingPolicy {
 pub struct SpaceDescriptor {
     pub id: SpaceId,
     pub local_frame: CoordinateFrame,
+    pub bounds: Option<SpatialBounds3D>,
     pub parent: Option<ParentAnchor>,
     pub epoch: SpaceEpoch,
     pub routing: RoutingPolicy,
@@ -166,6 +204,15 @@ impl SpaceDescriptor {
             }
         }
 
+        if let Some(bounds) = self.bounds {
+            if !matches!(self.local_frame, CoordinateFrame::Cartesian3D { .. }) {
+                return Err(SpaceValidationError::BoundsDimensionMismatch);
+            }
+            if !bounds.is_valid() {
+                return Err(SpaceValidationError::InvalidBounds);
+            }
+        }
+
         match self.routing {
             RoutingPolicy::BroadcastAll | RoutingPolicy::TopicOnly => {}
             RoutingPolicy::SpatialGrid2D {
@@ -193,6 +240,19 @@ impl SpaceDescriptor {
         }
         Ok(())
     }
+
+    pub fn validate_position(
+        &self,
+        position: EntityPosition,
+    ) -> Result<(), PositionValidationError> {
+        position.validate_for_frame(self.local_frame)?;
+        if let (Some(bounds), EntityPosition::Cartesian3D { x, y, z }) = (self.bounds, position)
+            && !bounds.contains(x, y, z)
+        {
+            return Err(PositionValidationError::OutOfBounds);
+        }
+        Ok(())
+    }
 }
 
 fn validate_positive_finite(value: f64) -> Result<(), SpaceValidationError> {
@@ -211,6 +271,8 @@ pub enum SpaceValidationError {
     ZeroAnchorEntityId,
     SelfParent,
     InvalidScale,
+    InvalidBounds,
+    BoundsDimensionMismatch,
     RoutingDimensionMismatch,
 }
 
@@ -241,7 +303,7 @@ pub struct ScopedCoalesceKey {
     pub application: CoalesceKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutboundMessage {
     pub namespace: NamespaceId,
     pub session: SessionId,
@@ -253,6 +315,7 @@ pub struct OutboundMessage {
     pub delivery: DeliveryClass,
     pub persistence: PersistenceClass,
     pub coalesce_key: Option<CoalesceKey>,
+    pub routing_position: Option<EntityPosition>,
     pub payload: Vec<u8>,
 }
 

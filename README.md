@@ -13,10 +13,12 @@ WOVEN is a general-purpose realtime relay, not a product tied to any particular 
 - A versioned, size-prefixed FlatBuffers protocol with verifier-backed bounded decoding, semantic validation, typed control payloads, and checked-in golden fixtures proving byte-for-byte cross-language stability.
 - An Axum HTTP control plane with public `/healthz`, `/readyz`, `/metrics`, and `/v1/capabilities` endpoints.
 - Two interchangeable realtime transports sharing one bounded single-owner Tokio worker and protocol bridge: native QUIC and browser WebTransport, which map unreliable/best-effort traffic to datagrams. Both have real-socket conformance coverage.
-- Uniform 2D/3D spatial routing for replaceable state, with owner-updated local positions, cell indexes, radius filtering, optional exact distance checks, and reliable-event bypass.
+- Uniform 2D/3D spatial routing for replaceable state, with owner-updated local positions, cell indexes, radius filtering, optional exact distance checks, and reliable-event bypass. Managed sessions can add up to 64 bounded 3D spatial subspaces live; positioned `EntityState` updates carry optional finite 3D routing metadata and apply position plus state atomically.
 - A bounded local load runner for broadcast, topic, 2D-grid, and 3D-grid scenarios with measured publish latency, delivery, queue, and machine metadata.
 - An integrated inference plane: a bounded per-request provider queue, a provider-neutral capability/request model, and a deterministic tool-call gateway that lets model output propose state changes without ever mutating state directly.
-- Native Rust and browser TypeScript clients. Both use the generated FlatBuffers bindings and validate cross-language decoding against checked-in golden fixtures.
+- Native Rust and browser TypeScript clients. Both use the generated FlatBuffers bindings, negotiate positioned-state support, expose reliable-stream and unreliable-datagram positioned-state APIs, and validate cross-language decoding against checked-in golden fixtures.
+
+Current product-level status: browser WebTransport/TypeScript client and managed Spatial Subspaces are **Online**; persistence and the optional inference plane remain **Preview**. “Persistence” here does not promise managed restart recovery: managed configuration/revocation history is still in memory, and the durable journal backend remains an integration seam.
 
 See [`docs/status.md`](docs/status.md) and [`docs/adr`](docs/adr) for what's implemented and the architecture decisions behind it.
 
@@ -40,11 +42,13 @@ npm install @signalweave/woven-client
 
 ## Current release versions and publication order
 
-The current release line is `0.3.0` for `woven-core`, `woven-transport`,
+The current release candidates are `0.4.0` for `woven-core`, `woven-transport`,
 `woven-transport-quic`, all four `woven-inference-*` crates, and `woven-server`.
 `woven-protocol`, the native `woven-client`, and `@signalweave/woven-client` are
-`0.2.0`. `woven-loadtest` is also `0.3.0` but remains workspace-only
-(`publish = false`). See the [changelog](CHANGELOG.md) for current release notes.
+`0.3.0`. `woven-loadtest` is also `0.4.0` but remains workspace-only
+(`publish = false`). These are candidate versions, not confirmation of registry publication
+or deployment. The wire protocol remains version 1 (`WVN1`); positioned state and ClientLog
+are additive, capability-gated extensions. See the [changelog](CHANGELOG.md) for release notes.
 
 Publish one artifact per `release/<artifact>/v<version>` tag and wait for each
 crates.io version to become available before packaging or publishing a dependent.
@@ -52,23 +56,24 @@ The complete dependency-first sequential order for the current manifests is:
 
 | Step | Artifact and version | Internal registry prerequisites |
 |---:|---|---|
-| 1 | `woven-core` `0.3.0` | none |
-| 2 | `woven-protocol` `0.2.0` | none |
-| 3 | `woven-client` `0.2.0` | `woven-protocol` |
-| 4 | `npm-woven-client` / `@signalweave/woven-client` `0.2.0` | current WVN1 schema and generated bindings |
-| 5 | `woven-inference-core` `0.3.0` | `woven-core` |
-| 6 | `woven-transport` `0.3.0` | `woven-core`, `woven-protocol` |
-| 7 | `woven-inference-test-provider` `0.3.0` | `woven-core` (dev), `woven-inference-core` |
-| 8 | `woven-inference-tools` `0.3.0` | `woven-core`, `woven-transport`, `woven-inference-core` |
-| 9 | `woven-transport-quic` `0.3.0` | `woven-core`, `woven-protocol`, `woven-transport` |
-| 10 | `woven-inference-coordinator` `0.3.0` | `woven-core`, `woven-protocol`, `woven-transport`, `woven-inference-core`, `woven-inference-tools` |
-| 11 | `woven-server` `0.3.0` | every Rust crate above, including `woven-client` as a dev dependency |
+| 1 | `woven-core` `0.4.0` | none |
+| 2 | `woven-protocol` `0.3.0` | none |
+| 3 | `woven-client` `0.3.0` | `woven-protocol` |
+| 4 | `npm-woven-client` / `@signalweave/woven-client` `0.3.0` | current WVN1 schema and generated bindings |
+| 5 | `woven-inference-core` `0.4.0` | `woven-core` |
+| 6 | `woven-transport` `0.4.0` | `woven-core`, `woven-protocol` |
+| 7 | `woven-inference-test-provider` `0.4.0` | `woven-core` (dev), `woven-inference-core` |
+| 8 | `woven-inference-tools` `0.4.0` | `woven-core`, `woven-transport`, `woven-inference-core` |
+| 9 | `woven-transport-quic` `0.4.0` | `woven-core`, `woven-protocol`, `woven-transport` |
+| 10 | `woven-inference-coordinator` `0.4.0` | `woven-core`, `woven-protocol`, `woven-transport`, `woven-inference-core`, `woven-inference-tools` |
+| 11 | `woven-server` `0.4.0` | every Rust crate above, including `woven-client` as a dev dependency |
 
 Before tagging each Rust artifact, run `cargo package --locked -p <crate> --list`
 after its prerequisites are visible on crates.io. Before tagging the npm artifact,
 run `npm pack --dry-run` from `crates/woven-client-ts`. Workspace tests alone do not
-verify registry dependency compatibility. Several artifact tags may legitimately
-refer to the same commit.
+verify registry dependency compatibility. Prerequisite names in the table refer to the candidate
+versions listed above; path dependencies cannot substitute for registry availability when
+packaging a published crate. Several artifact tags may legitimately refer to the same commit.
 
 ## Local development
 
@@ -159,10 +164,10 @@ Other platforms can build `woven-server` from source with Cargo; prebuilt binari
 
 ### Maintainer release checklist
 
-1. Bump only the package being released and update [`CHANGELOG.md`](CHANGELOG.md).
+1. Version the selected artifact and any required dependency/API-compatible release line; synchronize internal requirements, lockfiles, client Hello versions, and [`CHANGELOG.md`](CHANGELOG.md).
 2. Follow the dependency-first order above and confirm every prerequisite is visible in its registry.
 3. Run the full validation suite plus `cargo package --locked -p <crate> --list` or `npm pack --dry-run` for the selected artifact.
-4. Push `release/<artifact>/vX.Y.Z` (for example, `release/woven-client/v0.2.0`).
+4. Push `release/<artifact>/vX.Y.Z` (for example, `release/woven-client/v0.3.0`) only after publication is explicitly approved.
 5. Monitor the release workflow; only `woven-server` releases create binary assets and a GitHub Release.
 6. Verify the selected registry package, and for server releases, checksums and downloaded binaries.
 
@@ -170,7 +175,7 @@ Cloud deployment and engine distributions are intentionally not part of this pip
 
 ## Development configuration
 
-The development server composition explicitly provisions namespace/session `1`, logical spaces `1` and `2`, reliable and latest-value channels, and the development token `dev-token`. This composition exists solely for local development and test automation; it is not a production authentication or TLS configuration. When the inference plane is enabled, it also provisions one demo AI identity with its own dev token, entity, and status channel; see [`crates/woven-inference-coordinator`](crates/woven-inference-coordinator).
+The development server composition explicitly provisions namespace/session `1`, logical spaces `1` and `2`, bounded Cartesian3D spatial space `3`, channels `1`, `2`, and `4`, and the development token `dev-token`. Spatial space `3` uses the managed defaults (1 meter/unit, 10-unit cells, 25-unit radius, exact distance, and bounds from `(-1000, -100, -1000)` through `(1000, 500, 1000)`) so consumers can test positioned state without inventing spaces. This composition exists solely for local development and test automation; it is not a production authentication or TLS configuration. When the inference plane is enabled, it also provisions one demo AI identity with its own dev token, entity, and status channel; see [`crates/woven-inference-coordinator`](crates/woven-inference-coordinator).
 
 The default binary uses loopback development settings; inference is disabled by default
 and can be enabled through the library's development configuration. Non-loopback development

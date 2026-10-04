@@ -4,7 +4,7 @@
 `woven_server::{ManagedServerConfig, start_managed, serve_managed}` provides the opt-in
 composition described below. Host owns endpoint selection, external server IDs, entitlements,
 and secret distribution.
-Woven receives only explicit scope, capacity, and credentials over a network API.
+Woven receives only explicit scope, capacity, optional publish ceilings, and credentials over a network API.
 No hosted product/tier names or account models enter core.
 
 ## Composition and trust boundary
@@ -52,9 +52,11 @@ Reject unknown fields, zero/overflow IDs, oversized bodies, and invalid tokens.
 | Method and path | Request | Result |
 |---|---|---|
 | `GET /v1/node` | Admin auth | `nodeIncarnation`, transport status, limits and supported fixed channel/space definitions |
-| `PUT /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `{ "revision": "1", "allocatedCCU": 1, "clientToken": "<Host-supplied secret>" }` | `201` created; identical live retry `200` |
+| `GET /v1/logs?after=0&limit=32` | Admin auth and exact current `Woven-Node-Incarnation` on every read | Bounded volatile node/client log feed; contract below |
+| `PUT /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `{ "revision": "1", "allocatedCCU": 1, "clientToken": "<Host-supplied secret>", "tickRateHz": 60 }` (`tickRateHz` optional) | `201` created; identical live retry `200` |
 | `GET /v1/namespaces/{namespaceId}/sessions/{sessionId}` | Admin auth | `200` sanitized configuration and admission snapshot; `404` absent |
-| `PATCH /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `{ "revision": "2", "allocatedCCU": 2 }` | `200` applied configuration/snapshot |
+| `PATCH /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `{ "revision": "2", "allocatedCCU": 2, "tickRateHz": 30 }` (`tickRateHz` optional) | `200` applied configuration/snapshot |
+| `PUT /v1/namespaces/{namespaceId}/sessions/{sessionId}/spaces/{spaceId}` | Strict 3D spatial definition below | `201` added; exact same-revision/same-definition retry `200` |
 | `DELETE /v1/namespaces/{namespaceId}/sessions/{sessionId}` | `If-Match: "2"` (current revision) | `204` revoked and removed; identical delete retry `204` |
 
 All mutations also require `Woven-Node-Incarnation`, matching the authenticated
@@ -67,14 +69,230 @@ node creates a fresh non-secret random incarnation at startup. A stale incarnati
 clients must not automatically replace it and replay a mutation. Host must deliberately reconcile
 after restart.
 
+Managed `GET /metrics` on the private, read-only loopback management listener returns
+`Woven-Node-Incarnation` as a response header: the existing 48-lowercase-hex identity,
+paired with the same run's unchanged Prometheus counter sample. Each new managed node
+start changes the incarnation and resets the in-memory counters. Host can deduplicate
+samples per configured target and incarnation to retain observed lifetime totals;
+Woven does not persist them. Preserve the header through private gateways. This is
+HTTP response metadata only, with no WVN1 wire-protocol or binding change.
+
 Provisioning installs one exact `SessionKey`, mandatory admission, and fixed logical
-broadcast spaces 1/2, epoch 1. Both spaces expose only channel 1,
-ReliableOrdered/Ephemeral with a 64 KiB payload ceiling. Managed mode does not
+broadcast compatibility/system spaces 1/2, epoch 1. Both spaces expose exactly `channelIds: ["1", "4"]`:
+channel 1 is ReliableOrdered/Ephemeral and channel 4 is
+UnreliableSequenced/Ephemeral, each with a 64 KiB payload ceiling. Managed mode does not
 register or advertise a Stateful channel. No client may override policy. Provisioning
 is an atomic worker operation, not a sequence observable between commands. It does
 not authenticate/join a connection. The node never implicitly provisions a requested
 scope. Static remote, development, and other self-hosted compositions retain their
 independent channel definitions and the generic engine retains Stateful support.
+
+Channel 4 carries opaque `EntityState` with a server-assigned owned entity and a
+nonzero payload type/coalescing component. Persistence is resolved from the
+registered channel through the bounded worker, not selected by clients or inferred
+from `EntityState`. Ephemeral updates are not cached or replayed to late joiners.
+QUIC and WebTransport accept client datagrams only for
+`EntityState/UnreliableSequenced`; control and reliable traffic use the stream.
+All outbound paths use datagrams for UnreliableSequenced delivery. The complete encoded
+frame must fit the negotiated datagram budget; unsupported, oversized, or failed
+sends are dropped without stream fallback. Stale/duplicate unreliable sequences
+remain rejected but do not close the connection. Other publish failures retain
+their existing rejection behavior.
+
+Host integrations validating the former one-channel contract must update their
+exact node schema and returned per-space channel IDs before consuming channel 4.
+No change to session PUT/PATCH, capacity, credentials, or admission is required.
+
+### Optional session publish ceiling (`tickRateHz`)
+
+`tickRateHz` is an integer JSON number in **1..120**. Zero, 121, fractions (including `1.0`),
+strings, booleans, and explicit `null` are invalid (`400`,
+`{"error":{"code":"invalid_request"}}`), without changing capacity, revision, credentials, or
+runtime configuration. It is a generic **publish-admission budget per connected session member
+per second**, not a physics/simulation tick scheduler. Woven does not generate domain ticks,
+interpret payloads, or own product-type policy; consumers and Host retain those responsibilities.
+
+- PUT omission creates a session without an additional session ceiling. The existing core
+  per-connection publish limit still applies across all sessions (default 256 publishes/second).
+  PUT identity includes the optional rate: an otherwise identical same-revision PUT with a
+  different rate, or with the configured rate omitted, returns `409 revision_conflict`.
+- PATCH still requires `revision` and `allocatedCCU`. Omitted `tickRateHz` preserves the existing
+  value, including unlimited sessions; PATCH cannot clear a configured ceiling. Identical
+  same-revision retries return `200` without reapplying configuration. Retry identity includes
+  capacity and the requested optional rate, so changing either the rate or its presence at the
+  same revision returns `409 revision_conflict`; stale revisions also return `409`.
+- PUT/GET/PATCH and spatial-PUT snapshots include top-level `"tickRateHz": 60` only when
+  configured. Unlimited snapshots omit the property entirely (never `null`), preserving old
+  request/response shapes. Existing IDs/revisions, `nodeIncarnation`, `allocatedCCU`, `spaces`,
+  and `admission` fields are unchanged. Spatial adds share the revision and preserve the ceiling.
+- All publish channels and spaces in one session consume the **same** member budget, including
+  reliable stream events and unreliable state datagrams. Other connections and sessions have
+  independent budgets; no per-channel allowance multiplies the ceiling. The core connection-wide
+  limiter remains an additional cap. Subscription/control operations do not consume this budget.
+- Enforcement reuses the worker-owned fixed-window limiter: a one-second window starts on the
+  member's first eligible publish, and the next publish at or after its exact end starts a new
+  window. Up to the configured count may be admitted anywhere inside that window; this is not
+  pacing or a sliding-window guarantee. Eligible publish attempts reserve budget before later
+  channel/payload/sequence/authority validation, without refunds, just as the core limiter does.
+  Rate rejects do not mutate sequences, routing positions, cached state, or outbound deliveries.
+- Window starts and counts survive PATCH, identical retries, capacity changes, spatial adds,
+  rate increases/decreases, and **LeaveSession followed by re-admission/rejoin and resubscription
+  on the same connection**. Leaving still releases admission and removes entities, subscriptions,
+  sequences and queued messages; it does not replenish the publish budget. Publishes are tracked
+  even while unlimited, so enabling a ceiling mid-window cannot replenish the budget. Lowering
+  below the consumed count blocks further publishes until the window ends; increasing allows
+  only the remaining difference.
+- Rate state is connection-owned and bounded by `CoreConfig::max_memberships_per_connection`
+  (default **32**). Active memberships and retained detached histories share these slots. Before
+  a join, expired detached histories are lazily pruned; empty histories with no publish window
+  are immediately eligible for pruning. Active budgets and unexpired detached budgets are never
+  evicted to make room. A new session needing another slot fails with the existing
+  `CoreError::MembershipLimitReached`, without joining or leaking an admission lease. Rejoining
+  a retained session is allowed even when the history cap is full, subject to normal membership,
+  authorization and admission rules. Generic multi-session callers may need to wait for an
+  inactive window to expire before visiting another session, even with free membership slots;
+  managed connections are already scoped to one session and reuse their one history slot.
+- If a queued claim obtains a lease but atomic membership binding fails (including the history
+  cap), the worker releases that exact lease without a reconnect reservation and invalidates
+  both its connection-owned cached ticket and controller ticket. The original binding error is
+  returned; subsequent operations on that ticket report `Missing`, not `Admitted`. After a history
+  slot expires, request fresh admission (the same idempotency key may be reused). Successful
+  admitted requests/claims retain their existing idempotency and do not allocate extra leases.
+- A session that has never had a publish ceiling discards its history on leave: unlimited-only
+  session churn retains its old behavior. Once a ceiling has been configured, history survives
+  leave even through later unlimited periods. Managed history expires at its one-second boundary;
+  generic core policies use their configured window. Expiry cleanup cannot shorten an active
+  window or discard a clock-regressed history. Transport loss removes the entire connection and
+  its histories. Managed DELETE closes all authenticated scope connections, including detached
+  ones, reclaiming their histories along with the session.
+- Rejection is the existing `CoreError::PublishRateLimited { retry_after }`, mapped over both
+  managed transports to WVN1 `ProtocolErrorCode::RateLimited` for the rejected publish kind.
+  Existing transport rejection/connection-close behavior is unchanged; no silent retry, delivery,
+  or reliable fallback is added. This admin HTTP addition does **not** change WVN1 or require
+  regenerated protocol/client bindings.
+
+The trusted Rust API adds `tick_rate_hz: Option<u32>` to both `ManagedRequest::Put` and
+`ManagedRequest::Patch`, and `ManagedSnapshot::tick_rate_hz: Option<u32>` (serialized only for
+`Some`). Direct core embeddings can call
+`WovenCore::set_session_publish_rate_limit(session: SessionKey, policy: Option<PublishRateLimit>)
+-> Result<(), CoreError>`; managed HTTP maps Hz to `max_publishes = Hz`, `window = 1s`.
+`WorkerHandle::manage(ManagedRequest)` and `WovenCore::manage_at(ManagedRequest, Instant)` retain
+their signatures and serialize rate/capacity/revision changes with admission and client commands.
+`join_session_at(connection, session, Instant)` and
+`join_session_with_admission_at(connection, session, AdmissionLease, Instant)` add deterministic
+history-expiry seams; existing join methods remain wall-clock wrappers. Managed admission and
+queue claims forward their injected time through the atomic join.
+No credentials, scopes, admission leases, or product/domain logic are changed.
+
+### Best-effort log collection
+
+`GET /v1/logs` belongs only to the bearer-authenticated independent admin listener,
+not the unauthenticated read-only listener. Every request requires one matching
+`Woven-Node-Incarnation` header (`409` for missing/stale/duplicate incarnation).
+Both parameters are required: `after` is a canonical decimal `u64`, including `0`;
+`limit` is canonical decimal 1–32. Unknown, duplicate, percent-encoded, malformed,
+overflow, or noncanonical parameters and nonempty bodies return `400`. Existing
+admin concurrency/rate limits, timeout, and `no-store` apply.
+
+The exact response shape agreed for Host collection is:
+
+```json
+{
+  "nodeIncarnation": "current-incarnation",
+  "entries": [{
+    "sequence": "1",
+    "occurredAtMs": 1800000000000,
+    "namespaceId": "1",
+    "sessionId": "1",
+    "connectionId": "1",
+    "source": "client",
+    "event": "client.log",
+    "level": "info",
+    "message": "example client diagnostic"
+  }],
+  "nextSequence": "1",
+  "droppedThrough": "0"
+}
+```
+
+`source` is `client|node`; `event` is
+`client.log|client.connected|client.disconnected`; `level` is `info|warn|error`.
+IDs and cursors are decimal strings; `occurredAtMs` is numeric server capture time.
+A single-owner worker retains **2,048** entries globally. Sequences are monotonic,
+nonzero and never wrap per incarnation. `droppedThrough` is the highest evicted
+sequence (`"0"` initially). Return entries strictly after `after` in order;
+`nextSequence` is the last entry actually returned, or the supplied `after` when
+empty. The node dynamically reduces the page count to keep **all serialized JSON
+at or below 48 KiB**, including actual JSON escaping, below the Host 65,536-byte
+ceiling. Collection does not consume the ring; continue with `nextSequence` and
+use `droppedThrough` to detect missing history. The authenticated administrator
+can read all node tenants; clients cannot read or relay this feed.
+
+`ClientLog` uses kind 40 and negotiated capability mask `CAPABILITY_CLIENT_LOG = 2`. It requires an actually authenticated,
+joined membership for the asserted session; grants/admission tickets alone are
+insufficient. Messages contain 1–1,024 UTF-8 bytes and Info/Warn/Error. Capture is
+limited to 10 per connection and 1,024 aggregate per rolling second. Node entries
+record only first successful membership (including immediate admission and queue
+claim), and membership loss through leave, transport loss, revoke or slow-consumer
+cleanup. Failed/queued admission, retries, and publish/update traffic add no node
+entries. IDs/scope/time are server-attached; node text is fixed, with no credential,
+application payload, or client-provided leave-reason tracing.
+
+No database/cloud/disk work occurs in Woven. This buffer is best-effort pending Host
+collection, not durable persistence or a persistence acknowledgement; eviction,
+shutdown and restart can lose logs. Reconcile a new incarnation deliberately.
+Bridge-level log rejections are nonfatal `ProtocolError`s. At present the transport
+adapters close on protocol decode failures, including oversized wire `ClientLog`
+messages rejected before the bridge; nonfatal handling of that case remains an
+adapter read-loop follow-up.
+
+### Add-only managed spatial subspaces
+
+A live managed session accepts up to **64 additional** spatial spaces beyond system spaces 1/2,
+for **66 total managed spaces**. The path `spaceId` is a canonical nonzero decimal string and must
+not be 1 or 2. The request is strict JSON (unknown or omitted fields reject):
+
+```json
+{
+  "revision": "2",
+  "metersPerUnit": 1.0,
+  "cellSize": 10.0,
+  "interestRadius": 15.0,
+  "exactDistance": true,
+  "bounds": {
+    "min": { "x": -1000.0, "y": -1000.0, "z": -1000.0 },
+    "max": { "x": 1000.0, "y": 1000.0, "z": 1000.0 }
+  }
+}
+```
+
+`revision` is the next session-wide revision. `metersPerUnit`, `cellSize`, and
+`interestRadius` must be finite and greater than zero. Every bound coordinate must be finite and
+must satisfy `min.x < max.x`, `min.y < max.y`, and `min.z < max.z`. Runtime position validation is
+an **inclusive** AABB: coordinates exactly equal to either min or max are valid. The values above
+are examples/reasonable UI defaults, not server-side omission defaults; clients must send every
+field explicitly.
+
+The server fixes `CoordinateFrame::Cartesian3D`, `RoutingPolicy::SpatialGrid3D`, no parent,
+epoch **1**, and channel IDs **1 and 4**. A caller cannot request 2D, another epoch, nesting, or
+channel policy. The add and all grant updates happen in one owning-worker turn. Already
+authenticated connections for the session gain exact read/write space and channel grants, and
+future connections receive the same exact grants. There is no wildcard space grant: subscriptions
+and publishes to unknown/ad-hoc space IDs remain unauthorized.
+
+Spaces are add-only for the node incarnation: there is no space PATCH or DELETE route, and an
+existing `spaceId` cannot be redefined. An exact same-revision/same-definition retry returns `200`;
+the same revision with a different definition, a lower revision, or any attempted mutation returns
+`409 revision_conflict`. Adding the 65th spatial space returns
+`409 space_capacity_exhausted`. Session PATCH, space PUT, and session DELETE all share one revision
+sequence; callers must serialize changes and reconcile from the sanitized session response.
+
+Successful session GET/PUT/PATCH and space PUT responses expose `spaces`. Every definition includes
+`spaceId`, fixed `epoch`, and fixed `channelIds`; spatial definitions additionally include
+`metersPerUnit`, `bounds`, `cellSize`, `interestRadius`, and `exactDistance` as flat fields.
+`GET /v1/node` advertises `capabilities.positionedEntityState`,
+`capabilities.managedSpatialSubspaces`, `limits.maxAdditionalManagedSpatialSpaces = 64`, and
+`limits.maxManagedSpaces = 66`; its top-level spaces remain the fixed system definitions 1/2.
 
 Successful GET/PUT/PATCH responses contain `nodeIncarnation`, `namespaceId`,
 `sessionId`, `revision`, requested `allocatedCCU`, and `admission` with
@@ -90,8 +308,9 @@ the admin credential, and never returns/echoes the client token. Host already ow
 it, so lost responses do not require storing plaintext or issuing another token.
 Token validation proves possession, not an individual user's identity.
 
-PUT is create-only: the same live revision, capacity, and token verifier is an
-idempotent retry; any difference returns `409`. PATCH requires a higher revision;
+Session PUT is create-only: the same live revision, capacity, and token verifier is an
+idempotent retry; any difference returns `409`. Space PUT follows the add-only idempotency rules
+above and advances the same session revision. PATCH requires a higher revision;
 an identical current-revision retry succeeds, conflicting/stale revisions return
 `409`. PATCH cannot rotate credentials or change scope. DELETE requires the current
 revision and records a tombstone with the deleted verifier and revision. That scope
@@ -103,7 +322,7 @@ restart; this in-memory slice does not promise durable token-reuse prevention.
 
 Errors use `{ "error": { "code": "..." } }`, with no secrets or caller input:
 `400 invalid_request`, `401 unauthorized`, `404 scope_not_found`,
-`409 revision_conflict|incarnation_conflict|scope_retired|token_conflict`,
+`409 revision_conflict|incarnation_conflict|scope_retired|token_conflict|space_capacity_exhausted`,
 `413 request_too_large`, `429 rate_limited`, `503 capacity_exhausted|worker_unavailable`.
 Responses use `Cache-Control: no-store`. No HTTP admission routes are exposed.
 
@@ -173,6 +392,8 @@ partially removed state. Old authenticated connections cannot survive reprovisio
 
 Fixed defaults for this local slice, validated against node hard limits:
 
+- At most 64 add-only managed 3D spatial subspaces per scope, in addition to fixed logical spaces
+  1/2 (66 total). Definitions and exact grants are bounded and in memory for the node incarnation.
 - At most 1,024 live scopes and 4,096 total live/retired scope verifiers per incarnation;
   creation reserves a history slot so DELETE cannot fail for lack of tombstone space;
   per-scope allocation at most the node's 4,096 connection ceiling. Admission
@@ -214,7 +435,14 @@ sessions do not acquire this new limit.
 
 The runtime tests in `woven-core/tests/managed.rs` and `woven-server/tests/managed.rs` cover HTTP
 response fields, credential isolation, worker queue/claim, verified QUIC teardown,
-revision/history exhaustion, configuration, request deadlines and bounds.
+revision/history exhaustion, configuration, request deadlines and bounds, add-only spatial
+capacity/idempotency, live/future exact grants, positioned datagram traffic, inclusive bounds, and
+the cross-cell-boundary routing regression. `woven-core/tests/session_publish_rate.rs` adds
+injected-time boundary, cross-channel/space aggregation, connection/session isolation, preserved
+windows, global-limit, and membership cleanup checks. Managed runtime/HTTP tests cover optional
+rate snapshots, malformed Hz, atomic validation, retries/stale revisions and legacy omission;
+real managed QUIC and WebTransport tests verify a reliable event consumes the same budget as a
+subsequent channel-4 datagram, which receives the existing rate error.
 `woven-server/tests/managed_quic.rs` additionally exercises the real TLS-verified WVN1
 bridge/native client: Bearer enforcement and Development rejection, the Ephemeral-only channel
 policy, distinct principals, correlated rate errors, CCU-one queue/heartbeat/claim, duplicate
@@ -240,14 +468,16 @@ traffic, Host-provided WebTransport descriptors, production Firebase/App Check, 
 Weaver integration, persistence/restarts, or multi-node behavior.
 
 Rust bindings are generated at build time; checked-in TypeScript bindings and codec support
-include all seven controls. The TypeScript WebTransport client implements `requestAdmission`,
-all four queue operations, and bounded `admitWithCancellation` with fail-closed timeout,
-cancellation, and reply validation. Its tests use an in-memory WHATWG WebTransport mock and
-Rust/TypeScript wire-compatibility fixtures. They do **not** establish a browser or Node
-WebTransport connection to the managed server. Managed WebTransport is a separate explicitly
-configured endpoint; do not infer it from a managed native QUIC URL. Regenerate bindings and
-golden fixtures after schema changes. The local Host E2E above remains native QUIC only; Weaver
-integration and external remote deployment remain untested.
+include all seven controls plus additive positioned-state metadata. The TypeScript WebTransport
+client implements `requestAdmission`, all four queue operations, bounded `admitWithCancellation`,
+and reliable/unreliable positioned-state APIs with fail-closed capability checks. Tests include an
+in-memory WHATWG WebTransport mock, Rust/TypeScript wire-compatibility fixtures, and a bounded
+headless-Chromium connection to a disposable managed server. Browser WebTransport/TypeScript is
+therefore **Online** for this bounded protocol surface. Managed WebTransport is a separate
+explicitly configured endpoint; do not infer it from a managed native QUIC URL. Regenerate
+bindings and golden fixtures after schema changes. The local Host E2E above remains native QUIC
+only; Host-provided browser descriptors, Weaver integration, and external remote deployment remain
+untested.
 
 Local validation coverage spans the following boundaries (core/worker tests for
 expiry and bounds, real loopback QUIC tests for the network path):
@@ -274,7 +504,7 @@ expiry and bounds, real loopback QUIC tests for the network path):
    the read-only listener, and reports enabled state plus the live leaf SHA-256 fingerprint—but no
    endpoint URL—through authenticated `/v1/node`.
 
-No cloud actions, production secrets, deployments, persistence, failover, external managed
-WebTransport deployment, real-browser/TypeScript network E2E, or production per-user identity are
-part of this Woven slice. Host implementation remains in the sibling repository; Weaver
+No cloud actions, production secrets, deployments, durable managed persistence, failover,
+external managed WebTransport deployment, Host-provided browser descriptor E2E, or production
+per-user identity are part of this Woven slice. Host implementation remains in the sibling repository; Weaver
 integration remains separate.

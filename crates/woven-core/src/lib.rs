@@ -28,7 +28,9 @@ pub use authority::{
 };
 pub use cache::{CacheEntry, CacheError, CacheKey, CacheService, InMemoryCacheService};
 pub use core::managed::{
-    ManagedAdmissionSnapshot, ManagedError, ManagedOutcome, ManagedRequest, ManagedSnapshot,
+    MAX_MANAGED_SPACES, MAX_MANAGED_SPATIAL_SPACES, ManagedAdmissionSnapshot, ManagedBounds3D,
+    ManagedError, ManagedOutcome, ManagedPoint3D, ManagedRequest, ManagedSnapshot,
+    ManagedSpaceSnapshot,
 };
 pub use core::{
     CleanupSummary, CoreConfig, CoreError, EntityTransition, EntityTransitionRequest, IdKind,
@@ -44,7 +46,8 @@ pub use journal::{
 pub use model::{
     CoalesceKey, CoordinateFrame, DeliveryClass, EntityPosition, EntitySnapshot, OutboundMessage,
     ParentAnchor, PersistenceClass, PositionValidationError, RoutingPolicy, ScopedCoalesceKey,
-    SessionSnapshot, SpaceDescriptor, SpaceSnapshot, SpaceValidationError, StateSnapshot,
+    SessionSnapshot, SpaceDescriptor, SpaceSnapshot, SpaceValidationError, SpatialBounds3D,
+    StateSnapshot,
 };
 pub use queue::{
     OutboundQueue, OutboundQueueConfig, QueueConfigError, QueueError, QueueEviction, QueuePush,

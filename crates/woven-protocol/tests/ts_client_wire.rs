@@ -36,6 +36,52 @@ const TS_QUEUE_CLAIM: &str = "6c0000003000000057564e3100000000000022002a00000029
 const TS_QUEUE_CANCEL: &str = "6c0000003000000057564e3100000000000022002a000000290028001c001400000000000000000000000c00000000000b000400220000002c000000000000230d000000000000000c000000000000000b0000000000000000000000012606000c000400060000000e00000000000000";
 
 #[test]
+fn ts_client_log_decodes() {
+    // encodeClientLog({namespaceId:11n, sessionId:22n}, LogLevel.Warn, "🧶 session warning")
+    let envelope = decode_hex("840000003000000057564e310000000000002200240000002300220014000c00000000000000000000000000000000000b00040022000000280000000000002516000000000000000b00000000000000000000000000012808000c000b00040008000000080000000000000214000000f09fa7b62073657373696f6e207761726e696e6700000000").unwrap();
+    assert_eq!(envelope.namespace_id, 11);
+    assert_eq!(envelope.session_id, 22);
+    assert_eq!(envelope.space_id, 0);
+    assert_eq!(envelope.channel_id, None);
+    assert_eq!(envelope.entity_id, None);
+    assert_eq!(envelope.space_epoch, 0);
+    assert_eq!(
+        envelope.message,
+        MessagePayload::Control(woven_protocol::ControlPayload::ClientLog(
+            woven_protocol::ClientLog {
+                level: woven_protocol::LogLevel::Warn,
+                message: "🧶 session warning".to_owned(),
+            }
+        ))
+    );
+}
+
+#[test]
+fn ts_unreliable_entity_state_with_initial_zero_sequence_decodes() {
+    // encodeUnreliableEntityState with namespace/session/space/epoch 1/2/3/1,
+    // channel/entity/type 4/5/6, senderSequence 0n, and bytes [10, 20, 30].
+    let envelope = decode_hex("840000003000000057564e310000000024004c0000004b004a003c0034002c0024001c0000000000000014001000000000000400240000000400000000000000000000003c000000060000000000000001000000000000000500000000000000030000000000000002000000000000000100000000000000000000000000040d030000000a141e00").unwrap();
+    assert_eq!(
+        envelope.delivery_class,
+        woven_protocol::DeliveryClass::UnreliableSequenced
+    );
+    assert_eq!(envelope.namespace_id, 1);
+    assert_eq!(envelope.session_id, 2);
+    assert_eq!(envelope.space_id, 3);
+    assert_eq!(envelope.space_epoch, 1);
+    assert_eq!(envelope.channel_id, Some(4));
+    assert_eq!(envelope.entity_id, Some(5));
+    assert_eq!(envelope.sender_sequence, 0);
+    assert_eq!(
+        envelope.message,
+        MessagePayload::EntityState(woven_protocol::OpaquePayload {
+            type_id: 6,
+            bytes: vec![10, 20, 30],
+        })
+    );
+}
+
+#[test]
 fn ts_hello_decodes() {
     let envelope = decode_hex(TS_HELLO).expect("TS Hello must decode");
     let MessagePayload::Control(woven_protocol::ControlPayload::Hello(hello)) = envelope.message

@@ -60,7 +60,7 @@ impl WirePeer {
                 max_protocol_version: 1,
                 client_name: "managed-wire-test".into(),
                 client_version: "1".into(),
-                capability_bits: 0,
+                capability_bits: woven_protocol::CAPABILITY_CLIENT_LOG,
                 max_frame_size: 65536,
                 max_payload_size: 65536,
             }),
@@ -179,6 +179,274 @@ async fn managed_quic_rejects_development_authentication_scheme() {
     })
     .await
     .expect("bounded managed QUIC scheme rejection");
+}
+
+#[tokio::test]
+async fn socket_log_scope_and_rate_rejections_leave_the_authenticated_connection_healthy() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "c".repeat(64);
+        provision(&server, 1, 1, &token).await;
+        let mut peer = WirePeer::connect(&fixture, &server).await;
+        peer.authenticate(&token).await;
+        let control = ControlPayload::ClientLog(woven_protocol::ClientLog {
+            level: woven_protocol::LogLevel::Info,
+            message: "scoped wire diagnostic".into(),
+        });
+        peer.send(scoped(control.clone(), 1)).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::InvalidScope && error.related_message_kind == MessageKind::ClientLog));
+        peer.send(scoped(ControlPayload::RequestAdmission(RequestAdmission { idempotency_key: "wire-logs".into() }), 2)).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+        let mut foreign = scoped(control.clone(), 3);
+        foreign.namespace_id = 2;
+        peer.send(foreign).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::InvalidScope));
+        for correlation in 4..=14 {
+            peer.send(scoped(control.clone(), correlation)).await;
+        }
+        let error = peer.recv().await;
+        assert_eq!(error.correlation_id, Some(14));
+        assert!(matches!(error.message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::RateLimited && error.related_message_kind == MessageKind::ClientLog));
+        peer.send(scoped(ControlPayload::RequestAdmission(RequestAdmission { idempotency_key: "wire-logs".into() }), 15)).await;
+        let reply = peer.recv().await;
+        assert_eq!(reply.correlation_id, Some(15));
+        assert!(matches!(reply.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+        let (status, feed) = http(server.admin_address, "GET", "/v1/logs?after=0&limit=32", &headers(&server), "").await;
+        assert_eq!(status, 200);
+        let entries = feed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 11);
+        assert_eq!(entries.iter().filter(|entry| entry["event"] == "client.connected").count(), 1);
+        assert!(entries.iter().all(|entry| entry["namespaceId"] == "1"));
+    }).await.expect("bounded socket log rejection check");
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded socket lifecycle verifies admission and disconnect deduplication"
+)]
+async fn native_client_logs_capture_admission_claim_leave_revoke_and_transport_loss() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "a".repeat(64);
+        provision(&server, 1, 1, &token).await;
+        let mut first = fixture.client(&server, &token).await.unwrap();
+        let mut waiting = fixture.client(&server, &token).await.unwrap();
+        assert_eq!(
+            first
+                .request_admission(1, 1, 1, "logs-first".into())
+                .await
+                .unwrap()
+                .status,
+            AdmissionStatus::Admitted
+        );
+        assert_eq!(
+            first
+                .request_admission(1, 1, 2, "logs-first".into())
+                .await
+                .unwrap()
+                .status,
+            AdmissionStatus::Admitted
+        );
+        let ticket = waiting
+            .request_admission(1, 1, 1, "logs-waiting".into())
+            .await
+            .unwrap();
+        assert_eq!(ticket.status, AdmissionStatus::Queued);
+        assert!(waiting.log("not admitted").await.is_err());
+        first.log("info from native API").await.unwrap();
+        first
+            .logger()
+            .warn("warning from native API")
+            .await
+            .unwrap();
+        first.logger().error("error from native API").await.unwrap();
+        // A successful send carries no persistence ACK and produces no peer traffic.
+        assert!(
+            waiting
+                .recv_timeout(Duration::from_millis(100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (status, feed) = http(
+            server.admin_address,
+            "GET",
+            "/v1/logs?after=0&limit=32",
+            &headers(&server),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let entries = feed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0]["event"], "client.connected");
+        assert_eq!(entries[1]["level"], "info");
+        assert_eq!(entries[2]["level"], "warn");
+        assert_eq!(entries[3]["level"], "error");
+        assert_eq!(feed["droppedThrough"], "0");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["namespaceId"] == "1" && entry["sessionId"] == "1")
+        );
+        let first_id = entries[0]["connectionId"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        first
+            .leave_session("client-provided reason is not captured")
+            .await
+            .unwrap();
+        pace().await;
+        let ticket = ticket.ticket_id.unwrap();
+        assert_eq!(
+            waiting.queue_status(1, 1, 2, ticket).await.unwrap().state,
+            QueueState::Offered
+        );
+        assert_eq!(
+            waiting.queue_claim(1, 1, 3, ticket).await.unwrap().state,
+            QueueState::Admitted
+        );
+        assert_eq!(
+            waiting.queue_claim(1, 1, 4, ticket).await.unwrap().state,
+            QueueState::Admitted
+        );
+        waiting.logger().warn("queue claim logger").await.unwrap();
+        assert!(
+            waiting
+                .recv_timeout(Duration::from_millis(100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (status, _) = http(
+            server.admin_address,
+            "DELETE",
+            &path(1, 1),
+            &format!("{}If-Match: \"1\"\r\n", headers(&server)),
+            "",
+        )
+        .await;
+        assert_eq!(status, 204);
+        server
+            .worker
+            .discard_and_disconnect(woven_core::ConnectionId::new(first_id))
+            .await;
+        first.close().unwrap();
+        waiting.close().unwrap();
+
+        // A separate authenticated tenant proves that feed metadata is server-attached.
+        let other_token = "b".repeat(64);
+        provision(&server, 2, 7, &other_token).await;
+        let mut other = fixture.client(&server, &other_token).await.unwrap();
+        assert_eq!(
+            other
+                .request_admission(2, 7, 1, "other-logs".into())
+                .await
+                .unwrap()
+                .status,
+            AdmissionStatus::Admitted
+        );
+        other.log("other tenant").await.unwrap();
+        // Sending is not a capture ACK; verify collection before deliberately closing the socket.
+        let mut collected = false;
+        for _ in 0..10 {
+            let (status, page) = http(
+                server.admin_address,
+                "GET",
+                "/v1/logs?after=0&limit=32",
+                &headers(&server),
+                "",
+            )
+            .await;
+            assert_eq!(status, 200);
+            if page["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["message"] == "other tenant")
+            {
+                collected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            collected,
+            "native client log reaches the local capture feed"
+        );
+        other
+            .close_gracefully(Duration::from_secs(2))
+            .await
+            .unwrap();
+        pace().await;
+        let (status, feed) = http(
+            server.admin_address,
+            "GET",
+            "/v1/logs?after=0&limit=32",
+            &headers(&server),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(feed["nodeIncarnation"], server.node_incarnation);
+        let entries = feed["entries"].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["event"] == "client.connected")
+                .count(),
+            3
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["event"] == "client.disconnected")
+                .count(),
+            3
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["event"] == "client.log")
+                .count(),
+            5
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["message"] == "managed session revoked")
+                .count(),
+            1
+        );
+        let tenant: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["namespaceId"] == "2")
+            .collect();
+        assert_eq!(tenant.len(), 3);
+        assert!(tenant.iter().all(|entry| entry["sessionId"] == "7"));
+        let text = feed.to_string();
+        assert!(!text.contains(&token) && !text.contains(&other_token) && !text.contains(ADMIN));
+        assert!(!text.contains("client-provided reason"));
+        let after = feed["nextSequence"].as_str().unwrap();
+        let (status, empty) = http(
+            server.admin_address,
+            "GET",
+            &format!("/v1/logs?after={after}&limit=32"),
+            &headers(&server),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(empty["entries"], json!([]));
+        assert_eq!(empty["nextSequence"], after);
+    })
+    .await
+    .expect("bounded native client log lifecycle test");
 }
 
 const ADMIN: &str = "managed-wire-test-admin-not-a-client-credential";
@@ -322,7 +590,122 @@ async fn subscribed(client: &mut Client, namespace: u64, session: u64) -> u64 {
 }
 
 #[tokio::test]
-async fn lite_managed_runtime_exposes_only_ephemeral_channel_one() {
+async fn managed_channel_four_datagrams_are_ephemeral_and_channel_three_stays_denied() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "f".repeat(64);
+        provision(&server, 1, 1, &token).await;
+        let mut peer = WirePeer::connect(&fixture, &server).await;
+        let principal = peer.authenticate(&token).await;
+        peer.send(scoped(ControlPayload::RequestAdmission(RequestAdmission { idempotency_key: "unreliable".into() }), 1)).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+        let mut envelope = scoped(ControlPayload::SubscribeSpace(woven_protocol::SubscribeSpace), 2);
+        envelope.space_id = 1;
+        envelope.space_epoch = 1;
+        envelope.channel_id = Some(1);
+        peer.send(envelope.clone()).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::SubscriptionAccepted(_))));
+        let entered = peer.recv().await;
+        assert!(matches!(entered.message, MessagePayload::Control(ControlPayload::EntityEntered(_))));
+        envelope.entity_id = entered.entity_id;
+        envelope.channel_id = Some(4);
+        envelope.delivery_class = DeliveryClass::UnreliableSequenced;
+        envelope.sender_sequence = 1;
+        envelope.correlation_id = None;
+        envelope.message = MessagePayload::EntityState(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7; 25] });
+        let codec = Codec::default();
+        peer.connection.send_datagram(codec.encode(&envelope).unwrap().into()).unwrap();
+        let datagram = tokio::time::timeout(Duration::from_secs(3), peer.connection.read_datagram()).await.unwrap().unwrap();
+        assert_eq!(codec.decode(&datagram).unwrap(), envelope);
+        let session = woven_core::SessionKey::new(woven_core::NamespaceId::new(1), woven_core::SessionId::new(1));
+        let woven_core::CommandResult::Snapshot(snapshot) = server.worker.execute(woven_core::Command::Snapshot { connection: woven_core::ConnectionId::new(principal), session }).await.unwrap() else { panic!("expected snapshot") };
+        assert!(snapshot.state.is_empty());
+        assert_eq!(snapshot.state_bytes, 0);
+        envelope.channel_id = Some(3);
+        peer.connection.send_datagram(codec.encode(&envelope).unwrap().into()).unwrap();
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::Unauthorized));
+    }).await.expect("bounded managed datagram check");
+}
+
+#[tokio::test]
+async fn managed_quic_publish_ceiling_is_shared_by_stream_and_datagram_channels() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "f".repeat(64);
+        let body = json!({"revision":"1", "allocatedCCU":1, "clientToken":token, "tickRateHz":1}).to_string();
+        assert_eq!(http(server.admin_address, "PUT", &path(1, 1), &headers(&server), &body).await.0, 201);
+        let mut peer = WirePeer::connect(&fixture, &server).await;
+        peer.authenticate(&token).await;
+        peer.send(scoped(ControlPayload::RequestAdmission(RequestAdmission { idempotency_key: "publish-rate".into() }), 1)).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+        let mut envelope = scoped(ControlPayload::SubscribeSpace(woven_protocol::SubscribeSpace), 2);
+        envelope.space_id = 1;
+        envelope.space_epoch = 1;
+        envelope.channel_id = Some(1);
+        peer.send(envelope.clone()).await;
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::SubscriptionAccepted(_))));
+        let entered = peer.recv().await;
+        envelope.entity_id = entered.entity_id;
+        envelope.correlation_id = None;
+        envelope.sender_sequence = 1;
+        envelope.message = MessagePayload::ReliableEvent(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7] });
+        peer.send(envelope.clone()).await;
+        assert_eq!(peer.recv().await, envelope);
+        envelope.message = MessagePayload::EntityState(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7] });
+        envelope.channel_id = Some(4);
+        envelope.delivery_class = DeliveryClass::UnreliableSequenced;
+        peer.connection.send_datagram(Codec::default().encode(&envelope).unwrap().into()).unwrap();
+        assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::RateLimited && error.related_message_kind == MessageKind::EntityState));
+    }).await.expect("bounded managed QUIC publish ceiling");
+}
+
+#[tokio::test]
+async fn managed_quic_leave_readmit_and_resubscribe_cannot_reset_publish_budget() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "f".repeat(64);
+        let body = json!({"revision":"1", "allocatedCCU":1, "clientToken":token, "tickRateHz":1}).to_string();
+        assert_eq!(http(server.admin_address, "PUT", &path(1, 1), &headers(&server), &body).await.0, 201);
+        let mut peer = WirePeer::connect(&fixture, &server).await;
+        peer.authenticate(&token).await;
+        let started = std::time::Instant::now();
+        let mut first_entity = None;
+        for attempt in 0..2 {
+            if attempt == 1 {
+                peer.send(scoped(ControlPayload::LeaveSession(woven_protocol::LeaveSession { reason: "rate regression".into() }), 10)).await;
+            }
+            peer.send(scoped(ControlPayload::RequestAdmission(RequestAdmission { idempotency_key: format!("rate-rejoin-{attempt}") }), attempt + 1)).await;
+            assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+            let mut envelope = scoped(ControlPayload::SubscribeSpace(woven_protocol::SubscribeSpace), attempt + 3);
+            envelope.space_id = 1;
+            envelope.space_epoch = 1;
+            envelope.channel_id = Some(1);
+            peer.send(envelope.clone()).await;
+            assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::SubscriptionAccepted(_))));
+            let entered = peer.recv().await;
+            assert!(matches!(entered.message, MessagePayload::Control(ControlPayload::EntityEntered(_))));
+            envelope.entity_id = entered.entity_id;
+            envelope.correlation_id = None;
+            envelope.sender_sequence = 1;
+            envelope.message = MessagePayload::ReliableEvent(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7] });
+            peer.send(envelope.clone()).await;
+            if attempt == 0 {
+                first_entity = entered.entity_id;
+                assert_eq!(peer.recv().await, envelope);
+            } else {
+                assert_ne!(first_entity, entered.entity_id);
+                assert!(matches!(peer.recv().await.message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::RateLimited && error.related_message_kind == MessageKind::ReliableEvent));
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "regression must exercise one live publish window");
+    }).await.expect("bounded managed QUIC leave/readmission rate regression");
+}
+
+#[tokio::test]
+async fn lite_managed_runtime_exposes_only_ephemeral_channels_one_and_four() {
     tokio::time::timeout(LIMIT, async {
         let fixture = Fixture::new();
         let server = fixture.server().await;
@@ -345,14 +728,15 @@ async fn lite_managed_runtime_exposes_only_ephemeral_channel_one() {
         assert_eq!(
             node["spaces"],
             json!([
-                {"spaceId": "1", "epoch": "1", "channelIds": ["1"]},
-                {"spaceId": "2", "epoch": "1", "channelIds": ["1"]}
+                {"spaceId": "1", "epoch": "1", "channelIds": ["1", "4"], "system": true},
+                {"spaceId": "2", "epoch": "1", "channelIds": ["1", "4"], "system": true}
             ])
         );
         assert_eq!(
             node["channels"],
             json!([
-                {"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536}
+                {"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536},
+                {"channelId": "4", "delivery": "UnreliableSequenced", "persistence": "Ephemeral", "maxPayloadBytes": 65536}
             ])
         );
 

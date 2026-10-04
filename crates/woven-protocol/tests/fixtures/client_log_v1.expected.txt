@@ -1,0 +1,5 @@
+message_kind=ClientLog
+namespace_id=11
+session_id=22
+level=Warn
+message=🧶 session warning

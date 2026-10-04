@@ -21,6 +21,47 @@ interface EnvelopeOptions {
   channelId?: bigint;
 }
 
+export function createEnvelope(
+  builder: flatbuffers.Builder,
+  protocolVersion: number,
+  kind: MessageKind,
+  delivery: DeliveryClass,
+  namespaceId: bigint,
+  sessionId: bigint,
+  spaceId: bigint,
+  entityId: bigint,
+  spaceEpoch: bigint,
+  serverTick: bigint,
+  senderSequence: bigint,
+  correlationId: bigint,
+  payloadTypeId: bigint,
+  payload: number,
+  controlType: ControlPayload,
+  control: number,
+  channelId: bigint,
+  routingPosition = 0,
+): number {
+  FbEnvelope.startEnvelope(builder);
+  FbEnvelope.addProtocolVersion(builder, protocolVersion);
+  FbEnvelope.addMessageKind(builder, kind);
+  FbEnvelope.addDeliveryClass(builder, delivery);
+  FbEnvelope.addNamespaceId(builder, namespaceId);
+  FbEnvelope.addSessionId(builder, sessionId);
+  FbEnvelope.addSpaceId(builder, spaceId);
+  FbEnvelope.addEntityId(builder, entityId);
+  FbEnvelope.addSpaceEpoch(builder, spaceEpoch);
+  FbEnvelope.addServerTick(builder, serverTick);
+  FbEnvelope.addSenderSequence(builder, senderSequence);
+  FbEnvelope.addCorrelationId(builder, correlationId);
+  FbEnvelope.addPayloadTypeId(builder, payloadTypeId);
+  FbEnvelope.addPayload(builder, payload);
+  FbEnvelope.addControlType(builder, controlType);
+  FbEnvelope.addControl(builder, control);
+  FbEnvelope.addChannelId(builder, channelId);
+  FbEnvelope.addRoutingPosition(builder, routingPosition);
+  return FbEnvelope.endEnvelope(builder);
+}
+
 function finishControl(
   builder: flatbuffers.Builder,
   kind: MessageKind,
@@ -28,7 +69,7 @@ function finishControl(
   control: flatbuffers.Offset,
   options: EnvelopeOptions = {},
 ): Uint8Array {
-  const root = FbEnvelope.createEnvelope(
+  const root = createEnvelope(
     builder,
     options.protocolVersion ?? 1,
     kind,
@@ -56,6 +97,7 @@ export function buildCapabilities(options: {
   selectedProtocolVersion?: number;
   maxFrameSize?: number;
   maxPayloadSize?: number;
+  capabilityBits?: bigint;
   controlType?: ControlPayload;
 } = {}): Uint8Array {
   const builder = new flatbuffers.Builder(256);
@@ -66,9 +108,9 @@ export function buildCapabilities(options: {
     options.selectedProtocolVersion ?? 1,
     serverName,
     serverVersion,
-    0n,
+    options.capabilityBits ?? 0n,
     options.maxFrameSize ?? 1_048_576,
-    options.maxPayloadSize ?? 262_144,
+    options.maxPayloadSize ?? 65_536,
   );
   return finishControl(
     builder,

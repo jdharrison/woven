@@ -438,6 +438,7 @@ fn reply_envelope(source: &Envelope, ai_entity: EntityId, payload: ControlPayloa
         server_tick: 0,
         sender_sequence: 0,
         correlation_id: source.correlation_id,
+        routing_position: None,
         message: MessagePayload::Control(payload),
     }
 }

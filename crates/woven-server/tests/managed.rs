@@ -12,7 +12,7 @@ use woven_core::{
     Command, CommandResult, ConnectionId, IdempotencyKey, JoinDecision, NamespaceId,
     QueueOperation, QueueStatus, SessionId, SessionKey,
 };
-use woven_protocol::AuthenticationScheme;
+use woven_protocol::{AuthenticationScheme, MessageKind, RoutingPosition3D};
 use woven_server::{ManagedServer, ManagedServerConfig, start_managed};
 
 const ADMIN: &str = "test-independent-admin-credential-0123456789";
@@ -111,6 +111,21 @@ fn scope() -> SessionKey {
     SessionKey::new(NamespaceId::new(1), SessionId::new(1))
 }
 
+fn spatial_body(revision: u64, cell_size: f64) -> String {
+    json!({
+        "revision": revision.to_string(),
+        "metersPerUnit": 1.0,
+        "cellSize": cell_size,
+        "interestRadius": 15.0,
+        "exactDistance": true,
+        "bounds": {
+            "min": {"x": -1000.0, "y": -1000.0, "z": -1000.0},
+            "max": {"x": 1000.0, "y": 1000.0, "z": 1000.0}
+        }
+    })
+    .to_string()
+}
+
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -150,19 +165,29 @@ async fn host_contract_and_quic_scope_revocation() {
         assert!(node["transports"]["webTransport"]
             .get("certificateSha256")
             .is_none());
+        assert_eq!(node["capabilities"], json!({
+            "positionedEntityState": true,
+            "managedSpatialSubspaces": true
+        }));
+        assert_eq!(node["limits"]["maxAdditionalManagedSpatialSpaces"], 64);
+        assert_eq!(node["limits"]["maxManagedSpaces"], 66);
         assert_eq!(node["spaces"], json!([
-            {"spaceId": "1", "epoch": "1", "channelIds": ["1"]},
-            {"spaceId": "2", "epoch": "1", "channelIds": ["1"]}
+            {"spaceId": "1", "epoch": "1", "channelIds": ["1", "4"], "system": true},
+            {"spaceId": "2", "epoch": "1", "channelIds": ["1", "4"], "system": true}
         ]));
         assert_eq!(node["channels"], json!([
-            {"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536}
+            {"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536},
+            {"channelId": "4", "delivery": "UnreliableSequenced", "persistence": "Ephemeral", "maxPayloadBytes": 65536}
         ]));
         assert_eq!(http(server.admin_address, "GET", path, &headers(&server), "").await.0, 404);
         assert_eq!(http(server.management_address, "PUT", path, &headers(&server), &put(&a)).await.0, 404);
         assert_eq!(http(server.admin_address, "PUT", path, &format!("Authorization: Bearer {ADMIN}\r\nContent-Type: application/json\r\nWoven-Node-Incarnation: stale\r\n"), &put(&a)).await.0, 409);
         let (status, value) = http(server.admin_address, "PUT", path, &headers(&server), &put(&a)).await;
         assert_eq!(status, 201);
-        assert_eq!(value, json!({"nodeIncarnation": server.node_incarnation, "namespaceId":"1", "sessionId":"1", "revision":"1", "allocatedCCU":1,"admission":{"effectiveAllocatedCCU":1,"pendingTarget":null,"activeCCU":0,"offeredSlots":0,"queueDepth":0,"availableSlots":1}}));
+        assert_eq!(value, json!({"nodeIncarnation": server.node_incarnation, "namespaceId":"1", "sessionId":"1", "revision":"1", "allocatedCCU":1,"spaces":[
+            {"spaceId":"1","epoch":"1","channelIds":["1","4"]},
+            {"spaceId":"2","epoch":"1","channelIds":["1","4"]}
+        ],"admission":{"effectiveAllocatedCCU":1,"pendingTarget":null,"activeCCU":0,"offeredSlots":0,"queueDepth":0,"availableSlots":1}}));
         assert!(!value.to_string().contains(&a));
         assert_eq!(http(server.admin_address, "PUT", path, &headers(&server), &put(&a)).await.0, 200);
         assert_eq!(http(server.admin_address, "PUT", "/v1/namespaces/2/sessions/2", &headers(&server), &put(&b)).await.0, 201);
@@ -207,6 +232,367 @@ async fn host_contract_and_quic_scope_revocation() {
         assert!(other.recv_timeout(Duration::from_secs(1)).await.unwrap().is_some());
         assert!(fixture.client(&server, &b).await.is_ok());
     }).await.expect("bounded managed lifecycle");
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end managed spatial HTTP and QUIC lifecycle"
+)]
+async fn managed_spatial_endpoint_adds_live_space_and_is_revision_idempotent() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let fixture = Fixture::new();
+        let server = start_managed(fixture.config()).await.unwrap();
+        let token = "a".repeat(64);
+        let session_path = "/v1/namespaces/1/sessions/1";
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PUT",
+                session_path,
+                &headers(&server),
+                &json!({"revision":"1","allocatedCCU":2,"clientToken":token}).to_string(),
+            )
+            .await
+            .0,
+            201
+        );
+        let existing = fixture.client(&server, &token).await.unwrap();
+        assert!(existing.supports_positioned_state());
+        let space_path = "/v1/namespaces/1/sessions/1/spaces/3";
+        let missing_incarnation_headers =
+            format!("Authorization: Bearer {ADMIN}\r\nContent-Type: application/json\r\n");
+        let (status, value) = http(
+            server.admin_address,
+            "PUT",
+            space_path,
+            &missing_incarnation_headers,
+            &spatial_body(2, 10.0),
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert_eq!(value, json!({"error":{"code":"incarnation_conflict"}}));
+        let (status, value) = http(
+            server.admin_address,
+            "PUT",
+            space_path,
+            &headers(&server),
+            &spatial_body(2, 10.0),
+        )
+        .await;
+        assert_eq!(status, 201);
+        assert_eq!(value["revision"], "2");
+        assert_eq!(value["spaces"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            value["spaces"][2],
+            json!({
+                "spaceId":"3",
+                "epoch":"1",
+                "channelIds":["1","4"],
+                "metersPerUnit":1.0,
+                "cellSize":10.0,
+                "interestRadius":15.0,
+                "exactDistance":true,
+                "bounds":{
+                    "min":{"x":-1000.0,"y":-1000.0,"z":-1000.0},
+                    "max":{"x":1000.0,"y":1000.0,"z":1000.0}
+                }
+            })
+        );
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PUT",
+                space_path,
+                &headers(&server),
+                &spatial_body(2, 10.0),
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PATCH",
+                session_path,
+                &headers(&server),
+                &json!({"revision":"2","allocatedCCU":2}).to_string(),
+            )
+            .await
+            .0,
+            409
+        );
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PUT",
+                space_path,
+                &headers(&server),
+                &spatial_body(2, 11.0),
+            )
+            .await
+            .0,
+            409
+        );
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PUT",
+                "/v1/namespaces/1/sessions/1/spaces/1",
+                &headers(&server),
+                &spatial_body(3, 10.0),
+            )
+            .await
+            .0,
+            400
+        );
+
+        let admission = |connection, key| Command::RequestSessionAdmission {
+            connection: ConnectionId::new(connection),
+            session: scope(),
+            idempotency_key: IdempotencyKey::new(key).unwrap(),
+        };
+        assert!(matches!(
+            server
+                .worker
+                .execute(admission(1, "existing"))
+                .await
+                .unwrap(),
+            CommandResult::Admission(JoinDecision::Admitted(_))
+        ));
+        let mut existing = existing;
+        existing.subscribe_space(1, 1, 3, 1, 1).await.unwrap();
+        assert_eq!(
+            existing.recv().await.unwrap().message_kind(),
+            MessageKind::SubscriptionAccepted
+        );
+        let existing_entered = existing.recv().await.unwrap();
+        assert_eq!(existing_entered.message_kind(), MessageKind::EntityEntered);
+        let existing_entity = existing_entered.entity_id.unwrap();
+
+        let mut future = fixture.client(&server, &token).await.unwrap();
+        assert!(matches!(
+            server.worker.execute(admission(2, "future")).await.unwrap(),
+            CommandResult::Admission(JoinDecision::Admitted(_))
+        ));
+        future.subscribe_space(1, 1, 3, 1, 1).await.unwrap();
+        assert_eq!(
+            future.recv().await.unwrap().message_kind(),
+            MessageKind::SubscriptionAccepted
+        );
+        let future_entered = future.recv().await.unwrap();
+        assert_eq!(future_entered.message_kind(), MessageKind::EntityEntered);
+        let future_entity = future_entered.entity_id.unwrap();
+        let observed_future = existing.recv().await.unwrap();
+        assert_eq!(observed_future.message_kind(), MessageKind::EntityEntered);
+        assert_eq!(observed_future.entity_id, Some(future_entity));
+
+        let existing_position = RoutingPosition3D {
+            x: 9.9,
+            y: 0.0,
+            z: 0.0,
+        };
+        existing
+            .publish_unreliable_positioned_state(
+                1,
+                1,
+                3,
+                1,
+                4,
+                existing_entity,
+                1,
+                7,
+                existing_position,
+                b"existing".to_vec(),
+            )
+            .unwrap();
+        let mut existing_datagrams = existing.take_datagram_receiver().unwrap();
+        let own = existing_datagrams
+            .recv_timeout(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .expect("positioned state routed to its positioned owner");
+        assert_eq!(own.routing_position, Some(existing_position));
+
+        let future_position = RoutingPosition3D {
+            x: 20.1,
+            y: 0.0,
+            z: 0.0,
+        };
+        future
+            .publish_unreliable_positioned_state(
+                1,
+                1,
+                3,
+                1,
+                4,
+                future_entity,
+                1,
+                7,
+                future_position,
+                b"future".to_vec(),
+            )
+            .unwrap();
+        let routed = existing_datagrams
+            .recv_timeout(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .expect("cell-boundary candidate routed to nearby positioned owner");
+        assert_eq!(routed.entity_id, Some(future_entity));
+        assert_eq!(routed.routing_position, Some(future_position));
+    })
+    .await
+    .expect("bounded managed spatial lifecycle");
+}
+
+#[tokio::test]
+async fn managed_tick_rate_rejects_malformed_values_without_partial_mutation() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::new();
+        let server = start_managed(fixture.config()).await.unwrap();
+        let path = "/v1/namespaces/1/sessions/1";
+        let token = "a".repeat(64);
+        let invalid = ["0", "121", "1.5", "1.0", "-1", "4294967296", "\"60\"", "null", "true"];
+        for hz in invalid {
+            let body = format!("{{\"revision\":\"1\",\"allocatedCCU\":1,\"clientToken\":\"{token}\",\"tickRateHz\":{hz}}}");
+            assert_eq!(http(server.admin_address, "PUT", path, &headers(&server), &body).await, (400, json!({"error":{"code":"invalid_request"}})));
+            assert_eq!(server.worker.live_counts().await.unwrap().sessions_active, 0);
+        }
+        let (_, before) = http(server.admin_address, "PUT", path, &headers(&server), &put(&token)).await;
+        assert!(before.get("tickRateHz").is_none());
+        for hz in invalid {
+            let body = format!("{{\"revision\":\"2\",\"allocatedCCU\":2,\"tickRateHz\":{hz}}}");
+            assert_eq!(http(server.admin_address, "PATCH", path, &headers(&server), &body).await.0, 400);
+            assert_eq!(http(server.admin_address, "GET", path, &headers(&server), "").await.1, before);
+        }
+        let old_patch = json!({"revision":"2", "allocatedCCU":2}).to_string();
+        let (status, legacy) = http(server.admin_address, "PATCH", path, &headers(&server), &old_patch).await;
+        assert_eq!(status, 200);
+        assert_eq!(legacy["revision"], "2");
+        assert_eq!(legacy["allocatedCCU"], 2);
+        assert!(legacy.get("tickRateHz").is_none());
+    }).await.expect("bounded malformed publish ceiling checks");
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one optional-rate snapshot and mutation-retry contract"
+)]
+async fn managed_tick_rate_snapshot_retries_and_omission_preserve_configuration() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::new();
+        let server = start_managed(fixture.config()).await.unwrap();
+        let path = "/v1/namespaces/1/sessions/1";
+        let token = "a".repeat(64);
+        let create =
+            json!({"revision":"1", "allocatedCCU":1, "clientToken":token, "tickRateHz":120})
+                .to_string();
+        let (status, initial) = http(
+            server.admin_address,
+            "PUT",
+            path,
+            &headers(&server),
+            &create,
+        )
+        .await;
+        assert_eq!(status, 201);
+        assert_eq!(initial["tickRateHz"], 120);
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PUT",
+                path,
+                &headers(&server),
+                &create
+            )
+            .await,
+            (200, initial.clone())
+        );
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PUT",
+                path,
+                &headers(&server),
+                &put(&token)
+            )
+            .await
+            .0,
+            409
+        );
+        let omitted = json!({"revision":"2", "allocatedCCU":2}).to_string();
+        let (status, preserved) = http(
+            server.admin_address,
+            "PATCH",
+            path,
+            &headers(&server),
+            &omitted,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(preserved["tickRateHz"], 120);
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PATCH",
+                path,
+                &headers(&server),
+                &omitted
+            )
+            .await,
+            (200, preserved)
+        );
+        let rate_body = json!({"revision":"3", "allocatedCCU":2, "tickRateHz":1}).to_string();
+        let (status, applied) = http(
+            server.admin_address,
+            "PATCH",
+            path,
+            &headers(&server),
+            &rate_body,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(applied["tickRateHz"], 1);
+        assert_eq!(
+            http(
+                server.admin_address,
+                "PATCH",
+                path,
+                &headers(&server),
+                &rate_body
+            )
+            .await,
+            (200, applied.clone())
+        );
+        for conflict in [
+            json!({"revision":"3", "allocatedCCU":2, "tickRateHz":2}),
+            json!({"revision":"3", "allocatedCCU":2}),
+            json!({"revision":"2", "allocatedCCU":2, "tickRateHz":120}),
+        ] {
+            assert_eq!(
+                http(
+                    server.admin_address,
+                    "PATCH",
+                    path,
+                    &headers(&server),
+                    &conflict.to_string()
+                )
+                .await
+                .0,
+                409
+            );
+            assert_eq!(
+                http(server.admin_address, "GET", path, &headers(&server), "")
+                    .await
+                    .1,
+                applied
+            );
+        }
+    })
+    .await
+    .expect("bounded publish ceiling HTTP revision checks");
 }
 
 #[tokio::test]

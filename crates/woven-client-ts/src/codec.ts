@@ -25,26 +25,49 @@ import {
   ToolCallCompletedPayload,
   RequestAdmissionPayload, AdmissionResultPayload, AdmissionStatus, AdmissionRejectionCode,
   QueueStatusRequestPayload, QueueHeartbeatPayload, QueueClaimPayload, QueueCancelPayload,
-  QueueUpdatePayload, QueueState,
+  QueueUpdatePayload, QueueState, ClientLogPayload, LogLevel,
 } from "../generated/woven/protocol/v1.js";
 import { unionToControlPayload } from "../generated/woven/protocol/v1/control-payload.js";
 
 export const PROTOCOL_VERSION = 1;
 export const FILE_IDENTIFIER = "WVN1";
 export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
-export const DEFAULT_MAX_PAYLOAD_BYTES = 256 * 1024;
+export const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024;
+export const CAPABILITY_POSITIONED_ENTITY_STATE = 1n << 0n;
+export const CAPABILITY_CLIENT_LOG = 1n << 1n;
+export const MAX_LOG_MESSAGE_BYTES = 1024;
+
+/** Optional 3D routing metadata carried only by EntityState. */
+export interface RoutingPosition3D {
+  x: number;
+  y: number;
+  z: number;
+}
 
 /** Minimum frame length: 4-byte size prefix + root table offset. */
 const MIN_FRAME_LENGTH = 12;
 const MAX_SIZE_PREFIX = 0xffff_ffff;
 
-/** A framing or decoding error, mirroring the Rust `CodecError` variants. */
+/** A framing, payload, or decoding error, mirroring the Rust `CodecError` variants. */
 export class CodecError extends Error {
   readonly code: string;
   constructor(code: string, message: string) {
     super(message);
     this.name = "CodecError";
     this.code = code;
+  }
+}
+
+/** Check payload bytes before allocating a FlatBuffers builder or writing a frame. */
+export function validatePayloadLength(
+  length: number,
+  maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES,
+): void {
+  if (length > maxPayloadBytes) {
+    throw new CodecError(
+      "PayloadTooLarge",
+      `payload length ${length} bytes exceeds limit ${maxPayloadBytes} bytes`,
+    );
   }
 }
 
@@ -75,6 +98,7 @@ export interface DecodedEnvelope {
   senderSequence: bigint;
   correlationId: bigint | null;
   channelId: bigint | null;
+  routingPosition: RoutingPosition3D | null;
   payloadTypeId: bigint;
   payload: Uint8Array | null;
   controlType: ControlPayload;
@@ -161,12 +185,7 @@ export class EnvelopeCodec {
       const envelope = decodeEnvelope(FbEnvelope.getSizePrefixedRootAsEnvelope(bb));
       const payloadLength =
         (envelope.payload?.byteLength ?? 0) + controlVariableLength(envelope.control);
-      if (payloadLength > this.maxPayloadBytes) {
-        throw new CodecError(
-          "PayloadTooLarge",
-          `payload length ${payloadLength} exceeds limit ${this.maxPayloadBytes}`,
-        );
-      }
+      validatePayloadLength(payloadLength, this.maxPayloadBytes);
       return envelope;
     } catch (error) {
       if (error instanceof CodecError) throw error;
@@ -216,7 +235,9 @@ function controlVariableLength(control: unknown): number {
   if (control instanceof SubscriptionRejectedPayload) {
     return encodedStringLength(control.reason());
   }
-  if (control instanceof ProtocolErrorPayload) return encodedStringLength(control.message());
+  if (control instanceof ProtocolErrorPayload || control instanceof ClientLogPayload) {
+    return encodedStringLength(control.message());
+  }
   if (control instanceof InferenceRequestedPayload) {
     return encodedStringLength(control.capability()) + vectorLength(control.inputArray());
   }
@@ -252,6 +273,7 @@ function validateLimits(maxFrameBytes: number, maxPayloadBytes: number): void {
 
 function decodeEnvelope(envelope: FbEnvelope): DecodedEnvelope {
   const controlType = envelope.controlType();
+  const routingPosition = envelope.routingPosition();
   const decoded: DecodedEnvelope = {
     protocolVersion: envelope.protocolVersion(),
     messageKind: envelope.messageKind(),
@@ -265,6 +287,9 @@ function decodeEnvelope(envelope: FbEnvelope): DecodedEnvelope {
     senderSequence: envelope.senderSequence(),
     correlationId: nonzero(envelope.correlationId()),
     channelId: nonzero(envelope.channelId()),
+    routingPosition: routingPosition === null
+      ? null
+      : { x: routingPosition.x(), y: routingPosition.y(), z: routingPosition.z() },
     payloadTypeId: envelope.payloadTypeId(),
     payload: envelope.payloadArray(),
     controlType,
@@ -274,10 +299,33 @@ function decodeEnvelope(envelope: FbEnvelope): DecodedEnvelope {
         : unionToControlPayload(controlType, (obj) => envelope.control(obj)),
   };
   validateCommon(decoded);
+  validateRoutingPosition(decoded);
   validateHandshake(decoded);
   validateProtocolError(decoded);
   validateManaged(decoded);
+  validateClientLog(decoded);
   return decoded;
+}
+
+/** Lane-specific checks, without changing decoding or dispatch on the reliable control stream. */
+export function validateUnreliableEntityState(e: DecodedEnvelope): void {
+  requireSemantics(
+    e.messageKind === MessageKind.EntityState &&
+      e.deliveryClass === DeliveryClass.UnreliableSequenced &&
+      e.controlType === ControlPayload.NONE &&
+      e.control === null,
+    "datagram must contain opaque EntityState with UnreliableSequenced delivery",
+  );
+  requireSemantics(
+    e.namespaceId > 0n && e.sessionId > 0n && e.spaceId > 0n && e.spaceEpoch > 0n &&
+      e.channelId !== null && e.channelId > 0n && e.entityId !== null && e.entityId > 0n &&
+      e.payloadTypeId > 0n,
+    "datagram scope, channel/entity/type IDs, and epoch must be nonzero u64s",
+  );
+  requireSemantics(
+    e.senderSequence >= 0n && e.senderSequence <= 0xffff_ffff_ffff_ffffn,
+    "datagram sender sequence must be a u64",
+  );
 }
 
 function requireSemantics(valid: boolean, message: string): void {
@@ -297,6 +345,52 @@ function isConnectionScoped(e: DecodedEnvelope): boolean {
     e.channelId === null &&
     e.entityId === null
   );
+}
+
+function validateRoutingPosition(e: DecodedEnvelope): void {
+  if (e.routingPosition === null) return;
+  requireSemantics(
+    e.messageKind === MessageKind.EntityState &&
+      Number.isFinite(e.routingPosition.x) &&
+      Number.isFinite(e.routingPosition.y) &&
+      Number.isFinite(e.routingPosition.z),
+    "routing position requires EntityState and finite 3D coordinates",
+  );
+}
+
+export function validateLogMessage(level: LogLevel, message: string): number {
+  requireSemantics(
+    level === LogLevel.Info || level === LogLevel.Warn || level === LogLevel.Error,
+    "client log level must be Info, Warn, or Error",
+  );
+  requireSemantics(typeof message === "string", "client log message must be a string");
+  // UTF-8 is at least as long as UTF-16 here; bound allocation before encoding.
+  requireSemantics(message.length <= MAX_LOG_MESSAGE_BYTES, "client log message must contain 1 to 1024 UTF-8 bytes");
+  const length = new TextEncoder().encode(message).byteLength;
+  requireSemantics(
+    length > 0 && length <= MAX_LOG_MESSAGE_BYTES,
+    "client log message must contain 1 to 1024 UTF-8 bytes",
+  );
+  return length;
+}
+
+function validateClientLog(e: DecodedEnvelope): void {
+  if (e.messageKind !== MessageKind.ClientLog && e.controlType !== ControlPayload.ClientLogPayload) return;
+  requireSemantics(
+    e.messageKind === MessageKind.ClientLog &&
+      e.controlType === ControlPayload.ClientLogPayload &&
+      e.control instanceof ClientLogPayload,
+    "ClientLog message must carry ClientLogPayload",
+  );
+  requireSemantics(
+    e.deliveryClass === DeliveryClass.ReliableOrdered &&
+      e.namespaceId !== 0n && e.sessionId !== 0n &&
+      e.spaceId === 0n && e.spaceEpoch === 0n &&
+      e.channelId === null && e.entityId === null && hasNoDomainPayload(e),
+    "invalid ClientLog session scope, delivery, or domain payload",
+  );
+  const control = e.control as ClientLogPayload;
+  validateLogMessage(control.level(), control.message() ?? "");
 }
 
 function validateCommon(e: DecodedEnvelope): void {

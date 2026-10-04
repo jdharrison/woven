@@ -11,18 +11,27 @@
 #![deny(unsafe_code)]
 
 mod admission;
+mod datagram;
+mod logging;
+mod stream;
+pub use logging::ClientLogger;
 mod transform;
 pub use admission::ManagedAdmissionOutcome;
+pub use datagram::DatagramReceiver;
+pub use woven_protocol::RoutingPosition3D;
 
 pub use transform::Transform;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use stream::StreamReadState;
+
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use tracing::{debug, trace};
 use woven_protocol::{
-    Authenticate, AuthenticationScheme, Codec, CodecError, ControlPayload, DeliveryClass, Envelope,
-    Hello, InferenceRequested, JoinSession, MessagePayload, OpaquePayload, PROTOCOL_VERSION,
+    Authenticate, AuthenticationScheme, CAPABILITY_CLIENT_LOG, CAPABILITY_POSITIONED_ENTITY_STATE,
+    Codec, CodecError, CodecLimits, ControlPayload, DeliveryClass, Envelope, Hello,
+    InferenceRequested, JoinSession, MessagePayload, OpaquePayload, PROTOCOL_VERSION,
     ProtocolError, SnapshotRequest, SpaceTransition, SubscribeSpace,
 };
 use wtransport::ClientConfig as WtransportClientConfig;
@@ -47,9 +56,10 @@ pub struct ClientConfig {
     /// Credential sent during `Authenticate`. Existing connect methods use Development;
     /// `connect_with_tls_and_auth` permits explicit Bearer authentication.
     pub token: String,
-    /// Maximum frame size advertised in `Hello` (bytes). Default: 65536.
+    /// Maximum incoming frame size advertised in `Hello` (bytes). Default: 1 MiB.
     pub max_frame_bytes: u32,
-    /// Maximum payload size advertised in `Hello` (bytes). Default: 65536.
+    /// Maximum incoming payload size advertised in `Hello` (bytes). Default: 65536.
+    /// Publishing is capped at 64 KiB or a smaller configured/server limit.
     pub max_payload_bytes: u32,
 }
 
@@ -58,7 +68,7 @@ impl Default for ClientConfig {
         Self {
             url: String::new(),
             token: String::new(),
-            max_frame_bytes: 65536,
+            max_frame_bytes: 1_048_576,
             max_payload_bytes: 65536,
         }
     }
@@ -123,6 +133,8 @@ pub enum ClientError {
     Closed,
     /// The URL scheme is not recognised.
     UnsupportedScheme(String),
+    /// The connected server did not negotiate a capability required by the operation.
+    UnsupportedCapability(&'static str),
 }
 
 impl std::fmt::Display for ClientError {
@@ -134,6 +146,9 @@ impl std::fmt::Display for ClientError {
             Self::HandshakeFailed(msg) => write!(f, "handshake failed: {msg}"),
             Self::Closed => write!(f, "connection closed"),
             Self::UnsupportedScheme(s) => write!(f, "unsupported URL scheme: {s}"),
+            Self::UnsupportedCapability(capability) => {
+                write!(f, "server did not negotiate capability: {capability}")
+            }
         }
     }
 }
@@ -146,7 +161,8 @@ impl std::error::Error for ClientError {
             | Self::ServerError(_)
             | Self::HandshakeFailed(_)
             | Self::Closed
-            | Self::UnsupportedScheme(_) => None,
+            | Self::UnsupportedScheme(_)
+            | Self::UnsupportedCapability(_) => None,
         }
     }
 }
@@ -326,52 +342,6 @@ async fn wtransport_connect(
     Ok((endpoint, connection))
 }
 
-/// Read a single size-prefixed codec frame from a quinn `RecvStream`.
-async fn read_quinn_envelope(
-    stream: &mut quinn::RecvStream,
-    codec: &Codec,
-) -> Result<Envelope, ClientError> {
-    let mut prefix = [0_u8; 4];
-    stream
-        .read_exact(&mut prefix)
-        .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
-    let frame_len = codec
-        .expected_frame_len(&prefix)
-        .map_err(ClientError::Protocol)?
-        .ok_or_else(|| ClientError::Transport("incomplete size prefix".to_owned()))?;
-    let mut frame = vec![0_u8; frame_len];
-    frame[..prefix.len()].copy_from_slice(&prefix);
-    stream
-        .read_exact(&mut frame[prefix.len()..])
-        .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
-    codec.decode(&frame).map_err(ClientError::Protocol)
-}
-
-/// Read a single size-prefixed codec frame from a wtransport `RecvStream`.
-async fn read_wtransport_envelope(
-    stream: &mut wtransport::RecvStream,
-    codec: &Codec,
-) -> Result<Envelope, ClientError> {
-    let mut prefix = [0_u8; 4];
-    stream
-        .read_exact(&mut prefix)
-        .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
-    let frame_len = codec
-        .expected_frame_len(&prefix)
-        .map_err(ClientError::Protocol)?
-        .ok_or_else(|| ClientError::Transport("incomplete size prefix".to_owned()))?;
-    let mut frame = vec![0_u8; frame_len];
-    frame[..prefix.len()].copy_from_slice(&prefix);
-    stream
-        .read_exact(&mut frame[prefix.len()..])
-        .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
-    codec.decode(&frame).map_err(ClientError::Protocol)
-}
-
 enum Transport {
     Quic {
         endpoint: Endpoint,
@@ -395,6 +365,11 @@ enum Transport {
 pub struct Client {
     transport: Transport,
     codec: Codec,
+    outbound_codec: Codec,
+    stream_read: StreamReadState,
+    negotiated_capability_bits: u64,
+    datagram_receiver_taken: bool,
+    session_scope: Option<(u64, u64)>,
 }
 
 impl Client {
@@ -467,7 +442,12 @@ impl Client {
                 "verified TLS configuration supports native QUIC only".to_owned(),
             ));
         }
-        let codec = Codec::default();
+        let limits = CodecLimits::new(
+            config.max_frame_bytes as usize,
+            config.max_payload_bytes as usize,
+        )
+        .map_err(ClientError::Protocol)?;
+        let codec = Codec::new(limits).map_err(ClientError::Protocol)?;
 
         let mut client = match scheme {
             UrlScheme::Quic => {
@@ -492,7 +472,12 @@ impl Client {
                         send,
                         recv,
                     },
+                    outbound_codec: codec.clone(),
                     codec,
+                    stream_read: StreamReadState::default(),
+                    negotiated_capability_bits: 0,
+                    datagram_receiver_taken: false,
+                    session_scope: None,
                 }
             }
             UrlScheme::WebTransport => {
@@ -511,7 +496,12 @@ impl Client {
                         send,
                         recv,
                     },
+                    outbound_codec: codec.clone(),
                     codec,
+                    stream_read: StreamReadState::default(),
+                    negotiated_capability_bits: 0,
+                    datagram_receiver_taken: false,
+                    session_scope: None,
                 }
             }
         };
@@ -530,12 +520,13 @@ impl Client {
                 server_tick: 0,
                 sender_sequence: 0,
                 correlation_id: None,
+                routing_position: None,
                 message: MessagePayload::Control(ControlPayload::Hello(Hello {
                     min_protocol_version: 1,
                     max_protocol_version: 1,
                     client_name: "woven-client".to_owned(),
                     client_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    capability_bits: 0,
+                    capability_bits: CAPABILITY_POSITIONED_ENTITY_STATE | CAPABILITY_CLIENT_LOG,
                     max_frame_size: config.max_frame_bytes,
                     max_payload_size: config.max_payload_bytes,
                 })),
@@ -545,7 +536,22 @@ impl Client {
 
         // ── Capabilities ─────────────────────────────────────────────────────
         match client.recv().await?.message {
-            MessagePayload::Control(ControlPayload::Capabilities(_)) => {
+            MessagePayload::Control(ControlPayload::Capabilities(capabilities)) => {
+                client.negotiated_capability_bits = capabilities.capability_bits;
+                let defaults = CodecLimits::default();
+                client.outbound_codec = Codec::new(
+                    CodecLimits::new(
+                        limits
+                            .max_frame_len
+                            .min(capabilities.max_frame_size as usize),
+                        limits
+                            .max_payload_len
+                            .min(defaults.max_payload_len)
+                            .min(capabilities.max_payload_size as usize),
+                    )
+                    .map_err(ClientError::Protocol)?,
+                )
+                .map_err(ClientError::Protocol)?;
                 trace!("received Capabilities");
             }
             MessagePayload::Control(ControlPayload::ProtocolError(e)) => {
@@ -573,6 +579,7 @@ impl Client {
                 server_tick: 0,
                 sender_sequence: 0,
                 correlation_id: None,
+                routing_position: None,
                 message: MessagePayload::Control(ControlPayload::Authenticate(Authenticate {
                     scheme: auth_scheme,
                     credentials: config.token.into_bytes(),
@@ -619,11 +626,14 @@ impl Client {
             server_tick: 0,
             sender_sequence: 0,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::Control(ControlPayload::JoinSession(JoinSession {
                 resume_token: vec![],
             })),
         })
-        .await
+        .await?;
+        self.session_scope = Some((namespace_id, session_id));
+        Ok(())
     }
 
     /// Send a `SubscribeSpace` control envelope.
@@ -647,6 +657,7 @@ impl Client {
             server_tick: 0,
             sender_sequence: 0,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::Control(ControlPayload::SubscribeSpace(SubscribeSpace)),
         })
         .await
@@ -676,6 +687,7 @@ impl Client {
             server_tick: 0,
             sender_sequence: 0,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::Control(ControlPayload::SpaceTransition(SpaceTransition {
                 from_space_id: source_space_id,
                 to_space_id: destination_space_id,
@@ -706,6 +718,7 @@ impl Client {
             server_tick: 0,
             sender_sequence: 0,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::Control(ControlPayload::SnapshotRequest(SnapshotRequest {
                 after_server_tick: None,
             })),
@@ -741,6 +754,7 @@ impl Client {
             server_tick: 0,
             sender_sequence: sequence,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::ReliableEvent(OpaquePayload {
                 type_id,
                 bytes: payload,
@@ -779,12 +793,67 @@ impl Client {
             server_tick: 0,
             sender_sequence: sequence,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::EntityState(OpaquePayload {
                 type_id,
                 bytes: payload,
             }),
         })
         .await
+    }
+
+    /// Send a positioned `LatestValue` (`EntityState`) update.
+    ///
+    /// Position and state are validated and applied atomically by the server. This
+    /// fails locally if positioned state was not negotiated during the handshake.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_positioned_state(
+        &mut self,
+        namespace_id: u64,
+        session_id: u64,
+        space_id: u64,
+        space_epoch: u64,
+        channel_id: u64,
+        entity_id: u64,
+        sequence: u64,
+        type_id: u64,
+        position: RoutingPosition3D,
+        payload: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.require_positioned_state()?;
+        self.send_envelope(&Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_class: DeliveryClass::LatestValue,
+            namespace_id,
+            session_id,
+            space_id,
+            channel_id: Some(channel_id),
+            entity_id: Some(entity_id),
+            space_epoch,
+            server_tick: 0,
+            sender_sequence: sequence,
+            correlation_id: None,
+            routing_position: Some(position),
+            message: MessagePayload::EntityState(OpaquePayload {
+                type_id,
+                bytes: payload,
+            }),
+        })
+        .await
+    }
+
+    /// Whether the server negotiated atomic positioned `EntityState` support.
+    #[must_use]
+    pub const fn supports_positioned_state(&self) -> bool {
+        self.negotiated_capability_bits & CAPABILITY_POSITIONED_ENTITY_STATE != 0
+    }
+
+    fn require_positioned_state(&self) -> Result<(), ClientError> {
+        if self.supports_positioned_state() {
+            Ok(())
+        } else {
+            Err(ClientError::UnsupportedCapability("positioned EntityState"))
+        }
     }
 
     /// Send an `InferenceRequested` control envelope addressed to the AI identity's entity.
@@ -812,6 +881,7 @@ impl Client {
             server_tick: 0,
             sender_sequence: 0,
             correlation_id: None,
+            routing_position: None,
             message: MessagePayload::Control(ControlPayload::InferenceRequested(
                 InferenceRequested {
                     capability: capability.to_owned(),
@@ -823,20 +893,28 @@ impl Client {
         .await
     }
 
-    /// Receive the next decoded [`Envelope`], blocking until one arrives or an
-    /// error occurs.
+    /// Receive the next decoded [`Envelope`] from the control stream, blocking
+    /// until one arrives or an error occurs. Datagrams use [`DatagramReceiver`].
+    ///
+    /// Cancellation retains a partial prefix/body on this client, bounded by the
+    /// configured incoming frame limit. The next receive resumes the same frame.
     pub async fn recv(&mut self) -> Result<Envelope, ClientError> {
-        match &mut self.transport {
-            Transport::Quic { recv, .. } => read_quinn_envelope(recv, &self.codec).await,
-            Transport::WebTransport { recv, .. } => {
-                read_wtransport_envelope(recv, &self.codec).await
-            }
+        let result = match &mut self.transport {
+            Transport::Quic { recv, .. } => self.stream_read.recv(recv, &self.codec).await,
+            Transport::WebTransport { recv, .. } => self.stream_read.recv(recv, &self.codec).await,
+        };
+        match &result {
+            Ok(envelope) => logging::observe_session_scope(&mut self.session_scope, envelope),
+            Err(_) => self.session_scope = None,
         }
+        result
     }
 
     /// Try to receive the next [`Envelope`] within `duration`.
     ///
-    /// Returns `Ok(None)` if the timeout elapses before a frame arrives.
+    /// Returns `Ok(None)` if the timeout elapses before a complete frame arrives.
+    /// Partial prefix/body bytes remain on the client for the next receive; repeated
+    /// polling does not discard bytes or start a second reader.
     pub async fn recv_timeout(
         &mut self,
         duration: Duration,
@@ -902,9 +980,12 @@ impl Client {
 
     /// Encode `envelope` and send it on the transport's bidirectional stream.
     async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), ClientError> {
-        let bytes = self.codec.encode(envelope).map_err(ClientError::Protocol)?;
+        let bytes = self
+            .outbound_codec
+            .encode(envelope)
+            .map_err(ClientError::Protocol)?;
         trace!(kind = ?envelope.message_kind(), len = bytes.len(), "sending envelope");
-        match &mut self.transport {
+        let result = match &mut self.transport {
             Transport::Quic { send, .. } => send
                 .write_all(&bytes)
                 .await
@@ -913,7 +994,11 @@ impl Client {
                 .write_all(&bytes)
                 .await
                 .map_err(|e| ClientError::Transport(e.to_string())),
+        };
+        if result.is_err() {
+            self.session_scope = None;
         }
+        result
     }
 }
 

@@ -2,6 +2,49 @@
 
 This crate defines the transport-neutral Woven Protocol v1 envelope, typed control messages, bounded size-prefixed framing, safe owned Rust representations, and conformance fixtures. A transport adapter supplies and consumes complete frames; this crate does not depend on WebSocket, QUIC, WebTransport, or `woven-core` internals.
 
+## Client logging wire slice
+
+`MessageKind::ClientLog = 40` carries `ControlPayload::ClientLog(ClientLog {
+level: LogLevel, message: String })`. The additive FlatBuffers table is
+`ClientLogPayload` (union tag **37**), with fields `level:LogLevel` and
+`message:string`. `LogLevel` is u8: Unknown=0, Info=1, Warn=2, Error=3.
+
+This is a client-to-server, **ReliableOrdered, session-scoped** control, not a
+channel event and never a broadcast. Nonzero `namespace_id` and `session_id`
+are required; space, channel, entity, epoch, routing position, and domain payload
+are absent. Both encode and decode reject Unknown/unrecognized levels, empty
+messages, and messages over `MAX_LOG_MESSAGE_BYTES = 1024` UTF-8 bytes. Smaller
+configured payload/frame limits still apply. No persistence acknowledgement is
+specified; the receiving node/Host integration owns any bounded ingestion and
+persistence behavior, outside this protocol/SDK slice.
+
+`CAPABILITY_CLIENT_LOG = 1 << 1` (**2**) is the optional capability bit, distinct
+from positioned entity state (bit 0). Older peers may reject the additive kind.
+Regenerate the cross-language fixture with `cargo run --locked -p woven-protocol
+--example write_client_log_fixture`; Rust and TS tests verify it in both directions.
+
+## Positioned entity-state wire slice
+
+`Envelope` appends an optional `routing_position: RoutingPosition3D` table with finite
+`x`, `y`, and `z` doubles. Absence preserves existing frames and payload semantics. Presence is
+valid only on `EntityState`; controls, reliable events, and snapshots reject it. Routing position
+is metadata alongside the opaque domain payload, not a transform schema and never inferred from
+payload bytes.
+
+`CAPABILITY_POSITIONED_ENTITY_STATE = 1 << 0` is advertised by clients in `Hello` and returned
+only when selected by the server in `Capabilities`. Clients must not use positioned APIs unless
+that bit was negotiated. Servers reject positioned state from a connection that did not negotiate
+it. The capability covers both reliable-stream `LatestValue` state and datagram
+`UnreliableSequenced` state; the configured channel remains authoritative for delivery,
+persistence, payload size, and coalescing semantics.
+
+At the core boundary, an attached routing position is specifically 3D even though the generic
+engine retains standalone 2D position APIs. The server validates finite coordinates, the target
+space's 3D frame and optional inclusive AABB, then applies the entity position/index update and
+state publication atomically in one worker turn. A rejected position does not consume state or
+sequence. This is protocol/routing metadata only; it does not establish a physics or transform
+model.
+
 ## Managed admission wire slice
 
 Additive WVN1 controls (Rust variant and struct names match):
@@ -61,11 +104,26 @@ This cross-repository test is ignored by ordinary Cargo runs.
 
 The canonical schema is `schemas/woven_v1.fbs`. It uses the `WVN1` FlatBuffers file identifier and a four-byte little-endian FlatBuffers size prefix. The prefix is the byte count after the prefix; `CodecLimits::max_frame_len` counts the complete frame, including those four bytes.
 
-`Envelope` contains protocol version, stable message kind and delivery class values, namespace/session/space/channel IDs, optional entity semantics, space epoch, server tick, sender sequence, correlation/causal ID, payload type ID, payload bytes, and a typed control union. `EntityState`, `ReliableEvent`, and `Snapshot` use a non-zero payload type ID plus opaque domain bytes. Routing can inspect the envelope without understanding those domain bytes. Every other v1 message has a typed control table.
+`Envelope` contains protocol version, stable message kind and delivery class values, namespace/session/space/channel IDs, optional entity semantics, space epoch, server tick, sender sequence, correlation/causal ID, payload type ID, payload bytes, optional 3D `EntityState` routing position, and a typed control union. `EntityState`, `ReliableEvent`, and `Snapshot` use a non-zero payload type ID plus opaque domain bytes. Routing can inspect the envelope without understanding those domain bytes. Every other v1 message has a typed control table.
 
 Scalar ID value `0` means absent or unassigned. Assigned IDs and established epochs start at `1`. The owned Rust API represents optional entity, correlation, and channel values with `Option<u64>` where appropriate.
 
 ## Safe codec and limits
+
+The default limits are **64 KiB (65,536 bytes) per payload** and **1 MiB per
+complete frame**, leaving room for envelope metadata. Both encode and decode
+reject payloads above the limit with `CodecError::PayloadTooLarge`; exactly the
+limit is allowed. The payload limit counts serialized domain bytes, or the combined
+UTF-8 strings and byte vectors in a control message, not the number of properties.
+Woven's default core and transport advertisements use the same 64 KiB ceiling;
+individual channels may impose a smaller limit. Explicit `CodecLimits` remain
+available for bounded, custom protocol tooling.
+
+Property/state updates should contain granular entity/component deltas, not an
+entire serialized world. Oversized values are rejected, never silently truncated.
+Aggregated server snapshots share the payload ceiling; oversized snapshot responses
+produce `ProtocolErrorCode::PayloadTooLarge` without closing the connection. Snapshot
+pagination/chunking is not provided by this guardrail.
 
 `Codec::decode` applies bounds before accessing a FlatBuffer, checks the exact size prefix and file identifier, and then calls the generated FlatBuffers verifier API. Only after successful verification does it copy values into owned Rust types. It rejects:
 
@@ -76,7 +134,7 @@ Scalar ID value `0` means absent or unassigned. Assigned IDs and established epo
 - unknown message or delivery values;
 - message-kind/control-union mismatches; and
 - domain payloads on controls or missing domain payload type IDs; and
-- invalid per-message scope, ID, enum, version-range, or delivery semantics.
+- invalid per-message scope, ID, enum, version-range, delivery, or routing-position semantics.
 
 `Codec::expected_frame_len` lets stream transports read exactly one bounded frame after receiving the four-byte prefix. This crate does not allocate queues; transport implementations remain responsible for bounded queue and backpressure policy.
 

@@ -214,7 +214,7 @@ pub enum CoreError {
     Queue(QueueError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PublishRequest {
     pub connection: ConnectionId,
     pub session: SessionKey,
@@ -226,6 +226,8 @@ pub struct PublishRequest {
     pub delivery: DeliveryClass,
     pub persistence: PersistenceClass,
     pub coalesce_key: Option<CoalesceKey>,
+    /// Optional 3D position applied atomically with `LatestValue` or `UnreliableSequenced` state.
+    pub routing_position: Option<EntityPosition>,
     pub payload: Vec<u8>,
 }
 
@@ -306,6 +308,15 @@ struct ConnectionRateLimiter {
 
 impl ConnectionRateLimiter {
     fn admit(&mut self, policy: PublishRateLimit, now: Instant) -> Result<(), CoreError> {
+        self.admit_optional(Some(policy), now)
+    }
+
+    fn admit_optional(
+        &mut self,
+        policy: Option<PublishRateLimit>,
+        now: Instant,
+    ) -> Result<(), CoreError> {
+        let window = policy.map_or(Duration::from_secs(1), |policy| policy.window);
         let Some(started) = self.window_started else {
             self.window_started = Some(now);
             self.publishes = 1;
@@ -314,17 +325,55 @@ impl ConnectionRateLimiter {
         let elapsed = now
             .checked_duration_since(started)
             .ok_or(CoreError::RateLimitClockRegressed)?;
-        if elapsed >= policy.window {
+        if elapsed >= window {
             self.window_started = Some(now);
             self.publishes = 1;
             return Ok(());
         }
-        if self.publishes == policy.max_publishes {
+        if policy.is_some_and(|policy| self.publishes >= policy.max_publishes) {
             return Err(CoreError::PublishRateLimited {
-                retry_after: policy.window.saturating_sub(elapsed),
+                retry_after: window.saturating_sub(elapsed),
             });
         }
-        self.publishes += 1;
+        self.publishes = self.publishes.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SessionRateLimiter {
+    limiter: ConnectionRateLimiter,
+    retain_after_leave: bool,
+    window: Duration,
+}
+
+impl SessionRateLimiter {
+    fn new(policy: Option<PublishRateLimit>) -> Self {
+        Self {
+            limiter: ConnectionRateLimiter::default(),
+            retain_after_leave: policy.is_some(),
+            window: policy.map_or(Duration::from_secs(1), |policy| policy.window),
+        }
+    }
+
+    fn configure(&mut self, policy: Option<PublishRateLimit>) {
+        if let Some(policy) = policy {
+            self.retain_after_leave = true;
+            self.window = policy.window;
+        }
+    }
+
+    fn expired_at(&self, now: Instant) -> bool {
+        self.limiter.window_started.is_none_or(|started| {
+            now.checked_duration_since(started)
+                .is_some_and(|elapsed| elapsed >= self.window)
+        })
+    }
+
+    fn admit(&mut self, policy: Option<PublishRateLimit>, now: Instant) -> Result<(), CoreError> {
+        self.configure(policy);
+        self.limiter.admit_optional(policy, now)?;
+        self.window = policy.map_or(Duration::from_secs(1), |policy| policy.window);
         Ok(())
     }
 }
@@ -336,7 +385,16 @@ struct ConnectionState {
     subscriptions: BTreeSet<SpaceKey>,
     owned_entities: usize,
     rate_limiter: ConnectionRateLimiter,
+    session_rate_limiters: BTreeMap<SessionKey, SessionRateLimiter>,
     outbound: OutboundQueue,
+}
+
+impl ConnectionState {
+    fn prune_session_rate_limiters_at(&mut self, now: Instant) {
+        self.session_rate_limiters.retain(|session, limiter| {
+            self.memberships.contains(session) || !limiter.expired_at(now)
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -375,6 +433,7 @@ struct SequenceKey {
 #[derive(Debug)]
 struct SessionState {
     members: BTreeSet<ConnectionId>,
+    publish_rate_limit: Option<PublishRateLimit>,
     spaces: BTreeMap<SpaceId, SpaceDescriptor>,
     space_epoch_tombstones: BTreeMap<SpaceId, SpaceEpoch>,
     subscribers: BTreeMap<SpaceId, BTreeSet<ConnectionId>>,
@@ -390,6 +449,7 @@ impl SessionState {
     fn new() -> Self {
         Self {
             members: BTreeSet::new(),
+            publish_rate_limit: None,
             spaces: BTreeMap::new(),
             space_epoch_tombstones: BTreeMap::new(),
             subscribers: BTreeMap::new(),
@@ -425,7 +485,7 @@ impl SessionState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct AuthorizedMessage {
     space: SpaceId,
     space_epoch: SpaceEpoch,
@@ -435,6 +495,7 @@ struct AuthorizedMessage {
     delivery: DeliveryClass,
     persistence: PersistenceClass,
     coalesce_key: Option<CoalesceKey>,
+    routing_position: Option<EntityPosition>,
     payload: Vec<u8>,
 }
 
@@ -449,6 +510,7 @@ impl AuthorizedMessage {
             delivery: request.delivery,
             persistence: request.persistence,
             coalesce_key: request.coalesce_key,
+            routing_position: request.routing_position,
             payload: request.payload.clone(),
         }
     }
@@ -463,6 +525,7 @@ impl AuthorizedMessage {
             delivery: emission.delivery,
             persistence: emission.persistence,
             coalesce_key: emission.coalesce_key,
+            routing_position: None,
             payload: emission.payload,
         }
     }
@@ -479,6 +542,7 @@ impl AuthorizedMessage {
             delivery: self.delivery,
             persistence: self.persistence,
             coalesce_key: self.coalesce_key,
+            routing_position: self.routing_position,
             payload: self.payload.clone(),
         }
     }
@@ -538,6 +602,29 @@ impl<A: Authenticator> WovenCore<A> {
         Ok(())
     }
 
+    /// Returns an authorized publisher's immutable server-registered persistence policy.
+    pub fn channel_persistence(
+        &self,
+        connection: ConnectionId,
+        session: SessionKey,
+        channel: ChannelId,
+    ) -> Result<PersistenceClass, CoreError> {
+        validate_connection_id(connection)?;
+        validate_session_key(session)?;
+        require_nonzero(channel.get(), IdKind::Channel)?;
+        let principal = self.authenticated_principal(connection)?;
+        require_namespace_write(&principal, session.namespace)?;
+        require_session_write(&principal, session)?;
+        let scope = ChannelScope::new(session, channel);
+        if !principal.grants().can_write_channel(scope) {
+            return Err(CoreError::ChannelWriteAccessDenied(scope));
+        }
+        self.channels
+            .get(&channel)
+            .map(|definition| definition.persistence)
+            .ok_or(CoreError::UnknownChannel(channel))
+    }
+
     pub fn provision_session(&mut self, key: SessionKey) -> Result<(), CoreError> {
         validate_session_key(key)?;
         if self.sessions.contains_key(&key) {
@@ -547,6 +634,29 @@ impl<A: Authenticator> WovenCore<A> {
             return Err(CoreError::SessionLimitReached);
         }
         self.sessions.insert(key, SessionState::new());
+        Ok(())
+    }
+
+    /// Sets an additional publish budget per connected member, shared across all session spaces
+    /// and channels. `None` removes only this ceiling, not the core-wide connection limit.
+    /// Existing connection/session windows/counts survive configuration changes and leave/rejoin,
+    /// including unlimited periods after a ceiling was configured. This never schedules ticks.
+    pub fn set_session_publish_rate_limit(
+        &mut self,
+        session: SessionKey,
+        policy: Option<PublishRateLimit>,
+    ) -> Result<(), CoreError> {
+        validate_session_key(session)?;
+        let policy = policy.map(PublishRateLimit::validate).transpose()?;
+        self.sessions
+            .get_mut(&session)
+            .ok_or(CoreError::SessionNotFound(session))?
+            .publish_rate_limit = policy;
+        for connection in self.connections.values_mut() {
+            if let Some(limiter) = connection.session_rate_limiters.get_mut(&session) {
+                limiter.configure(policy);
+            }
+        }
         Ok(())
     }
 
@@ -699,13 +809,15 @@ impl<A: Authenticator> WovenCore<A> {
             crate::QueueOperation::Claim => {
                 if let Ok(lease) = controller.claim_offer_at(ticket, now) {
                     self.pending_admissions.insert((connection, session), lease);
-                    if let Err(error) = self.join_session_with_admission(connection, session, lease)
+                    if let Err(error) =
+                        self.join_session_with_admission_at(connection, session, lease, now)
                     {
                         self.pending_admissions.remove(&(connection, session));
+                        self.admission_tickets.remove(&(connection, session));
                         self.admissions
                             .get_mut(&session)
                             .ok_or(CoreError::AdmissionLeaseRequired(session))?
-                            .release_at(lease, crate::ReleaseReason::Intentional, now);
+                            .rollback_claim_at(ticket, lease, now);
                         return Err(error);
                     }
                 }
@@ -861,6 +973,7 @@ impl<A: Authenticator> WovenCore<A> {
                 subscriptions: BTreeSet::new(),
                 owned_entities: 0,
                 rate_limiter: ConnectionRateLimiter::default(),
+                session_rate_limiters: BTreeMap::new(),
                 outbound,
             },
         );
@@ -903,10 +1016,22 @@ impl<A: Authenticator> WovenCore<A> {
         connection: ConnectionId,
         key: SessionKey,
     ) -> Result<(), CoreError> {
+        self.join_session_at(connection, key, Instant::now())
+    }
+
+    /// Injected-time join for deterministic expiry of retained publish budgets. Active memberships
+    /// and unexpired detached histories share `max_memberships_per_connection` slots; exhausting
+    /// these slots rejects a new session with `MembershipLimitReached`, never evicts its budget.
+    pub fn join_session_at(
+        &mut self,
+        connection: ConnectionId,
+        key: SessionKey,
+        now: Instant,
+    ) -> Result<(), CoreError> {
         if self.admissions.contains_key(&key) {
             return Err(CoreError::AdmissionLeaseRequired(key));
         }
-        self.join_session_unchecked_admission(connection, key)
+        self.join_session_unchecked_admission_at(connection, key, now)
     }
 
     /// Joins a capacity-managed session after the transport-neutral admission controller has
@@ -916,6 +1041,17 @@ impl<A: Authenticator> WovenCore<A> {
         connection: ConnectionId,
         key: SessionKey,
         lease: AdmissionLease,
+    ) -> Result<(), CoreError> {
+        self.join_session_with_admission_at(connection, key, lease, Instant::now())
+    }
+
+    /// Injected-time counterpart of [`Self::join_session_with_admission`].
+    pub fn join_session_with_admission_at(
+        &mut self,
+        connection: ConnectionId,
+        key: SessionKey,
+        lease: AdmissionLease,
+        now: Instant,
     ) -> Result<(), CoreError> {
         validate_connection_id(connection)?;
         validate_session_key(key)?;
@@ -942,28 +1078,31 @@ impl<A: Authenticator> WovenCore<A> {
         {
             return Err(CoreError::InvalidAdmissionLease(key));
         }
-        self.join_session_unchecked_admission(connection, key)?;
+        self.join_session_unchecked_admission_at(connection, key, now)?;
         self.pending_admissions.remove(&(connection, key));
         self.admission_leases.insert((connection, key), lease);
         Ok(())
     }
 
-    fn join_session_unchecked_admission(
+    fn join_session_unchecked_admission_at(
         &mut self,
         connection: ConnectionId,
         key: SessionKey,
+        now: Instant,
     ) -> Result<(), CoreError> {
         validate_connection_id(connection)?;
         validate_session_key(key)?;
         let principal = self.authenticated_principal(connection)?;
         require_namespace_read(&principal, key.namespace)?;
         require_session_read(&principal, key)?;
-        if !self.sessions.contains_key(&key) {
-            return Err(CoreError::SessionNotFound(key));
-        }
+        let policy = self
+            .sessions
+            .get(&key)
+            .ok_or(CoreError::SessionNotFound(key))?
+            .publish_rate_limit;
         let connection_state = self
             .connections
-            .get(&connection)
+            .get_mut(&connection)
             .ok_or(CoreError::UnknownConnection(connection))?;
         if connection_state.memberships.contains(&key) {
             return Ok(());
@@ -971,11 +1110,18 @@ impl<A: Authenticator> WovenCore<A> {
         if connection_state.memberships.len() == self.config.max_memberships_per_connection {
             return Err(CoreError::MembershipLimitReached);
         }
-        self.connections
-            .get_mut(&connection)
-            .ok_or(CoreError::UnknownConnection(connection))?
-            .memberships
-            .insert(key);
+        connection_state.prune_session_rate_limiters_at(now);
+        if !connection_state.session_rate_limiters.contains_key(&key)
+            && connection_state.session_rate_limiters.len()
+                >= self.config.max_memberships_per_connection
+        {
+            return Err(CoreError::MembershipLimitReached);
+        }
+        connection_state
+            .session_rate_limiters
+            .entry(key)
+            .or_insert_with(|| SessionRateLimiter::new(policy));
+        connection_state.memberships.insert(key);
         self.sessions
             .get_mut(&key)
             .ok_or(CoreError::SessionNotFound(key))?
@@ -1180,8 +1326,8 @@ impl<A: Authenticator> WovenCore<A> {
             .spaces
             .get(&record.space)
             .ok_or(CoreError::SpaceNotFound(space_key))?;
-        position
-            .validate_for_frame(descriptor.local_frame)
+        descriptor
+            .validate_position(position)
             .map_err(CoreError::InvalidEntityPosition)?;
         let cell = spatial_cell_for(position, descriptor, record.space_epoch)?;
 
@@ -1360,6 +1506,19 @@ impl<A: Authenticator> WovenCore<A> {
         }
         self.require_membership(request.connection, request.session)?;
         self.require_subscription(request.connection, target)?;
+        let policy = self
+            .sessions
+            .get(&request.session)
+            .ok_or(CoreError::SessionNotFound(request.session))?
+            .publish_rate_limit;
+        // The connection owns this budget so LeaveSession cannot replenish it.
+        self.connections
+            .get_mut(&request.connection)
+            .ok_or(CoreError::UnknownConnection(request.connection))?
+            .session_rate_limiters
+            .get_mut(&request.session)
+            .ok_or(CoreError::SessionMembershipRequired(request.session))?
+            .admit(policy, now)?;
 
         let channel = self
             .channels
@@ -1415,6 +1574,11 @@ impl<A: Authenticator> WovenCore<A> {
                 ..proposed_authorized
             }],
             AuthorityOutcome::Emit(emissions) => {
+                if request.routing_position.is_some() {
+                    return Err(CoreError::AuthorityRejected(
+                        AuthorityRejection::PolicyDenied,
+                    ));
+                }
                 if emissions.len() > self.config.max_authority_emissions {
                     return Err(CoreError::AuthorityEmissionLimitExceeded);
                 }
@@ -1441,6 +1605,41 @@ impl<A: Authenticator> WovenCore<A> {
         }
         self.validate_sequence_capacity(request.session, &planned_sequences)?;
         self.validate_state_capacity(request.session, &messages, now)?;
+        let planned_position = if let Some(position) = request.routing_position {
+            if !matches!(position, EntityPosition::Cartesian3D { .. }) {
+                return Err(CoreError::InvalidEntityPosition(
+                    PositionValidationError::DimensionMismatch,
+                ));
+            }
+            let entity = request.entity.ok_or(CoreError::AuthorityRejected(
+                AuthorityRejection::EntityRequired,
+            ))?;
+            let session = self
+                .sessions
+                .get(&request.session)
+                .ok_or(CoreError::SessionNotFound(request.session))?;
+            let record = session
+                .entities
+                .get(&entity)
+                .ok_or(CoreError::EntityNotFound(entity))?;
+            if record.owner_connection != request.connection {
+                return Err(CoreError::EntityNotOwned(entity));
+            }
+            let descriptor = session
+                .spaces
+                .get(&request.space)
+                .ok_or(CoreError::SpaceNotFound(target))?;
+            descriptor
+                .validate_position(position)
+                .map_err(CoreError::InvalidEntityPosition)?;
+            Some((
+                entity,
+                position,
+                spatial_cell_for(position, descriptor, request.space_epoch)?,
+            ))
+        } else {
+            None
+        };
 
         let durable_count = messages
             .iter()
@@ -1469,6 +1668,19 @@ impl<A: Authenticator> WovenCore<A> {
             .sessions
             .get_mut(&request.session)
             .ok_or(CoreError::SessionNotFound(request.session))?;
+        if let Some((entity, position, cell)) = planned_position {
+            if session.entity_cells.get(&entity).copied() != cell {
+                session.remove_entity_from_cell(entity);
+                if let Some(cell) = cell {
+                    session.insert_entity_into_cell(entity, cell);
+                }
+            }
+            session
+                .entities
+                .get_mut(&entity)
+                .ok_or(CoreError::EntityNotFound(entity))?
+                .position = Some(position);
+        }
         for (key, sequence) in planned_sequences {
             session.sequences.insert(key, sequence);
         }
@@ -1560,6 +1772,11 @@ impl<A: Authenticator> WovenCore<A> {
             .get(&message.channel)
             .ok_or(CoreError::UnknownChannel(message.channel))?;
         validate_channel_policy(channel, message.delivery, message.persistence)?;
+        if message.routing_position.is_some() && !message.delivery.is_replaceable() {
+            return Err(CoreError::AuthorityRejected(
+                AuthorityRejection::PolicyDenied,
+            ));
+        }
         let payload_limit = self.config.max_payload_bytes.min(channel.max_payload_bytes);
         if message.payload.len() > payload_limit {
             return Err(CoreError::PayloadTooLarge {
@@ -1781,6 +1998,28 @@ impl<A: Authenticator> WovenCore<A> {
             .drain())
     }
 
+    /// Retain queued messages for spaces whose transport subscription is not active yet.
+    pub fn drain_outbound_for_spaces(
+        &mut self,
+        connection: ConnectionId,
+        spaces: &BTreeSet<SpaceKey>,
+    ) -> Result<Vec<OutboundMessage>, CoreError> {
+        validate_connection_id(connection)?;
+        let state = self
+            .connections
+            .get_mut(&connection)
+            .ok_or(CoreError::UnknownConnection(connection))?;
+        if spaces.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(state.outbound.drain_matching(|message| {
+            spaces.contains(&SpaceKey::new(
+                SessionKey::new(message.namespace, message.session),
+                message.space,
+            ))
+        }))
+    }
+
     pub fn pop_journal_record(&mut self) -> Option<JournalRecord> {
         self.journal_outbox.pop()
     }
@@ -1820,6 +2059,22 @@ impl<A: Authenticator> WovenCore<A> {
     #[must_use]
     pub fn is_connected(&self, connection: ConnectionId) -> bool {
         self.connections.contains_key(&connection)
+    }
+
+    /// Actual joined sessions for an authenticated connection, not its potential grants.
+    pub fn session_memberships(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<&BTreeSet<SessionKey>, CoreError> {
+        validate_connection_id(connection)?;
+        let state = self
+            .connections
+            .get(&connection)
+            .ok_or(CoreError::UnknownConnection(connection))?;
+        if state.authenticated.is_none() {
+            return Err(CoreError::AuthenticationRequired);
+        }
+        Ok(&state.memberships)
     }
 
     #[must_use]
@@ -1995,6 +2250,13 @@ impl<A: Authenticator> WovenCore<A> {
         }
         if let Some(state) = self.connections.get_mut(&connection) {
             state.memberships.remove(&key);
+            if state
+                .session_rate_limiters
+                .get(&key)
+                .is_some_and(|limiter| !limiter.retain_after_leave)
+            {
+                state.session_rate_limiters.remove(&key);
+            }
             state.subscriptions.retain(|space| space.session != key);
             summary.queued_messages_discarded += state.outbound.purge(|message| {
                 message.namespace == key.namespace && message.session == key.session
@@ -2209,7 +2471,7 @@ fn routing_recipients(
         return BTreeSet::new();
     }
 
-    let radius_in_cells = interest_radius / cell_size;
+    let radius_in_cells = (interest_radius / cell_size).ceil();
     let mut recipients = BTreeSet::new();
     for (candidate_cell, candidate_entities) in &session.cell_entities {
         if candidate_cell.space != outbound.space

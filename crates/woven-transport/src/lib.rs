@@ -3,7 +3,10 @@
 #![deny(unsafe_code)]
 
 mod admission;
+mod logging;
 mod metrics;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -15,17 +18,19 @@ use woven_core::{
     RemovedEntity, SpaceEpoch, SpaceKey, TransportIndependentWorker,
 };
 use woven_protocol::{
-    ControlPayload, DeliveryClass, EntityEntered, EntityLeaveReason, EntityLeft, Envelope,
-    MessageKind, MessagePayload, OpaquePayload, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+    CAPABILITY_POSITIONED_ENTITY_STATE, ControlPayload, DeliveryClass, EntityEntered,
+    EntityLeaveReason, EntityLeft, Envelope, MessageKind, MessagePayload, OpaquePayload,
+    PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, RoutingPosition3D,
 };
 
+pub use logging::{LOG_CAPACITY, LogEntry, LogPage, MAX_LOG_PAGE_ENTRIES};
 pub use metrics::{LiveCounts, ServerMetrics, ServerMetricsSnapshot};
 /// Maximum number of commands pending for the single core owner.
 pub const COMMAND_CAPACITY: usize = 256;
 /// Maximum protocol frame size advertised by the transport bridge.
 pub const MAX_FRAME_BYTES: u32 = 1_048_576;
 /// Maximum domain payload size advertised by the transport bridge.
-pub const MAX_PAYLOAD_BYTES: u32 = 262_144;
+pub const MAX_PAYLOAD_BYTES: u32 = 65_536;
 /// How often the worker actively reclaims expired `Stateful` cache entries. TTLs are measured in
 /// hours, so this only needs to be coarse-grained enough that idle memory doesn't linger long.
 const STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -53,6 +58,17 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 enum WorkerRequest {
+    ClientLog {
+        connection: ConnectionId,
+        session: woven_core::SessionKey,
+        log: woven_protocol::ClientLog,
+        reply: oneshot::Sender<Result<(), ProtocolErrorCode>>,
+    },
+    Logs {
+        after: u64,
+        limit: usize,
+        reply: oneshot::Sender<LogPage>,
+    },
     Managed {
         request: woven_core::ManagedRequest,
         reply: oneshot::Sender<Result<woven_core::ManagedOutcome, woven_core::ManagedError>>,
@@ -60,6 +76,12 @@ enum WorkerRequest {
     Command {
         command: Command,
         reply: oneshot::Sender<Result<CommandResult, CoreError>>,
+    },
+    ChannelPersistence {
+        connection: ConnectionId,
+        session: woven_core::SessionKey,
+        channel: woven_core::ChannelId,
+        reply: oneshot::Sender<Result<PersistenceClass, CoreError>>,
     },
     RegisterLifecycle {
         connection: ConnectionId,
@@ -141,6 +163,42 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Capture a client message through the bounded owner; success is not a persistence ACK.
+    pub async fn capture_client_log(
+        &self,
+        connection: ConnectionId,
+        session: woven_core::SessionKey,
+        log: woven_protocol::ClientLog,
+    ) -> Result<(), ProtocolErrorCode> {
+        // Bound the mailbox's owned message bytes as well as the retained ring.
+        logging::validate_log(&log)?;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::ClientLog {
+                connection,
+                session,
+                log,
+                reply,
+            })
+            .await
+            .map_err(|_| ProtocolErrorCode::Internal)?;
+        receive.await.map_err(|_| ProtocolErrorCode::Internal)?
+    }
+
+    /// Trusted local read; public feed authentication belongs to the server admin listener.
+    pub async fn read_logs(&self, after: u64, limit: usize) -> Result<LogPage, TransportError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::Logs {
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| TransportError::WorkerUnavailable)?;
+        receive.await.map_err(|_| TransportError::WorkerUnavailable)
+    }
+
     /// Trusted management operations share the bounded mailbox with native client commands.
     pub async fn manage(
         &self,
@@ -176,6 +234,29 @@ impl WorkerHandle {
         let (reply, receive) = oneshot::channel();
         self.sender
             .send(WorkerRequest::Command { command, reply })
+            .await
+            .map_err(|_| TransportError::WorkerUnavailable)?;
+        receive
+            .await
+            .map_err(|_| TransportError::WorkerUnavailable)?
+            .map_err(TransportError::Core)
+    }
+
+    /// Read the registered policy through the same bounded mailbox as publishes.
+    pub async fn channel_persistence(
+        &self,
+        connection: ConnectionId,
+        session: woven_core::SessionKey,
+        channel: woven_core::ChannelId,
+    ) -> Result<PersistenceClass, TransportError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WorkerRequest::ChannelPersistence {
+                connection,
+                session,
+                channel,
+                reply,
+            })
             .await
             .map_err(|_| TransportError::WorkerUnavailable)?;
         receive
@@ -301,6 +382,7 @@ where
     let (sender, mut receiver) = mpsc::channel::<WorkerRequest>(COMMAND_CAPACITY);
     tokio::spawn(async move {
         let mut worker = worker;
+        let mut logs = logging::LogCapture::default();
         let mut recipients: BTreeMap<ConnectionId, LifecycleRecipient> = BTreeMap::new();
         let mut subscriptions = BTreeMap::new();
         let mut admission_interval = tokio::time::interval(Duration::from_millis(100));
@@ -329,11 +411,38 @@ where
                     continue;
                 }
             };
+            let mut reconcile_disconnections = request_can_disconnect(&request);
             match request {
+                WorkerRequest::ClientLog {
+                    connection,
+                    session,
+                    log,
+                    reply,
+                } => {
+                    let _ = reply.send(logs.client(
+                        worker.core(),
+                        connection,
+                        session,
+                        log,
+                        Instant::now(),
+                    ));
+                }
+                WorkerRequest::Logs {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    let _ = reply.send(logs.page(after, limit));
+                }
                 WorkerRequest::Managed { request, reply } => {
                     let result = worker.core_mut().manage_at(request, Instant::now());
                     if let Ok(woven_core::ManagedOutcome::Deleted { connections }) = &result {
                         for connection in connections {
+                            logs.observe_connection(
+                                worker.core(),
+                                *connection,
+                                "managed session revoked",
+                            );
                             if let Some(recipient) = recipients.remove(connection) {
                                 let _ = recipient.shutdown.try_send(());
                             }
@@ -347,7 +456,28 @@ where
                     let activity = log_development_activity(&command);
                     let action = lifecycle_action(&command);
                     let context = metrics_context(&command);
-                    let result = worker.handle(command);
+                    let log_connection = membership_log_context(&command);
+                    let result = match &command {
+                        Command::DrainOutbound { connection }
+                            if recipients.contains_key(connection) =>
+                        {
+                            // Core routing starts at subscribe, but transport output starts only
+                            // after the accepted/self-entry replies have been queued.
+                            let active_spaces = subscriptions.entry(*connection).or_default();
+                            worker
+                                .core_mut()
+                                .drain_outbound_for_spaces(*connection, active_spaces)
+                                .map(CommandResult::Outbound)
+                        }
+                        _ => worker.handle(command),
+                    };
+                    if let Ok(CommandResult::Published(outcome)) = &result {
+                        // Ordinary publishes must not scan the node's membership tracking map.
+                        reconcile_disconnections = !outcome.disconnected_slow_consumers.is_empty();
+                    }
+                    if let Some((connection, reason)) = log_connection {
+                        logs.observe_connection(worker.core(), connection, reason);
+                    }
                     #[cfg(debug_assertions)]
                     log_development_result(activity, &result);
                     observe_command(&worker_metrics, context, &result);
@@ -361,6 +491,18 @@ where
                         );
                     }
                     let _ = reply.send(result);
+                }
+                WorkerRequest::ChannelPersistence {
+                    connection,
+                    session,
+                    channel,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        worker
+                            .core()
+                            .channel_persistence(connection, session, channel),
+                    );
                 }
                 WorkerRequest::LiveCounts { reply } => {
                     let _ = reply.send(LiveCounts {
@@ -490,9 +632,49 @@ where
                     let _ = reply.send(result);
                 }
             }
+            if reconcile_disconnections {
+                for connection in logs.disconnected(worker.core()) {
+                    logs.observe_connection(
+                        worker.core(),
+                        connection,
+                        "slow consumer disconnected",
+                    );
+                    if let Some(recipient) = recipients.remove(&connection) {
+                        let _ = recipient.shutdown.try_send(());
+                    }
+                    subscriptions.remove(&connection);
+                }
+            }
         }
     });
     WorkerHandle { sender, metrics }
+}
+
+fn membership_log_context(command: &Command) -> Option<(ConnectionId, &'static str)> {
+    match command {
+        Command::JoinSession { connection, .. }
+        | Command::JoinSessionWithAdmission { connection, .. }
+        | Command::RequestSessionAdmission { connection, .. }
+        | Command::SessionQueue { connection, .. }
+        | Command::LeaveSession { connection, .. } => Some((*connection, "session left")),
+        Command::TransportLost { connection } => Some((*connection, "transport lost")),
+        _ => None,
+    }
+}
+
+fn request_can_disconnect(request: &WorkerRequest) -> bool {
+    match request {
+        WorkerRequest::Command { command, .. } => {
+            !matches!(lifecycle_action(command), LifecycleAction::None)
+        }
+        WorkerRequest::Managed { request, .. } => {
+            matches!(request, woven_core::ManagedRequest::Delete { .. })
+        }
+        WorkerRequest::SubscribeAndSpawn { .. }
+        | WorkerRequest::BroadcastToSpace { .. }
+        | WorkerRequest::SendToConnection { .. } => true,
+        _ => false,
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -1182,6 +1364,7 @@ pub fn entity_entered_envelope(
         server_tick: 0,
         sender_sequence: 0,
         correlation_id: None,
+        routing_position: None,
         message: MessagePayload::Control(ControlPayload::EntityEntered(EntityEntered {
             owner_entity_id: Some(entity.get()),
         })),
@@ -1207,11 +1390,33 @@ pub fn entity_left_envelope(
         server_tick: 0,
         sender_sequence: 0,
         correlation_id: None,
+        routing_position: None,
         message: MessagePayload::Control(ControlPayload::EntityLeft(EntityLeft { reason })),
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::result_unit_err)]
+struct SnapshotPayload(Vec<u8>);
+
+impl std::fmt::Write for SnapshotPayload {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if value.len() > MAX_PAYLOAD_BYTES as usize - self.0.len() {
+            return Err(std::fmt::Error);
+        }
+        self.0.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn bounded_snapshot_payload(
+    snapshot: &woven_core::SessionSnapshot,
+) -> Result<Vec<u8>, std::fmt::Error> {
+    // Debug-formatted snapshots can expand byte vectors substantially; stop at the wire ceiling.
+    let mut payload = SnapshotPayload(Vec::new());
+    std::fmt::write(&mut payload, format_args!("{snapshot:?}"))?;
+    Ok(payload.0)
+}
+
+#[allow(clippy::result_unit_err)]
 pub async fn handle_authenticated(
     worker: &WorkerHandle,
     connection: ConnectionId,
@@ -1219,9 +1424,42 @@ pub async fn handle_authenticated(
     write_sender: &mpsc::Sender<Envelope>,
     inference_sink: Option<&mpsc::Sender<UnroutedControl>>,
 ) -> Result<(), ()> {
+    handle_authenticated_with_capabilities(
+        worker,
+        connection,
+        envelope,
+        write_sender,
+        inference_sink,
+        0,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::result_unit_err)]
+pub async fn handle_authenticated_with_capabilities(
+    worker: &WorkerHandle,
+    connection: ConnectionId,
+    envelope: Envelope,
+    write_sender: &mpsc::Sender<Envelope>,
+    inference_sink: Option<&mpsc::Sender<UnroutedControl>>,
+    negotiated_capability_bits: u64,
+) -> Result<(), ()> {
     use woven_core::{
         ChannelId, NamespaceId, SessionId, SessionKey, SpaceEpoch, SpaceId, SpaceKey,
     };
+
+    if envelope.routing_position.is_some()
+        && negotiated_capability_bits & CAPABILITY_POSITIONED_ENTITY_STATE == 0
+    {
+        send_error(
+            write_sender,
+            envelope.message_kind(),
+            ProtocolErrorCode::UnsupportedMessage,
+            "positioned EntityState capability was not negotiated".to_owned(),
+        )
+        .await;
+        return Err(());
+    }
     if let Some(sink) = inference_sink
         && matches!(
             envelope.message,
@@ -1252,6 +1490,39 @@ pub async fn handle_authenticated(
     ) {
         return admission::handle(worker, connection, envelope, write_sender).await;
     }
+    if let MessagePayload::Control(ControlPayload::ClientLog(log)) = &envelope.message {
+        let result = if negotiated_capability_bits & woven_protocol::CAPABILITY_CLIENT_LOG == 0 {
+            Err(ProtocolErrorCode::UnsupportedMessage)
+        } else if envelope.delivery_class != DeliveryClass::ReliableOrdered
+            || envelope.space_id != 0
+            || envelope.space_epoch != 0
+            || envelope.channel_id.is_some()
+            || envelope.entity_id.is_some()
+            || envelope.routing_position.is_some()
+        {
+            Err(ProtocolErrorCode::InvalidScope)
+        } else if let Err(code) = logging::validate_log(log) {
+            Err(code)
+        } else {
+            worker
+                .capture_client_log(connection, session, log.clone())
+                .await
+        };
+        if let Err(code) = result {
+            let mut response = Envelope::control(
+                DeliveryClass::ReliableOrdered,
+                ControlPayload::ProtocolError(ProtocolError {
+                    code,
+                    related_message_kind: MessageKind::ClientLog,
+                    message: "client log rejected".to_owned(),
+                }),
+            );
+            response.correlation_id = envelope.correlation_id;
+            return send_envelope(write_sender, response).await;
+        }
+        // No peer relay, outbound drain, or successful-log acknowledgement.
+        return Ok(());
+    }
     let space = SpaceKey {
         session,
         space: SpaceId::new(envelope.space_id),
@@ -1269,10 +1540,18 @@ pub async fn handle_authenticated(
         {
             Ok(CommandResult::Snapshot(snapshot)) => {
                 let mut response = envelope;
-                response.message = MessagePayload::Snapshot(OpaquePayload {
-                    type_id: 1,
-                    bytes: format!("{snapshot:?}").into_bytes(),
-                });
+                response.message = match bounded_snapshot_payload(&snapshot) {
+                    Ok(bytes) => MessagePayload::Snapshot(OpaquePayload { type_id: 1, bytes }),
+                    Err(_) => {
+                        MessagePayload::Control(ControlPayload::ProtocolError(ProtocolError {
+                            code: ProtocolErrorCode::PayloadTooLarge,
+                            related_message_kind: MessageKind::SnapshotRequest,
+                            message: format!(
+                                "snapshot payload exceeds limit {MAX_PAYLOAD_BYTES} bytes"
+                            ),
+                        }))
+                    }
+                };
                 send_envelope(write_sender, response).await
             }
             Ok(_) => Err(()),
@@ -1361,13 +1640,18 @@ pub async fn handle_authenticated(
         }
         MessagePayload::ReliableEvent(payload) | MessagePayload::EntityState(payload) => {
             let delivery = core_delivery(envelope.delivery_class).ok_or(())?;
-            let persistence = if matches!(envelope.message, MessagePayload::EntityState(_)) {
-                PersistenceClass::Stateful { ttl: None }
-            } else {
-                PersistenceClass::Ephemeral
-            };
             let entity = envelope.entity_id.map(woven_core::EntityId::new);
             let channel = ChannelId::new(envelope.channel_id.ok_or(())?);
+            let persistence = match worker
+                .channel_persistence(connection, session, channel)
+                .await
+            {
+                Ok(persistence) => persistence,
+                Err(error) => {
+                    send_transport_error(write_sender, envelope.message_kind(), &error).await;
+                    return Err(());
+                }
+            };
             Command::Publish(PublishRequest {
                 connection,
                 session,
@@ -1383,6 +1667,13 @@ pub async fn handle_authenticated(
                 } else {
                     None
                 },
+                routing_position: envelope.routing_position.map(|position| {
+                    woven_core::EntityPosition::Cartesian3D {
+                        x: position.x,
+                        y: position.y,
+                        z: position.z,
+                    }
+                }),
                 payload: payload.bytes.clone(),
             })
         }
@@ -1400,19 +1691,14 @@ pub async fn handle_authenticated(
     match worker.execute(command).await {
         Ok(_) => {}
         Err(error) => {
-            let code = match &error {
-                TransportError::Core(core_error) => core_error_code(core_error),
-                TransportError::WorkerUnavailable | TransportError::UnknownConnection => {
-                    ProtocolErrorCode::Internal
-                }
-            };
-            send_error(
-                write_sender,
-                envelope.message_kind(),
-                code,
-                error.to_string(),
-            )
-            .await;
+            if envelope.delivery_class == DeliveryClass::UnreliableSequenced
+                && matches!(error, TransportError::Core(CoreError::StaleSequence { .. }))
+            {
+                // Datagram reordering is expected; the core has rejected this update atomically.
+                tracing::trace!(?connection, ?error, "dropping stale unreliable state");
+                return Ok(());
+            }
+            send_transport_error(write_sender, envelope.message_kind(), &error).await;
             return Err(());
         }
     }
@@ -1461,6 +1747,12 @@ pub fn outbound_envelope(message: woven_core::OutboundMessage) -> Envelope {
         server_tick: 0,
         sender_sequence: message.sequence,
         correlation_id: None,
+        routing_position: message.routing_position.map(|position| match position {
+            woven_core::EntityPosition::Cartesian3D { x, y, z } => RoutingPosition3D { x, y, z },
+            woven_core::EntityPosition::Cartesian2D { .. } => {
+                unreachable!("wire routing positions are 3D-only")
+            }
+        }),
         message: payload,
     }
 }
@@ -1516,6 +1808,20 @@ pub fn protocol_delivery(delivery: CoreDelivery) -> DeliveryClass {
         CoreDelivery::UnreliableSequenced => DeliveryClass::UnreliableSequenced,
         CoreDelivery::BestEffortEvent => DeliveryClass::BestEffortEvent,
     }
+}
+
+async fn send_transport_error(
+    sender: &mpsc::Sender<Envelope>,
+    related: MessageKind,
+    error: &TransportError,
+) {
+    let code = match error {
+        TransportError::Core(error) => core_error_code(error),
+        TransportError::WorkerUnavailable | TransportError::UnknownConnection => {
+            ProtocolErrorCode::Internal
+        }
+    };
+    send_error(sender, related, code, error.to_string()).await;
 }
 
 #[must_use]

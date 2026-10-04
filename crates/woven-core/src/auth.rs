@@ -174,6 +174,10 @@ impl AuthenticatedPrincipal {
     pub const fn grants(&self) -> &AuthorizationGrants {
         &self.grants
     }
+
+    pub(crate) const fn grants_mut(&mut self) -> &mut AuthorizationGrants {
+        &mut self.grants
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -3,7 +3,7 @@ use std::future::{Future, Ready, ready};
 
 use crate::OutboundMessage;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JournalRecord {
     pub message: OutboundMessage,
 }

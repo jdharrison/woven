@@ -65,6 +65,7 @@ numeric_enum!(MessageKind, u8, {
     QueueClaim = 37,
     QueueCancel = 38,
     QueueUpdate = 39,
+    ClientLog = 40,
 });
 
 numeric_enum!(DeliveryClass, u8, {
@@ -83,6 +84,19 @@ impl DeliveryClass {
     pub const fn is_unreliable(self) -> bool {
         matches!(self, Self::UnreliableSequenced | Self::BestEffortEvent)
     }
+}
+
+numeric_enum!(LogLevel, u8, {
+    Unknown = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientLog {
+    pub level: LogLevel,
+    pub message: String,
 }
 
 numeric_enum!(AuthenticationScheme, u8, {
@@ -306,6 +320,7 @@ pub struct ToolCallCompleted {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlPayload {
+    ClientLog(ClientLog),
     RequestAdmission(RequestAdmission),
     AdmissionResult(AdmissionResult),
     QueueStatusRequest(QueueStatusRequest),
@@ -348,6 +363,7 @@ impl ControlPayload {
     #[must_use]
     pub const fn message_kind(&self) -> MessageKind {
         match self {
+            Self::ClientLog(_) => MessageKind::ClientLog,
             Self::RequestAdmission(_) => MessageKind::RequestAdmission,
             Self::AdmissionResult(_) => MessageKind::AdmissionResult,
             Self::QueueStatusRequest(_) => MessageKind::QueueStatusRequest,
@@ -397,6 +413,7 @@ impl ControlPayload {
                 .server_name
                 .len()
                 .saturating_add(value.server_version.len()),
+            Self::ClientLog(value) => value.message.len(),
             Self::RequestAdmission(value) => value.idempotency_key.len(),
 
             Self::Authenticate(value) => value.credentials.len(),
@@ -535,7 +552,21 @@ impl MessagePayload {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoutingPosition3D {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl RoutingPosition3D {
+    #[must_use]
+    pub const fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Envelope {
     pub protocol_version: u16,
     pub delivery_class: DeliveryClass,
@@ -548,6 +579,7 @@ pub struct Envelope {
     pub server_tick: u64,
     pub sender_sequence: u64,
     pub correlation_id: Option<u64>,
+    pub routing_position: Option<RoutingPosition3D>,
     pub message: MessagePayload,
 }
 
@@ -566,6 +598,7 @@ impl Envelope {
             server_tick: 0,
             sender_sequence: 0,
             correlation_id: None,
+            routing_position: None,
             message,
         }
     }

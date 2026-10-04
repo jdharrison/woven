@@ -208,7 +208,7 @@ enum TicketState {
     Offered(Instant),
     Expired,
     Cancelled,
-    Admitted,
+    Admitted(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -311,7 +311,7 @@ impl AdmissionController {
                 TicketState::Waiting | TicketState::Offered(_) => {
                     return JoinDecision::Queued(entry.ticket.clone());
                 }
-                TicketState::Admitted | TicketState::Expired | TicketState::Cancelled => {}
+                TicketState::Admitted(_) | TicketState::Expired | TicketState::Cancelled => {}
             }
         }
 
@@ -382,7 +382,7 @@ impl AdmissionController {
                 self.promote_at(now);
                 CancelResult::Cancelled
             }
-            TicketState::Admitted => CancelResult::AlreadyAdmitted,
+            TicketState::Admitted(_) => CancelResult::AlreadyAdmitted,
             TicketState::Expired | TicketState::Cancelled => CancelResult::AlreadyExpired,
         }
     }
@@ -397,7 +397,7 @@ impl AdmissionController {
             let entry = self.tickets.get_mut(&id).ok_or(ClaimError::Missing)?;
             match entry.state {
                 TicketState::Offered(_) => {
-                    entry.state = TicketState::Admitted;
+                    entry.state = TicketState::Admitted(self.next_lease);
                     entry.terminal_at = Some(now);
                     self.idempotency_index
                         .remove(&(entry.ticket.principal, entry.ticket.idempotency_key.clone()));
@@ -406,12 +406,40 @@ impl AdmissionController {
                 TicketState::Waiting => return Err(ClaimError::NotOffered),
                 TicketState::Expired => return Err(ClaimError::Expired),
                 TicketState::Cancelled => return Err(ClaimError::Cancelled),
-                TicketState::Admitted => return Err(ClaimError::AlreadyAdmitted),
+                TicketState::Admitted(_) => return Err(ClaimError::AlreadyAdmitted),
             }
         };
         self.counters.increment_promoted_players();
         self.prune_terminal_at(now);
         Ok(self.admit(principal, now))
+    }
+
+    /// Only the owning core may abandon a newly claimed lease that failed membership binding.
+    /// Pairing ticket and lease IDs protects other admitted claims for the same principal; a
+    /// terminal ticket already evicted by bounded history pruning still releases its fresh lease.
+    pub(crate) fn rollback_claim_at(
+        &mut self,
+        ticket: QueueTicketId,
+        lease: AdmissionLease,
+        now: Instant,
+    ) {
+        if !self.has_active_lease(lease) {
+            return;
+        }
+        if let Some(entry) = self.tickets.get(&ticket) {
+            if entry.ticket.principal != lease.principal
+                || !matches!(entry.state, TicketState::Admitted(id) if id == lease.id)
+            {
+                return;
+            }
+            if let Some(removed) = self.tickets.remove(&ticket) {
+                let key = (removed.ticket.principal, removed.ticket.idempotency_key);
+                if self.idempotency_index.get(&key) == Some(&ticket) {
+                    self.idempotency_index.remove(&key);
+                }
+            }
+        }
+        self.release_at(lease, ReleaseReason::Intentional, now);
     }
 
     pub fn release_at(&mut self, lease: AdmissionLease, reason: ReleaseReason, now: Instant) {
@@ -633,7 +661,7 @@ impl AdmissionController {
                     .map_or(0, |position| position + 1),
             },
             TicketState::Offered(_) => QueueStatus::Offered,
-            TicketState::Admitted => QueueStatus::Admitted,
+            TicketState::Admitted(_) => QueueStatus::Admitted,
             TicketState::Expired => QueueStatus::Expired,
             TicketState::Cancelled => QueueStatus::Cancelled,
         }
@@ -846,6 +874,129 @@ mod tests {
         }
         assert_eq!((admitted, queued), (10, 5));
         assert_eq!(controller.snapshot().active_ccu, 10);
+    }
+
+    #[test]
+    fn claim_rollback_pairs_ticket_and_lease_and_preserves_genuine_admissions() {
+        let now = Instant::now();
+        let mut controller = controller(2);
+        let JoinDecision::Admitted(first) = controller.request_join_at(join(1, "first"), now)
+        else {
+            panic!("first permit")
+        };
+        let JoinDecision::Admitted(occupant) = controller.request_join_at(join(3, "occupant"), now)
+        else {
+            panic!("second permit")
+        };
+        let JoinDecision::Queued(genuine) = controller.request_join_at(join(2, "genuine"), now)
+        else {
+            panic!("queued genuine claim")
+        };
+        controller.release_at(first, ReleaseReason::Intentional, now);
+        let genuine_lease = controller.claim_offer_at(genuine.id, now).unwrap();
+        let JoinDecision::Queued(failed) = controller.request_join_at(join(2, "failed"), now)
+        else {
+            panic!("another queued claim for the same principal")
+        };
+        controller.release_at(occupant, ReleaseReason::Intentional, now);
+        let failed_lease = controller.claim_offer_at(failed.id, now).unwrap();
+        assert_eq!(genuine_lease.principal, failed_lease.principal);
+        assert_ne!(genuine_lease.id, failed_lease.id);
+        controller.rollback_claim_at(genuine.id, failed_lease, now);
+        controller.rollback_claim_at(
+            failed.id,
+            AdmissionLease {
+                principal: PrincipalId::new(99),
+                ..failed_lease
+            },
+            now,
+        );
+        controller.rollback_claim_at(
+            failed.id,
+            AdmissionLease {
+                session: SessionKey::new(crate::NamespaceId::new(2), crate::SessionId::new(2)),
+                ..failed_lease
+            },
+            now,
+        );
+        assert_eq!(controller.snapshot().active_ccu, 2);
+        assert_eq!(
+            controller.queue_status_at(genuine.id, now),
+            QueueStatus::Admitted
+        );
+        assert_eq!(
+            controller.queue_status_at(failed.id, now),
+            QueueStatus::Admitted
+        );
+        controller.rollback_claim_at(failed.id, failed_lease, now);
+        controller.rollback_claim_at(failed.id, failed_lease, now);
+        assert!(!controller.has_ticket(failed.id));
+        assert_eq!(
+            controller.queue_status_at(failed.id, now),
+            QueueStatus::Missing
+        );
+        assert_eq!(
+            controller.claim_offer_at(failed.id, now),
+            Err(ClaimError::Missing)
+        );
+        assert_eq!(controller.snapshot().active_ccu, 1);
+        assert!(controller.has_active_lease(genuine_lease));
+        assert_eq!(
+            controller.queue_status_at(genuine.id, now),
+            QueueStatus::Admitted
+        );
+        assert_eq!(
+            controller.claim_offer_at(genuine.id, now),
+            Err(ClaimError::AlreadyAdmitted)
+        );
+        assert_eq!(
+            controller.cancel_at(genuine.id, now),
+            CancelResult::AlreadyAdmitted
+        );
+        assert!(matches!(
+            controller.request_join_at(join(2, "failed"), now),
+            JoinDecision::Admitted(_)
+        ));
+        assert_eq!(controller.snapshot().active_ccu, 2);
+    }
+
+    #[test]
+    fn claim_rollback_releases_lease_even_if_bounded_terminal_history_pruned_ticket() {
+        let now = Instant::now();
+        let mut controller = controller(1);
+        let JoinDecision::Admitted(first) = controller.request_join_at(join(1, "first"), now)
+        else {
+            panic!("first permit")
+        };
+        let JoinDecision::Queued(ticket) = controller.request_join_at(join(2, "queued"), now)
+        else {
+            panic!("queue")
+        };
+        // Claiming the oldest ticket at the same timestamp exceeds the terminal-history cap,
+        // so normal claim pruning evicts that record before membership binding can fail.
+        for _ in 0..1024 {
+            let JoinDecision::Queued(cancelled) =
+                controller.request_join_at(join(3, "terminal-history"), now)
+            else {
+                panic!("queued terminal-history entry")
+            };
+            assert_eq!(
+                controller.cancel_at(cancelled.id, now),
+                CancelResult::Cancelled
+            );
+        }
+        controller.release_at(first, ReleaseReason::Intentional, now);
+        let claimed = controller.claim_offer_at(ticket.id, now).unwrap();
+        assert!(!controller.has_ticket(ticket.id));
+        assert!(controller.has_active_lease(claimed));
+        controller.rollback_claim_at(ticket.id, claimed, now);
+        assert!(!controller.has_active_lease(claimed));
+        assert_eq!(
+            controller.queue_status_at(ticket.id, now),
+            QueueStatus::Missing
+        );
+        assert_eq!(controller.snapshot().active_ccu, 0);
+        assert_eq!(controller.snapshot().available_slots, 1);
     }
 
     #[test]

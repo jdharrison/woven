@@ -21,6 +21,7 @@ fn message(
         delivery,
         persistence: PersistenceClass::Ephemeral,
         coalesce_key: key,
+        routing_position: None,
         payload: sequence.to_be_bytes().to_vec(),
     }
 }

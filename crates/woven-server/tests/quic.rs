@@ -11,7 +11,7 @@ use tokio::{
     net::TcpStream,
 };
 use woven_client::{Client, ClientConfig, ClientError};
-use woven_protocol::{ControlPayload, MessagePayload, ProtocolErrorCode};
+use woven_protocol::{CodecError, ControlPayload, MessagePayload, ProtocolErrorCode};
 use woven_server::serve_dev_ephemeral;
 
 async fn start_server() -> String {
@@ -27,6 +27,8 @@ async fn capabilities_reports_quic_and_webtransport() {
     assert!(body.contains("\"quic\""));
     assert!(body.contains("\"webtransport\""));
     assert!(!body.contains("\"websocket\""));
+    assert!(body.contains("\"max_frame_bytes\":1048576"));
+    assert!(body.contains("\"max_payload_bytes\":65536"));
     // The WebTransport endpoint is advertised as a relative `port/path` that a
     // client resolves against the host it used for the control plane.
     let wt = urls.webtransport.trim_start_matches("wtransport://");
@@ -194,6 +196,155 @@ async fn latest_value_replaces_pending_state_for_recipients() {
             .unwrap()
             .is_none()
     );
+}
+
+async fn assert_payload_guardrails(url: String) {
+    let mut client = Client::connect(ClientConfig {
+        url: url.clone(),
+        token: "dev-token".to_owned(),
+        // Larger receive budgets must not raise the server's publish ceiling.
+        max_payload_bytes: 256 * 1024,
+        ..ClientConfig::default()
+    })
+    .await
+    .unwrap();
+    client.join_session(1, 1).await.unwrap();
+    client.subscribe_space(1, 1, 1, 1, 1).await.unwrap();
+    let entity = receive_assigned_entity(&mut client).await;
+    for state in [false, true] {
+        let channel = if state { 2 } else { 1 };
+        let error = if state {
+            client
+                .publish_state(1, 1, 1, 1, channel, entity, 1, 7, vec![255; 65_537])
+                .await
+        } else {
+            client
+                .publish_event(1, 1, 1, 1, channel, entity, 1, 7, vec![255; 65_537])
+                .await
+        };
+        assert!(matches!(
+            error,
+            Err(ClientError::Protocol(CodecError::PayloadTooLarge {
+                actual: 65_537,
+                maximum: 65_536
+            }))
+        ));
+        if state {
+            client
+                .publish_state(1, 1, 1, 1, channel, entity, 1, 7, vec![255; 65_536])
+                .await
+                .unwrap();
+        } else {
+            client
+                .publish_event(1, 1, 1, 1, channel, entity, 1, 7, vec![255; 65_536])
+                .await
+                .unwrap();
+        }
+        let received = tokio::time::timeout(Duration::from_secs(1), client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.payload_bytes(), vec![255; 65_536]);
+    }
+    client
+        .close_gracefully(Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let mut limited = Client::connect(ClientConfig {
+        url,
+        token: "dev-token".to_owned(),
+        max_payload_bytes: 128,
+        ..ClientConfig::default()
+    })
+    .await
+    .unwrap();
+    let error = limited
+        .publish_state(1, 1, 1, 1, 2, 1, 1, 7, vec![0; 129])
+        .await;
+    assert!(matches!(
+        error,
+        Err(ClientError::Protocol(CodecError::PayloadTooLarge {
+            actual: 129,
+            maximum: 128
+        }))
+    ));
+    limited
+        .close_gracefully(Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn quic_client_enforces_payload_guardrails() {
+    assert_payload_guardrails(start_server().await).await;
+}
+
+#[tokio::test]
+async fn webtransport_client_enforces_payload_guardrails() {
+    assert_payload_guardrails(serve_dev_ephemeral(false).await.unwrap().webtransport).await;
+}
+
+#[tokio::test]
+async fn oversized_snapshots_return_error_without_closing_connection() {
+    let urls = serve_dev_ephemeral(false).await.unwrap();
+    for url in [urls.quic, urls.webtransport] {
+        let mut client = Client::connect(ClientConfig {
+            url,
+            token: "dev-token".to_owned(),
+            ..ClientConfig::default()
+        })
+        .await
+        .unwrap();
+        client.join_session(1, 1).await.unwrap();
+        client.subscribe_space(1, 1, 1, 1, 2).await.unwrap();
+        let entity = receive_assigned_entity(&mut client).await;
+        client
+            .publish_state(1, 1, 1, 1, 2, entity, 1, 7, vec![0; 32_768])
+            .await
+            .unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(1), client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.payload_bytes().len(), 32_768);
+
+        client.request_snapshot(1, 1, 1, 1, 2).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let MessagePayload::Control(ControlPayload::ProtocolError(error)) = response.message else {
+            panic!("expected a bounded snapshot error");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::PayloadTooLarge);
+        assert_eq!(
+            error.related_message_kind,
+            woven_protocol::MessageKind::SnapshotRequest
+        );
+        assert!(error.message.contains("65536 bytes"));
+        assert_eq!(response.space_id, 1);
+
+        client
+            .publish_state(1, 1, 1, 1, 2, entity, 2, 7, b"small delta".to_vec())
+            .await
+            .unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(1), client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.payload_bytes(), b"small delta");
+        client.request_snapshot(1, 1, 1, 1, 2).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(snapshot.message, MessagePayload::Snapshot(_)));
+        client
+            .close_gracefully(Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

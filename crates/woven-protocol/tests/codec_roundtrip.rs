@@ -4,10 +4,70 @@ use woven_protocol::{
     Envelope, Hello, InferenceAccepted, InferenceCancelled, InferenceCompleted, InferenceExpired,
     InferenceFailed, InferenceProgress, InferenceRequested, InferenceStreamChunk, JoinSession,
     LeaveSession, MessageKind, MessagePayload, OpaquePayload, Ping, Pong, ProtocolError,
-    ProtocolErrorCode, SnapshotRequest, SpaceTransition, SubscribeSpace, SubscriptionAccepted,
-    SubscriptionRejected, SubscriptionRejectionCode, ToolCallAccepted, ToolCallCompleted,
-    ToolCallProposed, ToolCallRejected, ToolCallRejectionCode, UnsubscribeSpace,
+    ProtocolErrorCode, RoutingPosition3D, SnapshotRequest, SpaceTransition, SubscribeSpace,
+    SubscriptionAccepted, SubscriptionRejected, SubscriptionRejectionCode, ToolCallAccepted,
+    ToolCallCompleted, ToolCallProposed, ToolCallRejected, ToolCallRejectionCode, UnsubscribeSpace,
 };
+
+fn positioned_state() -> Envelope {
+    let mut envelope = Envelope::entity_state(
+        DeliveryClass::UnreliableSequenced,
+        OpaquePayload {
+            type_id: 7,
+            bytes: vec![1, 2, 3],
+        },
+    );
+    envelope.namespace_id = 1;
+    envelope.session_id = 2;
+    envelope.space_id = 3;
+    envelope.channel_id = Some(4);
+    envelope.entity_id = Some(5);
+    envelope.space_epoch = 1;
+    envelope.sender_sequence = 1;
+    envelope.routing_position = Some(RoutingPosition3D {
+        x: -1.25,
+        y: 2.5,
+        z: 3.75,
+    });
+    envelope
+}
+
+#[test]
+fn positioned_entity_state_roundtrips_and_rejects_invalid_attachments() {
+    let codec = Codec::default();
+    let envelope = positioned_state();
+    assert_eq!(
+        codec.decode(&codec.encode(&envelope).unwrap()).unwrap(),
+        envelope
+    );
+
+    let mut non_finite = positioned_state();
+    non_finite.routing_position.as_mut().unwrap().x = f64::NAN;
+    assert!(matches!(
+        codec.encode(&non_finite),
+        Err(CodecError::InvalidSemantics { .. })
+    ));
+
+    let mut event = Envelope::reliable_event(
+        DeliveryClass::ReliableOrdered,
+        OpaquePayload {
+            type_id: 1,
+            bytes: vec![],
+        },
+    );
+    event.namespace_id = 1;
+    event.session_id = 2;
+    event.space_id = 3;
+    event.channel_id = Some(4);
+    event.entity_id = Some(5);
+    event.space_epoch = 1;
+    event.sender_sequence = 1;
+    event.routing_position = envelope.routing_position;
+    assert!(matches!(
+        codec.encode(&event),
+        Err(CodecError::InvalidSemantics { .. })
+    ));
+}
 
 fn envelope_for_control(payload: ControlPayload) -> Envelope {
     let kind = payload.message_kind();
@@ -42,7 +102,7 @@ fn envelope_for_control(payload: ControlPayload) -> Envelope {
             envelope.session_id = 20;
             envelope.correlation_id = Some(1);
         }
-        MessageKind::JoinSession | MessageKind::LeaveSession => {
+        MessageKind::JoinSession | MessageKind::LeaveSession | MessageKind::ClientLog => {
             envelope.namespace_id = 10;
             envelope.session_id = 20;
         }
@@ -277,6 +337,91 @@ fn opaque_domain_payloads_roundtrip_with_required_channel_scope() {
             .expect("domain message should encode");
         assert_eq!(codec.decode(&frame), Ok(expected));
     }
+}
+
+#[test]
+fn default_payload_limit_accepts_64_kib_and_rejects_one_byte_more() {
+    const MAX_PAYLOAD_BYTES: usize = 65_536;
+    let codec = Codec::default();
+    assert_eq!(codec.limits().max_payload_len, MAX_PAYLOAD_BYTES);
+    let permissive =
+        Codec::new(CodecLimits::new(codec.limits().max_frame_len, MAX_PAYLOAD_BYTES + 1).unwrap())
+            .unwrap();
+
+    for kind in [
+        MessageKind::EntityState,
+        MessageKind::ReliableEvent,
+        MessageKind::Snapshot,
+    ] {
+        for size in [MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES + 1] {
+            let payload = OpaquePayload {
+                type_id: 1,
+                bytes: vec![255; size],
+            };
+            let mut envelope = match kind {
+                MessageKind::EntityState => {
+                    Envelope::entity_state(DeliveryClass::LatestValue, payload)
+                }
+                MessageKind::ReliableEvent => {
+                    Envelope::reliable_event(DeliveryClass::ReliableOrdered, payload)
+                }
+                MessageKind::Snapshot => {
+                    Envelope::snapshot(DeliveryClass::ReliableOrdered, payload)
+                }
+                _ => unreachable!(),
+            };
+            envelope.namespace_id = 1;
+            envelope.session_id = 1;
+            envelope.space_id = 1;
+            envelope.channel_id = Some(1);
+            envelope.entity_id = Some(1);
+            envelope.space_epoch = 1;
+            let frame = permissive.encode(&envelope).unwrap();
+            if size == MAX_PAYLOAD_BYTES {
+                assert_eq!(codec.encode(&envelope).unwrap(), frame);
+                assert_eq!(codec.decode(&frame).unwrap(), envelope);
+            } else {
+                let expected = CodecError::PayloadTooLarge {
+                    actual: size,
+                    maximum: MAX_PAYLOAD_BYTES,
+                };
+                assert_eq!(codec.encode(&envelope), Err(expected.clone()));
+                assert_eq!(codec.decode(&frame), Err(expected));
+            }
+        }
+    }
+}
+
+#[test]
+fn default_control_payload_limit_counts_combined_utf8_bytes() {
+    let codec = Codec::default();
+    let permissive = Codec::new(CodecLimits::new(1024 * 1024, 65_537).unwrap()).unwrap();
+    let mut hello = Hello {
+        min_protocol_version: 1,
+        max_protocol_version: 1,
+        client_name: "é".repeat(32_768),
+        client_version: String::new(),
+        capability_bits: 0,
+        max_frame_size: 1_048_576,
+        max_payload_size: 65_536,
+    };
+    let at_limit = envelope_for_control(ControlPayload::Hello(hello.clone()));
+    assert_eq!(
+        codec.decode(&codec.encode(&at_limit).unwrap()).unwrap(),
+        at_limit
+    );
+
+    hello.client_version.push('1');
+    let oversized = envelope_for_control(ControlPayload::Hello(hello));
+    let expected = CodecError::PayloadTooLarge {
+        actual: 65_537,
+        maximum: 65_536,
+    };
+    assert_eq!(codec.encode(&oversized), Err(expected.clone()));
+    assert_eq!(
+        codec.decode(&permissive.encode(&oversized).unwrap()),
+        Err(expected)
+    );
 }
 
 #[test]

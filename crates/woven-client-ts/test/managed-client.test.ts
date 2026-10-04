@@ -30,6 +30,7 @@ import {
   buildAuthenticated,
   buildCapabilities,
   buildProtocolError,
+  createEnvelope,
 } from "./wire-helpers.js";
 
 const codec = new EnvelopeCodec();
@@ -58,7 +59,7 @@ function buildAdmissionResult(
     options.pollAfterMs ?? 0,
     options.ticketRemainingMs ?? 0,
   );
-  const root = FbEnvelope.createEnvelope(
+  const root = createEnvelope(
     builder,
     1,
     MessageKind.AdmissionResult,
@@ -104,7 +105,7 @@ function buildQueueUpdate(
     options.ticketRemainingMs ?? 0,
     options.offerRemainingMs ?? 0,
   );
-  const root = FbEnvelope.createEnvelope(
+  const root = createEnvelope(
     builder,
     1,
     MessageKind.QueueUpdate,
@@ -194,6 +195,7 @@ function makeTransport(server: ManagedFakeServer): WebTransport {
     ready: Promise.resolve(),
     closed: new Promise(() => {}),
     datagrams: {
+      maxDatagramSize: 1_200,
       readable: new ReadableStream(),
       writable: new WritableStream(),
       incomingMaxAge: null,

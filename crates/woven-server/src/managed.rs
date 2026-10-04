@@ -1,11 +1,13 @@
 //! Opt-in managed QUIC/WebTransport and an independently authenticated loopback admin listener.
+#[path = "managed_logs.rs"]
+mod logs;
 #[cfg(test)]
 #[path = "managed_tests.rs"]
 mod tests;
 use crate::{
     ServerError,
     remote::{read_bounded, validate_token},
-    router_with_transports,
+    router_with_transports_and_incarnation,
 };
 use axum::{
     Json, Router,
@@ -28,9 +30,10 @@ use std::{
     time::{Duration, Instant},
 };
 use woven_core::{
-    ChannelDefinition, ChannelId, CoreConfig, Credentials, DeliveryClass, DevAuthenticator,
-    ManagedError, ManagedOutcome, ManagedRequest, NamespaceId, PersistenceClass, SessionId,
-    SessionKey, TransportIndependentWorker, WovenCore,
+    ChannelDefinition, ChannelId, CoordinateFrame, CoreConfig, Credentials, DeliveryClass,
+    DevAuthenticator, MAX_MANAGED_SPACES, MAX_MANAGED_SPATIAL_SPACES, ManagedError, ManagedOutcome,
+    ManagedRequest, NamespaceId, PersistenceClass, RoutingPolicy, SessionId, SessionKey,
+    SpaceDescriptor, SpaceEpoch, SpaceId, SpatialBounds3D, TransportIndependentWorker, WovenCore,
 };
 use woven_protocol::AuthenticationScheme;
 use woven_transport::{WorkerHandle, spawn_worker};
@@ -389,6 +392,13 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
         65536,
     ))
     .map_err(|_| invalid())?;
+    core.register_channel(ChannelDefinition::relay_owned(
+        ChannelId::new(4),
+        DeliveryClass::UnreliableSequenced,
+        PersistenceClass::Ephemeral,
+        65536,
+    ))
+    .map_err(|_| invalid())?;
 
     // No listener or worker is started until all configuration, TLS and secrets validate.
     let endpoint = server_endpoint(config.quic_bind_address, tls.quic)?;
@@ -421,12 +431,13 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
         tls.webtransport_certificate_sha256,
     ));
     let admin_router = Router::new().fallback(admin_request).with_state(state);
-    let management_router = router_with_transports(
+    let management_router = router_with_transports_and_incarnation(
         true,
         webtransport_enabled,
         webtransport_capability,
         false,
         worker.clone(),
+        Some(header::HeaderValue::from_str(&node_incarnation).map_err(|_| invalid())?),
     );
     let mut quic_config = QuicConfig::new(worker.clone());
     quic_config.expected_authentication_scheme = AuthenticationScheme::Bearer;
@@ -563,6 +574,7 @@ fn managed_error(value: ManagedError) -> Response {
         ManagedError::ScopeRetired => (StatusCode::CONFLICT, "scope_retired"),
         ManagedError::TokenConflict => (StatusCode::CONFLICT, "token_conflict"),
         ManagedError::CapacityExhausted => (StatusCode::SERVICE_UNAVAILABLE, "capacity_exhausted"),
+        ManagedError::SpaceCapacityExhausted => (StatusCode::CONFLICT, "space_capacity_exhausted"),
         ManagedError::WorkerUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable"),
     };
     error(status, code)
@@ -575,7 +587,7 @@ async fn admin_request(State(state): State<Arc<AdminState>>, request: Request) -
         } else if !state.authorized(request.headers()) {
             error(StatusCode::UNAUTHORIZED, "unauthorized")
         } else {
-            tokio::time::timeout(Duration::from_secs(5), dispatch(&state, request))
+            tokio::time::timeout(Duration::from_secs(5), dispatch_admin(&state, request))
                 .await
                 .unwrap_or_else(|_| managed_error(ManagedError::WorkerUnavailable))
         }
@@ -605,6 +617,8 @@ struct PutBody {
     revision: String,
     #[serde(rename = "allocatedCCU")]
     allocated_ccu: u32,
+    #[serde(default, deserialize_with = "optional_tick_rate_hz")]
+    tick_rate_hz: Option<u32>,
     client_token: String,
 }
 #[derive(Deserialize)]
@@ -613,6 +627,47 @@ struct PatchBody {
     revision: String,
     #[serde(rename = "allocatedCCU")]
     allocated_ccu: u32,
+    #[serde(default, deserialize_with = "optional_tick_rate_hz")]
+    tick_rate_hz: Option<u32>,
+}
+
+fn optional_tick_rate_hz<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    // Omission preserves configuration; explicit null is not a request to remove the ceiling.
+    let hz = u32::deserialize(deserializer)?;
+    if !(1..=120).contains(&hz) {
+        return Err(serde::de::Error::custom(
+            "tickRateHz must be an integer in 1..=120",
+        ));
+    }
+    Ok(Some(hz))
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Point3DBody {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bounds3DBody {
+    min: Point3DBody,
+    max: Point3DBody,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PutSpaceBody {
+    revision: String,
+    meters_per_unit: f64,
+    cell_size: f64,
+    interest_radius: f64,
+    exact_distance: bool,
+    bounds: Bounds3DBody,
 }
 
 fn invalid_body_headers(request: &Request) -> Option<Response> {
@@ -642,6 +697,14 @@ fn invalid_body_headers(request: &Request) -> Option<Response> {
     None
 }
 
+async fn dispatch_admin(state: &AdminState, request: Request) -> Response {
+    if request.uri().path() == "/v1/logs" {
+        logs::dispatch(state, request).await
+    } else {
+        dispatch(state, request).await
+    }
+}
+
 async fn dispatch(state: &AdminState, request: Request) -> Response {
     let bad = || error(StatusCode::BAD_REQUEST, "invalid_request");
     if let Some(response) = invalid_body_headers(&request) {
@@ -652,9 +715,25 @@ async fn dispatch(state: &AdminState, request: Request) -> Response {
             || json!({"enabled": false}),
             |certificate_sha256| json!({"enabled": true, "certificateSha256": certificate_sha256}),
         );
-        return Json(json!({"nodeIncarnation": state.incarnation, "transports": {"quic": true, "webTransport": webtransport}, "limits": {"maxSessions": 1024, "maxScopeHistory": 4096, "maxConnections": 4096, "maxAllocatedCCU": 4096, "maxQueueDepth": 1024}, "spaces": [{"spaceId": "1", "epoch": "1", "channelIds": ["1"]}, {"spaceId": "2", "epoch": "1", "channelIds": ["1"]}], "channels": [{"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536}]})).into_response();
+        return Json(json!({"nodeIncarnation": state.incarnation, "transports": {"quic": true, "webTransport": webtransport}, "capabilities": {"positionedEntityState": true, "managedSpatialSubspaces": true}, "limits": {"maxSessions": 1024, "maxScopeHistory": 4096, "maxConnections": 4096, "maxAllocatedCCU": 4096, "maxQueueDepth": 1024, "maxAdditionalManagedSpatialSpaces": MAX_MANAGED_SPATIAL_SPACES, "maxManagedSpaces": MAX_MANAGED_SPACES}, "spaces": [{"spaceId": "1", "epoch": "1", "channelIds": ["1", "4"], "system": true}, {"spaceId": "2", "epoch": "1", "channelIds": ["1", "4"], "system": true}], "channels": [{"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536}, {"channelId": "4", "delivery": "UnreliableSequenced", "persistence": "Ephemeral", "maxPayloadBytes": 65536}]})).into_response();
     }
     let parts = request.uri().path().split('/').collect::<Vec<_>>();
+    if parts.len() == 8
+        && parts[0].is_empty()
+        && parts[1] == "v1"
+        && parts[2] == "namespaces"
+        && parts[4] == "sessions"
+        && parts[6] == "spaces"
+    {
+        let (Some(namespace), Some(session), Some(space)) = (
+            canonical_id(parts[3]),
+            canonical_id(parts[5]),
+            canonical_id(parts[7]),
+        ) else {
+            return bad();
+        };
+        return dispatch_space(state, request, namespace, session, space).await;
+    }
     if parts.len() != 6
         || !parts[0].is_empty()
         || parts[1] != "v1"
@@ -692,36 +771,101 @@ async fn dispatch(state: &AdminState, request: Request) -> Response {
             let Ok(body) = to_bytes(request.into_body(), 8192).await else {
                 return error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large");
             };
-            if method == Method::PUT {
-                let Ok(body) = serde_json::from_slice::<PutBody>(&body) else {
-                    return bad();
-                };
-                let Some(revision) = canonical_id(&body.revision) else {
-                    return bad();
-                };
-                ManagedRequest::Put {
-                    session,
-                    revision,
-                    allocated_ccu: body.allocated_ccu,
-                    credentials: Credentials::new(body.client_token),
-                }
-            } else {
-                let Ok(body) = serde_json::from_slice::<PatchBody>(&body) else {
-                    return bad();
-                };
-                let Some(revision) = canonical_id(&body.revision) else {
-                    return bad();
-                };
-                ManagedRequest::Patch {
-                    session,
-                    revision,
-                    allocated_ccu: body.allocated_ccu,
-                }
-            }
+            let Some(command) = session_mutation(&method, session, &body) else {
+                return bad();
+            };
+            command
         }
         _ => return bad(),
     };
-    match state.worker.manage(command).await {
+    managed_response(state, state.worker.manage(command).await)
+}
+
+fn session_mutation(method: &Method, session: SessionKey, body: &[u8]) -> Option<ManagedRequest> {
+    if method == Method::PUT {
+        let body = serde_json::from_slice::<PutBody>(body).ok()?;
+        Some(ManagedRequest::Put {
+            session,
+            revision: canonical_id(&body.revision)?,
+            allocated_ccu: body.allocated_ccu,
+            tick_rate_hz: body.tick_rate_hz,
+            credentials: Credentials::new(body.client_token),
+        })
+    } else {
+        let body = serde_json::from_slice::<PatchBody>(body).ok()?;
+        Some(ManagedRequest::Patch {
+            session,
+            revision: canonical_id(&body.revision)?,
+            allocated_ccu: body.allocated_ccu,
+            tick_rate_hz: body.tick_rate_hz,
+        })
+    }
+}
+
+async fn dispatch_space(
+    state: &AdminState,
+    request: Request,
+    namespace: u64,
+    session: u64,
+    space: u64,
+) -> Response {
+    let bad = || error(StatusCode::BAD_REQUEST, "invalid_request");
+    if request.method() != Method::PUT
+        || single_header(request.headers(), "content-type") != Some("application/json")
+    {
+        return bad();
+    }
+    if single_header(request.headers(), "woven-node-incarnation")
+        != Some(state.incarnation.as_str())
+    {
+        return error(StatusCode::CONFLICT, "incarnation_conflict");
+    }
+    let Ok(body) = to_bytes(request.into_body(), 8192).await else {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large");
+    };
+    let Ok(body) = serde_json::from_slice::<PutSpaceBody>(&body) else {
+        return bad();
+    };
+    let Some(revision) = canonical_id(&body.revision) else {
+        return bad();
+    };
+    let session = SessionKey::new(NamespaceId::new(namespace), SessionId::new(session));
+    let descriptor = SpaceDescriptor {
+        id: SpaceId::new(space),
+        local_frame: CoordinateFrame::Cartesian3D {
+            meters_per_unit: body.meters_per_unit,
+        },
+        bounds: Some(SpatialBounds3D {
+            min_x: body.bounds.min.x,
+            min_y: body.bounds.min.y,
+            min_z: body.bounds.min.z,
+            max_x: body.bounds.max.x,
+            max_y: body.bounds.max.y,
+            max_z: body.bounds.max.z,
+        }),
+        parent: None,
+        epoch: SpaceEpoch::new(1),
+        routing: RoutingPolicy::SpatialGrid3D {
+            cell_size: body.cell_size,
+            interest_radius: body.interest_radius,
+            exact_distance: body.exact_distance,
+        },
+    };
+    managed_response(
+        state,
+        state
+            .worker
+            .manage(ManagedRequest::PutSpace {
+                session,
+                revision,
+                descriptor,
+            })
+            .await,
+    )
+}
+
+fn managed_response(state: &AdminState, outcome: Result<ManagedOutcome, ManagedError>) -> Response {
+    match outcome {
         Ok(ManagedOutcome::Snapshot { created, snapshot }) => {
             let mut value = serde_json::to_value(snapshot).unwrap_or_default();
             value["nodeIncarnation"] = json!(state.incarnation);

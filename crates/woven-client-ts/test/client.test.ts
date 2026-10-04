@@ -1,8 +1,14 @@
 import { test, describe, beforeEach } from "node:test";
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import * as flatbuffers from "flatbuffers";
 import { WovenClient } from "../src/client.js";
-import { EnvelopeCodec, DecodedEnvelope } from "../src/codec.js";
-import { MessageKind, ControlPayload } from "../generated/woven/protocol/v1.js";
+import {
+  CAPABILITY_POSITIONED_ENTITY_STATE,
+  EnvelopeCodec,
+  DecodedEnvelope,
+} from "../src/codec.js";
+import { MessageKind, ControlPayload, HelloPayload, InferenceRequestedPayload } from "../generated/woven/protocol/v1.js";
 import {
   WebTransport,
   WebTransportBidirectionalStream,
@@ -14,6 +20,7 @@ import {
   encodeJoinSession,
   encodeSubscribeSpace,
   encodeReliableEvent,
+  encodeEntityState,
 } from "../src/encode.js";
 import { buildAuthenticated, buildCapabilities } from "./wire-helpers.js";
 
@@ -28,6 +35,7 @@ const encoder = new TextEncoder();
  */
 class FakeServer {
   readonly requests: DecodedEnvelope[] = [];
+  writeCount = 0;
   readonly readable: ReadableStream<Uint8Array>;
   readonly writable: WritableStream<Uint8Array>;
   readonly bidi: WebTransportBidirectionalStream;
@@ -54,6 +62,7 @@ class FakeServer {
     });
     this.writable = new WritableStream({
       write(chunk: Uint8Array) {
+        self.writeCount += 1;
         self.ingest(new Uint8Array(chunk));
       },
     });
@@ -101,6 +110,7 @@ function makeWebTransport(
     ready: Promise.resolve(),
     closed,
     datagrams: {
+      maxDatagramSize: 1_200,
       readable: new ReadableStream(),
       writable: new WritableStream(),
       incomingMaxAge: null,
@@ -130,8 +140,83 @@ describe("WovenClient handshake over mocked WebTransport", () => {
     });
     assert.equal(server.requests[0]!.messageKind, MessageKind.Hello);
     assert.equal(server.requests[1]!.messageKind, MessageKind.Authenticate);
+    const packageVersion = (JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string }).version;
+    assert.equal((server.requests[0]!.control as HelloPayload).clientVersion(), packageVersion);
+    assert.equal((codec.decode(encodeHello({})).control as HelloPayload).clientVersion(), packageVersion);
     client.close();
   });
+
+  test("negotiates and publishes reliable positioned state, rejecting it when absent", async () => {
+    const unsupportedServer = new FakeServer();
+    const unsupported = await WovenClient.fromTransport(
+      makeWebTransport(unsupportedServer),
+      unsupportedServer.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+    assert.equal(unsupported.supportsPositionedState(), false);
+    const writesBefore = unsupportedServer.writeCount;
+    await assert.rejects(
+      unsupported.publishPositionedState(
+        1n, 1n, 3n, 1n, 1n, 7n, 1n, 5n,
+        { x: 1, y: 2, z: 3 }, encoder.encode("state"),
+      ),
+      { kind: "protocol", message: "server did not negotiate positioned EntityState" },
+    );
+    assert.equal(unsupportedServer.writeCount, writesBefore);
+    unsupported.close();
+
+    const positionedServer = new FakeServer(
+      true,
+      true,
+      buildCapabilities({ capabilityBits: CAPABILITY_POSITIONED_ENTITY_STATE }),
+    );
+    const positioned = await WovenClient.fromTransport(
+      makeWebTransport(positionedServer),
+      positionedServer.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+    assert.equal(positioned.supportsPositionedState(), true);
+    await positioned.publishPositionedState(
+      1n, 1n, 3n, 1n, 1n, 7n, 1n, 5n,
+      { x: 1, y: 2, z: 3 }, encoder.encode("state"),
+    );
+    const published = positionedServer.requests.at(-1)!;
+    assert.equal(published.messageKind, MessageKind.EntityState);
+    assert.deepEqual(published.routingPosition, { x: 1, y: 2, z: 3 });
+    positioned.close();
+  });
+
+  for (const method of ["connect", "fromTransport"] as const) {
+    test(`${method} normalizes oversized credentials without writing Authenticate`, async () => {
+      let closeCount = 0;
+      const transport = makeWebTransport(server, () => { closeCount += 1; });
+      if (method === "connect") {
+        (globalThis as Record<string, unknown>).WebTransport = function (_url: string) {
+          return transport;
+        } as unknown as typeof globalThis.WebTransport;
+      }
+      try {
+        const config = {
+          url: "https://localhost:4433/webtransport",
+          token: "é".repeat(32_768) + "x",
+          connectTimeoutMs: 1_000,
+        };
+        await assert.rejects(
+          method === "connect"
+            ? WovenClient.connect(config)
+            : WovenClient.fromTransport(transport, server.bidi, config),
+          { kind: "protocol", message: "payload length 65537 bytes exceeds limit 65536 bytes" },
+        );
+        assert.equal(server.writeCount, 1, "only Hello may be written");
+        assert.deepEqual(server.requests.map((request) => request.messageKind), [MessageKind.Hello]);
+        assert.equal(closeCount, 1, "failed handshake closes the transport exactly once");
+      } finally {
+        if (method === "connect") delete (globalThis as Record<string, unknown>).WebTransport;
+      }
+    });
+  }
 
   test("rejects semantically invalid Capabilities and Authenticated payloads", async () => {
     const cases = [
@@ -265,6 +350,42 @@ describe("WovenClient handshake over mocked WebTransport", () => {
     client.close();
   });
 
+  test("requestInference normalizes oversized control payloads and leaves the connection usable", async () => {
+    let closeCount = 0;
+    const client = await WovenClient.fromTransport(
+      makeWebTransport(server, () => { closeCount += 1; }),
+      server.bidi,
+      { url: "https://localhost:4433/webtransport", token: "dev-token" },
+    );
+    try {
+      const writesBefore = server.writeCount;
+      const requestsBefore = server.requests.length;
+      await assert.rejects(
+        client.requestInference(1n, 1n, 1n, 1n, 9n, "é", 500n, new Uint8Array(65_535)),
+        { kind: "protocol", message: "payload length 65537 bytes exceeds limit 65536 bytes" },
+      );
+      assert.equal(server.writeCount, writesBefore, "no transport write for rejected inference");
+      assert.equal(server.requests.length, requestsBefore);
+      assert.equal(closeCount, 0);
+
+      const input = encoder.encode("q");
+      await client.requestInference(1n, 1n, 1n, 1n, 9n, "é", 500n, input);
+      assert.equal(server.writeCount, writesBefore + 1);
+      const request = server.requests.at(-1)!;
+      assert.equal(request.messageKind, MessageKind.InferenceRequested);
+      assert.deepEqual((request.control as InferenceRequestedPayload).inputArray(), input);
+      const reply = encoder.encode("still connected");
+      server.pushFrame(encodeReliableEvent(
+        { namespaceId: 1n, sessionId: 1n, spaceId: 1n, spaceEpoch: 1n, channelId: 1n, entityId: 5n, senderSequence: 1n },
+        { typeId: 1n, bytes: reply },
+      ));
+      assert.deepEqual((await client.recv()).payload, reply);
+      assert.equal(closeCount, 0);
+    } finally {
+      client.close();
+    }
+  });
+
   test("recv yields envelopes queued by the server", async () => {
     const client = await WovenClient.fromTransport(wt, server.bidi, {
       url: "https://localhost:4433/webtransport",
@@ -336,6 +457,157 @@ describe("WovenClient handshake over mocked WebTransport", () => {
       const value = error as { kind?: string; message?: string };
       return value.kind === "protocol" && value.message?.includes("pending envelope queue") === true;
     });
+    assert.equal(closeCount, 1);
+  });
+});
+
+describe("WovenClient publishing payload bounds", () => {
+  const cases = [
+    { name: "defaults", config: {}, serverLimit: 65_536, limit: 65_536 },
+    { name: "smaller configured limit", config: { maxPayloadBytes: 128 }, serverLimit: 256, limit: 128 },
+    { name: "smaller server limit", config: { maxPayloadBytes: 256 }, serverLimit: 128, limit: 128 },
+    { name: "larger server limit", config: {}, serverLimit: 262_144, limit: 65_536 },
+    { name: "larger configured and server limits", config: { maxPayloadBytes: 262_144 }, serverLimit: 262_144, limit: 65_536 },
+  ];
+  const publishers = [
+    { method: "publishState" as const, kind: MessageKind.EntityState, encode: encodeEntityState },
+    { method: "publishEvent" as const, kind: MessageKind.ReliableEvent, encode: encodeReliableEvent },
+  ];
+
+  for (const { method, kind, encode } of publishers) {
+    for (const { name, config, serverLimit, limit } of cases) {
+      test(`${method}: ${name} accepts max, rejects max + 1, and remains usable`, async (t) => {
+        const server = new FakeServer(true, true, buildCapabilities({ maxPayloadSize: serverLimit }));
+        let closeCount = 0;
+        const client = await WovenClient.fromTransport(
+          makeWebTransport(server, () => { closeCount += 1; }),
+          server.bidi,
+          { url: "https://localhost:4433/webtransport", token: "dev-token", ...config },
+        );
+        try {
+          const writesBefore = server.writeCount;
+          const requestsBefore = server.requests.length;
+          const serialization = t.mock.method(flatbuffers.Builder.prototype, "createByteVector", () => {
+            assert.fail("oversized payload reached FlatBuffers serialization");
+          });
+          await assert.rejects(
+            client[method](1n, 1n, 1n, 1n, 1n, 1n, 1n, 1n, new Uint8Array(limit + 1)),
+            (error: unknown) => {
+              const value = error as { kind?: string; message?: string };
+              return value.kind === "protocol" &&
+                value.message === `payload length ${limit + 1} bytes exceeds limit ${limit} bytes`;
+            },
+          );
+          assert.equal(serialization.mock.calls.length, 0);
+          serialization.mock.restore();
+          assert.equal(server.writeCount, writesBefore, "no transport writes on rejection");
+          assert.equal(server.requests.length, requestsBefore);
+          assert.equal(closeCount, 0, "local payload rejection does not close the connection");
+
+          const payload = new Uint8Array(limit + 2).fill(42).subarray(1, limit + 1);
+          await client[method](1n, 1n, 1n, 1n, 1n, 1n, 1n, 1n, payload);
+          assert.equal(server.writeCount, writesBefore + 1);
+          const published = server.requests.at(-1)!;
+          assert.equal(published.messageKind, kind);
+          assert.deepEqual(published.payload, payload);
+
+          const frame = encode(
+            { namespaceId: 1n, sessionId: 1n, spaceId: 1n, spaceEpoch: 1n, channelId: 1n, entityId: 1n, senderSequence: 1n },
+            { typeId: 1n, bytes: payload },
+          );
+          assert.ok(frame.byteLength > limit, "frame includes overhead beyond payload bytes");
+          server.pushFrame(frame);
+          assert.deepEqual((await client.recv()).payload, payload);
+          assert.equal(closeCount, 0);
+        } finally {
+          client.close();
+        }
+      });
+    }
+  }
+});
+
+describe("WovenClient outgoing frame bounds", () => {
+  const scope = {
+    namespaceId: 1n, sessionId: 1n, spaceId: 3n, spaceEpoch: 1n,
+    channelId: 2n, entityId: 7n, senderSequence: 1n,
+  };
+  const position = { x: 1, y: 2, z: 3 };
+  const publishers = [
+    {
+      name: "publishEvent",
+      encode: (bytes: Uint8Array) => encodeReliableEvent(scope, { typeId: 5n, bytes }),
+      publish: (client: WovenClient, bytes: Uint8Array) =>
+        client.publishEvent(1n, 1n, 3n, 1n, 2n, 7n, 1n, 5n, bytes),
+    },
+    {
+      name: "publishState",
+      encode: (bytes: Uint8Array) => encodeEntityState(scope, { typeId: 5n, bytes }),
+      publish: (client: WovenClient, bytes: Uint8Array) =>
+        client.publishState(1n, 1n, 3n, 1n, 2n, 7n, 1n, 5n, bytes),
+    },
+    {
+      name: "publishPositionedState",
+      encode: (bytes: Uint8Array) => encodeEntityState(
+        { ...scope, routingPosition: position }, { typeId: 5n, bytes },
+      ),
+      publish: (client: WovenClient, bytes: Uint8Array) =>
+        client.publishPositionedState(1n, 1n, 3n, 1n, 2n, 7n, 1n, 5n, position, bytes),
+    },
+  ];
+
+  for (const { name, encode, publish } of publishers) {
+    for (const bound of ["configured", "server"] as const) {
+      test(`${name} enforces the ${bound} complete-frame limit without writing or closing`, async () => {
+        const payload = new Uint8Array(32);
+        const limit = encode(payload).byteLength;
+        const server = new FakeServer(true, true, buildCapabilities({
+          maxFrameSize: bound === "server" ? limit : 1_048_576,
+          maxPayloadSize: 128,
+          capabilityBits: CAPABILITY_POSITIONED_ENTITY_STATE,
+        }));
+        let closeCount = 0;
+        const client = await WovenClient.fromTransport(
+          makeWebTransport(server, () => { closeCount += 1; }), server.bidi,
+          {
+            url: "https://localhost:4433/webtransport", token: "dev-token",
+            maxFrameBytes: bound === "configured" ? limit : 1_048_576,
+            maxPayloadBytes: 128,
+          },
+        );
+        try {
+          const writesBefore = server.writeCount;
+          const oversized = new Uint8Array(128);
+          assert.ok(encode(oversized).byteLength > limit);
+          await assert.rejects(publish(client, oversized), {
+            kind: "protocol",
+            message: `encoded frame length ${encode(oversized).byteLength} bytes exceeds frame limit ${limit} bytes`,
+          });
+          assert.equal(server.writeCount, writesBefore);
+          assert.equal(closeCount, 0);
+          await publish(client, payload);
+          assert.equal(server.writeCount, writesBefore + 1);
+          assert.deepEqual(server.requests.at(-1)!.payload, payload);
+          assert.equal(closeCount, 0);
+        } finally {
+          client.close();
+        }
+      });
+    }
+  }
+
+  test("negotiated frame limits reject oversized Authenticate before writing it", async () => {
+    const server = new FakeServer(true, true, buildCapabilities({ maxFrameSize: 256, maxPayloadSize: 256 }));
+    let closeCount = 0;
+    const token = "x".repeat(256);
+    await assert.rejects(WovenClient.fromTransport(
+      makeWebTransport(server, () => { closeCount += 1; }), server.bidi,
+      { url: "https://localhost:4433/webtransport", token },
+    ), {
+      kind: "protocol",
+      message: `encoded frame length ${encodeAuthenticate(encoder.encode(token)).byteLength} bytes exceeds frame limit 256 bytes`,
+    });
+    assert.deepEqual(server.requests.map((request) => request.messageKind), [MessageKind.Hello]);
     assert.equal(closeCount, 1);
   });
 });

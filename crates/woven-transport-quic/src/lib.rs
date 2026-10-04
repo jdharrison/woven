@@ -23,10 +23,11 @@ use woven_core::{Command, CommandResult, ConnectionId, Credentials};
 use woven_protocol::{
     Authenticated, AuthenticationScheme, Capabilities, Codec, ControlPayload, DeliveryClass,
     Envelope, MessageKind, MessagePayload, PROTOCOL_VERSION, ProtocolErrorCode,
+    SUPPORTED_CAPABILITY_BITS,
 };
 use woven_transport::{
-    MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, UnroutedControl, WorkerHandle, handle_authenticated,
-    outbound_envelope, send_envelope, send_error,
+    MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, UnroutedControl, WorkerHandle,
+    handle_authenticated_with_capabilities, outbound_envelope, send_envelope, send_error,
 };
 
 const WRITE_CAPACITY: usize = 128;
@@ -34,6 +35,11 @@ const MAX_CONNECTION_TASKS: usize = 4_096;
 const INITIAL_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_PROTOCOL: u32 = 0x100;
 const CLOSE_TRANSPORT: u32 = 0x101;
+
+fn is_client_datagram(envelope: &Envelope) -> bool {
+    envelope.delivery_class == DeliveryClass::UnreliableSequenced
+        && matches!(envelope.message, MessagePayload::EntityState(_))
+}
 
 /// Configuration shared by QUIC connection handlers.
 #[derive(Clone)]
@@ -182,80 +188,97 @@ pub async fn serve_connection(connection: Connection, config: QuicConfig) {
     );
 
     let mut greeted = false;
+    let mut negotiated_capability_bits = 0;
     let mut authenticated = false;
-    loop {
-        tokio::select! {
-            _ = shutdown_receiver.recv() => break,
-            extra_stream = connection.accept_bi() => {
-                if extra_stream.is_ok() {
-                    send_error(
-                        &write_sender,
-                        MessageKind::Unknown,
-                        ProtocolErrorCode::UnsupportedMessage,
-                        "only one client bidirectional stream is supported".to_owned(),
-                    ).await;
-                }
-                break;
-            }
-            datagram = connection.read_datagram() => {
-                match datagram {
-                    Ok(bytes) => {
-                        if !authenticated {
-                            trace!(?core_connection, "dropping pre-authentication datagram");
-                            continue;
+    'connection: loop {
+        let received = {
+            // read_exact is not cancellation-safe once a prefix/body has been partly consumed.
+            let frame = read_envelope(&mut receive_stream, &codec);
+            tokio::pin!(frame);
+            loop {
+                tokio::select! {
+                    _ = shutdown_receiver.recv() => break 'connection,
+                    extra_stream = connection.accept_bi() => {
+                        if extra_stream.is_ok() {
+                            send_error(
+                                &write_sender,
+                                MessageKind::Unknown,
+                                ProtocolErrorCode::UnsupportedMessage,
+                                "only one client bidirectional stream is supported".to_owned(),
+                            ).await;
                         }
-                        match codec.decode(&bytes) {
-                            Ok(envelope) => {
-                                if handle_authenticated(
-                                    &config.worker,
-                                    core_connection,
-                                    envelope,
-                                    &write_sender,
-                                    config.inference_sink.as_ref(),
-                                ).await.is_err() {
-                                    break;
+                        break 'connection;
+                    }
+                    datagram = connection.read_datagram() => {
+                        match datagram {
+                            Ok(bytes) => {
+                                if !authenticated {
+                                    trace!(?core_connection, "dropping pre-authentication datagram");
+                                    continue;
+                                }
+                                match codec.decode(&bytes) {
+                                    Ok(envelope) if is_client_datagram(&envelope) => {
+                                        if handle_authenticated_with_capabilities(
+                                            &config.worker,
+                                            core_connection,
+                                            envelope,
+                                            &write_sender,
+                                            config.inference_sink.as_ref(),
+                                            negotiated_capability_bits,
+                                        ).await.is_err() {
+                                            break 'connection;
+                                        }
+                                    }
+                                    Ok(_) => trace!("dropping non-state or reliable client datagram"),
+                                    Err(error) => {
+                                        trace!(?error, "dropping malformed datagram");
+                                    }
                                 }
                             }
-                            Err(error) => {
-                                trace!(?error, "dropping malformed datagram");
-                            }
+                            Err(_) => break 'connection,
                         }
                     }
-                    Err(_) => break,
+                    received = &mut frame => break received,
                 }
             }
-            received = read_envelope(&mut receive_stream, &codec) => {
-                let envelope = match received {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        send_error(
-                            &write_sender,
-                            MessageKind::Unknown,
-                            ProtocolErrorCode::MalformedFrame,
-                            error,
-                        ).await;
-                        break;
-                    }
-                };
-                let result = if !greeted {
-                    handle_hello(&write_sender, &config, &envelope).await.map(|()| greeted = true)
-                } else if !authenticated {
-                    handle_authenticate(&config, core_connection, &write_sender, envelope)
-                        .await
-                        .map(|()| authenticated = true)
-                } else {
-                    handle_authenticated(
-                        &config.worker,
-                        core_connection,
-                        envelope,
-                        &write_sender,
-                        config.inference_sink.as_ref(),
-                    ).await
-                };
-                if result.is_err() {
-                    break;
-                }
+        };
+        let envelope = match received {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                send_error(
+                    &write_sender,
+                    MessageKind::Unknown,
+                    ProtocolErrorCode::MalformedFrame,
+                    error,
+                )
+                .await;
+                break;
             }
+        };
+        let result = if !greeted {
+            handle_hello(&write_sender, &config, &envelope)
+                .await
+                .map(|capabilities| {
+                    negotiated_capability_bits = capabilities;
+                    greeted = true;
+                })
+        } else if !authenticated {
+            handle_authenticate(&config, core_connection, &write_sender, envelope)
+                .await
+                .map(|()| authenticated = true)
+        } else {
+            handle_authenticated_with_capabilities(
+                &config.worker,
+                core_connection,
+                envelope,
+                &write_sender,
+                config.inference_sink.as_ref(),
+                negotiated_capability_bits,
+            )
+            .await
+        };
+        if result.is_err() {
+            break;
         }
     }
 
@@ -347,6 +370,10 @@ async fn writer_loop(
     connection: Connection,
 ) {
     while let Some(envelope) = receiver.recv().await {
+        if envelope.delivery_class == DeliveryClass::UnreliableSequenced {
+            send_datagram_envelope(&connection, &codec, &envelope);
+            continue;
+        }
         let frame = match codec.encode(&envelope) {
             Ok(frame) => frame,
             Err(_) => {
@@ -393,11 +420,8 @@ async fn handle_hello(
     write_sender: &mpsc::Sender<Envelope>,
     config: &QuicConfig,
     envelope: &Envelope,
-) -> Result<(), ()> {
-    if !matches!(
-        envelope.message,
-        MessagePayload::Control(ControlPayload::Hello(_))
-    ) {
+) -> Result<u64, ()> {
+    let MessagePayload::Control(ControlPayload::Hello(hello)) = &envelope.message else {
         send_error(
             write_sender,
             envelope.message_kind(),
@@ -406,7 +430,8 @@ async fn handle_hello(
         )
         .await;
         return Err(());
-    }
+    };
+    let negotiated = hello.capability_bits & SUPPORTED_CAPABILITY_BITS;
     send_envelope(
         write_sender,
         Envelope::control(
@@ -415,13 +440,14 @@ async fn handle_hello(
                 selected_protocol_version: PROTOCOL_VERSION,
                 server_name: config.server_name.to_string(),
                 server_version: config.server_version.to_string(),
-                capability_bits: 0,
+                capability_bits: negotiated,
                 max_frame_size: MAX_FRAME_BYTES,
                 max_payload_size: MAX_PAYLOAD_BYTES,
             }),
         ),
     )
-    .await
+    .await?;
+    Ok(negotiated)
 }
 
 #[allow(clippy::manual_let_else, clippy::single_match_else)]
@@ -500,6 +526,39 @@ async fn handle_authenticate(
 
 fn close(connection: &Connection, code: u32, reason: &[u8]) {
     connection.close(VarInt::from_u32(code), reason);
+}
+
+#[cfg(test)]
+fn test_state(entity: u64, channel: u64, sequence: u64, payload_len: usize) -> Envelope {
+    Envelope {
+        protocol_version: PROTOCOL_VERSION,
+        delivery_class: DeliveryClass::UnreliableSequenced,
+        namespace_id: 1,
+        session_id: 1,
+        space_id: 1,
+        channel_id: Some(channel),
+        entity_id: Some(entity),
+        space_epoch: 1,
+        server_tick: 0,
+        sender_sequence: sequence,
+        correlation_id: None,
+        routing_position: None,
+        message: MessagePayload::EntityState(woven_protocol::OpaquePayload {
+            type_id: 1,
+            bytes: vec![7; payload_len],
+        }),
+    }
+}
+
+#[cfg(test)]
+fn test_reliable(entity: u64, sequence: u64, payload: &[u8]) -> Envelope {
+    let mut envelope = test_state(entity, 1, sequence, 0);
+    envelope.delivery_class = DeliveryClass::ReliableOrdered;
+    envelope.message = MessagePayload::ReliableEvent(woven_protocol::OpaquePayload {
+        type_id: 1,
+        bytes: payload.to_vec(),
+    });
+    envelope
 }
 
 #[cfg(test)]
@@ -636,6 +695,7 @@ mod tests {
                         server_tick: 0,
                         sender_sequence: 1,
                         correlation_id: None,
+                        routing_position: None,
                         message: MessagePayload::ReliableEvent(OpaquePayload {
                             type_id: 1,
                             bytes: b"hello-quic".to_vec(),
@@ -731,6 +791,7 @@ mod tests {
                 server_tick: 0,
                 sender_sequence: 1,
                 correlation_id: None,
+                routing_position: None,
                 message: MessagePayload::EntityState(OpaquePayload {
                     type_id: 1,
                     bytes: b"datagram-payload".to_vec(),
@@ -756,6 +817,309 @@ mod tests {
         client_endpoint.close(VarInt::from_u32(0), b"done");
         client_endpoint2.close(VarInt::from_u32(0), b"done");
         endpoint.close(VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded connection exercises writer and timer phases"
+    )]
+    async fn ephemeral_datagrams_cover_writer_timer_reordering_ingress_and_oversize_drop() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (endpoint, worker, address, certificate) = setup_server();
+            let (connection, mut send, mut recv, codec, client_endpoint) =
+                connect_client(address, certificate).await;
+            perform_handshake(&mut send, &mut recv, &codec).await;
+            join_and_subscribe(&mut send, &mut recv, &codec, 1, 1).await;
+            let entity = recv_subscription_accepted_and_entity(&mut recv, &codec).await;
+            let core_connection = ConnectionId::new(1);
+            let session = woven_core::SessionKey::new(
+                woven_core::NamespaceId::new(1),
+                woven_core::SessionId::new(1),
+            );
+
+            let mut leave = Envelope::control(
+                DeliveryClass::ReliableOrdered,
+                ControlPayload::LeaveSession(woven_protocol::LeaveSession {
+                    reason: "must stay joined".into(),
+                }),
+            );
+            leave.namespace_id = 1;
+            leave.session_id = 1;
+            connection
+                .send_datagram(codec.encode(&leave).unwrap().into())
+                .unwrap();
+            let mut reliable_state = test_state(entity, 2, 1, 25);
+            reliable_state.delivery_class = DeliveryClass::LatestValue;
+            connection
+                .send_datagram(codec.encode(&reliable_state).unwrap().into())
+                .unwrap();
+            connection
+                .send_datagram(codec.encode(&test_state(entity, 4, 2, 25)).unwrap().into())
+                .unwrap();
+            assert_eq!(recv_datagram(&connection, &codec).await.sender_sequence, 2);
+            for sequence in [1, 2] {
+                connection
+                    .send_datagram(
+                        codec
+                            .encode(&test_state(entity, 4, sequence, 25))
+                            .unwrap()
+                            .into(),
+                    )
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), connection.read_datagram())
+                    .await
+                    .is_err()
+            );
+            connection
+                .send_datagram(codec.encode(&test_state(entity, 4, 3, 25)).unwrap().into())
+                .unwrap();
+            assert_eq!(recv_datagram(&connection, &codec).await.sender_sequence, 3);
+
+            worker
+                .execute(Command::Publish(woven_core::PublishRequest {
+                    connection: core_connection,
+                    session,
+                    space: woven_core::SpaceId::new(1),
+                    space_epoch: woven_core::SpaceEpoch::new(1),
+                    entity: Some(woven_core::EntityId::new(entity)),
+                    channel: woven_core::ChannelId::new(4),
+                    sequence: 4,
+                    delivery: woven_core::DeliveryClass::UnreliableSequenced,
+                    persistence: woven_core::PersistenceClass::Ephemeral,
+                    coalesce_key: Some(woven_core::CoalesceKey::new(
+                        woven_core::ChannelId::new(4),
+                        Some(woven_core::EntityId::new(entity)),
+                        1,
+                    )),
+                    routing_position: None,
+                    payload: vec![7; 25],
+                }))
+                .await
+                .unwrap();
+            assert_eq!(recv_datagram(&connection, &codec).await.sender_sequence, 4);
+            worker
+                .send_to_connection(core_connection, test_state(entity, 4, 5, 25))
+                .await
+                .unwrap();
+            assert_eq!(recv_datagram(&connection, &codec).await.sender_sequence, 5);
+            worker
+                .send_to_connection(core_connection, test_state(entity, 4, 6, 65_536))
+                .await
+                .unwrap();
+            let marker = Envelope::control(
+                DeliveryClass::ReliableOrdered,
+                ControlPayload::ProtocolError(woven_protocol::ProtocolError {
+                    code: ProtocolErrorCode::UnsupportedMessage,
+                    related_message_kind: MessageKind::EntityState,
+                    message: "writer marker".into(),
+                }),
+            );
+            worker
+                .send_to_connection(core_connection, marker.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(TEST_TIMEOUT, read_envelope(&mut recv, &codec))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                marker
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), connection.read_datagram())
+                    .await
+                    .is_err()
+            );
+            let CommandResult::Snapshot(snapshot) = worker
+                .execute(Command::Snapshot {
+                    connection: core_connection,
+                    session,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("expected snapshot")
+            };
+            assert!(snapshot.state.is_empty());
+            assert_eq!(snapshot.state_bytes, 0);
+            assert!(connection.close_reason().is_none());
+            connection.close(VarInt::from_u32(0), b"done");
+            client_endpoint.close(VarInt::from_u32(0), b"done");
+            endpoint.close(VarInt::from_u32(0), b"done");
+        })
+        .await
+        .expect("bounded datagram regression");
+    }
+
+    #[tokio::test]
+    async fn split_reliable_frames_survive_interleaved_datagrams_and_timer_drains() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (endpoint, _worker, address, certificate) = setup_server();
+            let (connection, mut send, mut recv, codec, client_endpoint) =
+                connect_client(address, certificate).await;
+            perform_handshake(&mut send, &mut recv, &codec).await;
+            join_and_subscribe(&mut send, &mut recv, &codec, 1, 1).await;
+            let entity = recv_subscription_accepted_and_entity(&mut recv, &codec).await;
+            let mut datagram_sequence = 0;
+            for (sequence, payload) in [(1, b"profile".as_slice()), (2, b"chat".as_slice())] {
+                let expected = test_reliable(entity, sequence, payload);
+                let frame = codec.encode(&expected).unwrap();
+                let mut start = 0;
+                for end in [2, 4, frame.len() / 2, frame.len()] {
+                    send.write_all(&frame[start..end]).await.unwrap();
+                    start = end;
+                    if end != frame.len() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        datagram_sequence += 1;
+                        connection
+                            .send_datagram(
+                                codec
+                                    .encode(&test_state(entity, 4, datagram_sequence, 25))
+                                    .unwrap()
+                                    .into(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            recv_datagram(&connection, &codec).await.sender_sequence,
+                            datagram_sequence
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+                assert_eq!(
+                    tokio::time::timeout(TEST_TIMEOUT, read_envelope(&mut recv, &codec))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert!(connection.close_reason().is_none());
+            connection.close(VarInt::from_u32(0), b"done");
+            client_endpoint.close(VarInt::from_u32(0), b"done");
+            endpoint.close(VarInt::from_u32(0), b"done");
+        })
+        .await
+        .expect("bounded split-frame regression");
+    }
+
+    #[tokio::test]
+    async fn startup_replies_precede_early_peer_profile() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (endpoint, _worker, address, certificate) = setup_server();
+            let (alice, mut alice_send, mut alice_recv, codec, alice_endpoint) =
+                connect_client(address, certificate.clone()).await;
+            perform_handshake(&mut alice_send, &mut alice_recv, &codec).await;
+            join_and_subscribe(&mut alice_send, &mut alice_recv, &codec, 1, 1).await;
+            let alice_entity = recv_subscription_accepted_and_entity(&mut alice_recv, &codec).await;
+            let (bob, mut bob_send, mut bob_recv, _codec, bob_endpoint) =
+                connect_client(address, certificate).await;
+            perform_handshake(&mut bob_send, &mut bob_recv, &codec).await;
+            let profile = test_reliable(alice_entity, 1, b"early peer profile");
+            let response = async {
+                let entered =
+                    tokio::time::timeout(TEST_TIMEOUT, read_envelope(&mut alice_recv, &codec))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(matches!(
+                    entered.message,
+                    MessagePayload::Control(ControlPayload::EntityEntered(_))
+                ));
+                alice_send
+                    .write_all(&codec.encode(&profile).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::timeout(TEST_TIMEOUT, read_envelope(&mut alice_recv, &codec))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    profile
+                );
+                entered.entity_id.unwrap()
+            };
+            let startup = async {
+                join_and_subscribe(&mut bob_send, &mut bob_recv, &codec, 1, 1).await;
+                let entity = recv_subscription_accepted_and_entity(&mut bob_recv, &codec).await;
+                assert_eq!(
+                    tokio::time::timeout(TEST_TIMEOUT, read_envelope(&mut bob_recv, &codec))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    profile
+                );
+                entity
+            };
+            let (announced, assigned) = tokio::join!(response, startup);
+            assert_eq!(announced, assigned);
+            assert_ne!(assigned, alice_entity);
+            alice.close(VarInt::from_u32(0), b"done");
+            bob.close(VarInt::from_u32(0), b"done");
+            alice_endpoint.close(VarInt::from_u32(0), b"done");
+            bob_endpoint.close(VarInt::from_u32(0), b"done");
+            endpoint.close(VarInt::from_u32(0), b"done");
+        })
+        .await
+        .expect("bounded startup regression");
+    }
+
+    #[tokio::test]
+    async fn writer_drops_state_when_peer_does_not_negotiate_datagrams() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (endpoint, worker, address, certificate) = setup_server();
+            let (connection, mut send, mut recv, codec, client_endpoint) =
+                connect_client_with_datagrams(address, certificate, false).await;
+            perform_handshake(&mut send, &mut recv, &codec).await;
+            join_and_subscribe(&mut send, &mut recv, &codec, 1, 1).await;
+            let entity = recv_subscription_accepted_and_entity(&mut recv, &codec).await;
+            worker
+                .send_to_connection(ConnectionId::new(1), test_state(entity, 4, 1, 25))
+                .await
+                .unwrap();
+            let marker = Envelope::control(
+                DeliveryClass::ReliableOrdered,
+                ControlPayload::ProtocolError(woven_protocol::ProtocolError {
+                    code: ProtocolErrorCode::UnsupportedMessage,
+                    related_message_kind: MessageKind::EntityState,
+                    message: "writer marker".into(),
+                }),
+            );
+            worker
+                .send_to_connection(ConnectionId::new(1), marker.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(TEST_TIMEOUT, read_envelope(&mut recv, &codec))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                marker
+            );
+            assert!(connection.close_reason().is_none());
+            connection.close(VarInt::from_u32(0), b"done");
+            client_endpoint.close(VarInt::from_u32(0), b"done");
+            endpoint.close(VarInt::from_u32(0), b"done");
+        })
+        .await
+        .expect("bounded unsupported datagram check");
+    }
+
+    async fn recv_datagram(connection: &Connection, codec: &Codec) -> Envelope {
+        let bytes = tokio::time::timeout(TEST_TIMEOUT, connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope = codec.decode(&bytes).unwrap();
+        assert_eq!(envelope.delivery_class, DeliveryClass::UnreliableSequenced);
+        assert_eq!(envelope.channel_id, Some(4));
+        assert!(
+            matches!(&envelope.message, MessagePayload::EntityState(payload) if payload.type_id == 1 && payload.bytes == vec![7; 25])
+        );
+        envelope
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -790,7 +1154,7 @@ mod tests {
                 woven_core::AccessGrant::ReadWrite,
             );
         }
-        for channel_id in [1, 2, 3] {
+        for channel_id in [1, 2, 3, 4] {
             grants.grant_channel(
                 woven_core::ChannelScope::new(session, woven_core::ChannelId::new(channel_id)),
                 woven_core::AccessGrant::ReadWrite,
@@ -826,6 +1190,13 @@ mod tests {
             64 * 1024,
         ))
         .expect("register channel 3");
+        core.register_channel(woven_core::ChannelDefinition::relay_owned(
+            woven_core::ChannelId::new(4),
+            woven_core::DeliveryClass::UnreliableSequenced,
+            woven_core::PersistenceClass::Ephemeral,
+            64 * 1024,
+        ))
+        .expect("register channel 4");
         core.provision_session(session).expect("provision session");
         for space_id in [1, 2] {
             core.install_space(
@@ -833,6 +1204,7 @@ mod tests {
                 woven_core::SpaceDescriptor {
                     id: woven_core::SpaceId::new(space_id),
                     local_frame: woven_core::CoordinateFrame::Logical,
+                    bounds: None,
                     parent: None,
                     epoch: woven_core::SpaceEpoch::new(1),
                     routing: woven_core::RoutingPolicy::BroadcastAll,
@@ -858,14 +1230,27 @@ mod tests {
         Codec,
         Endpoint,
     ) {
+        connect_client_with_datagrams(server_address, certificate, true).await
+    }
+
+    async fn connect_client_with_datagrams(
+        server_address: SocketAddr,
+        certificate: CertificateDer<'static>,
+        datagrams: bool,
+    ) -> (Connection, SendStream, RecvStream, Codec, Endpoint) {
         let mut roots = RootCertStore::empty();
         roots.add(certificate).expect("trust localhost certificate");
         let client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let client_config = ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(client_crypto).expect("create QUIC client configuration"),
         ));
+        if !datagrams {
+            let mut transport = quinn::TransportConfig::default();
+            transport.datagram_receive_buffer_size(None);
+            client_config.transport_config(Arc::new(transport));
+        }
         let mut client_endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
             .expect("bind QUIC client endpoint");
         client_endpoint.set_default_client_config(client_config);
@@ -964,6 +1349,7 @@ mod tests {
                     server_tick: 0,
                     sender_sequence: 0,
                     correlation_id: None,
+                    routing_position: None,
                     message: MessagePayload::Control(ControlPayload::JoinSession(
                         woven_protocol::JoinSession {
                             resume_token: vec![],
@@ -989,6 +1375,7 @@ mod tests {
                     server_tick: 0,
                     sender_sequence: 0,
                     correlation_id: None,
+                    routing_position: None,
                     message: MessagePayload::Control(ControlPayload::SubscribeSpace(
                         woven_protocol::SubscribeSpace,
                     )),

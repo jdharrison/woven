@@ -8,6 +8,43 @@ cargo add woven-client
 
 `woven-client` is a library crate. It does not provide a standalone executable.
 
+## Session logger
+
+After joining an unmanaged session or receiving a verified managed `Admitted`
+result, log without repeating scope:
+
+```rust,ignore
+client.logger().info("connected").await?;
+client.logger().warn("cache miss").await?;
+client.logger().error("operation failed").await?;
+client.log("info alias").await?;
+```
+
+`Client::logger(&mut self) -> ClientLogger<'_>` borrows the ordered control
+stream. Its async `info`, `warn`, and `error` methods accept `impl AsRef<str>`
+and return `Result<(), ClientError>`; `Client::log` is the info alias. No
+logging queue or retries are introduced. Each call sends one session-scoped
+`ClientLog`, never a broadcast. **`Ok(())` means sent, not server acceptance,
+Host persistence, or a persistence acknowledgement.** Receive control traffic
+to observe server rejections, and never put secrets in messages.
+
+Messages must contain 1–1024 UTF-8 bytes (`woven_protocol::MAX_LOG_MESSAGE_BYTES`);
+smaller negotiated payload/frame limits still apply. Missing joined/admitted
+scope and invalid messages fail locally. Successful request admission, queue
+operations returning Admitted (including claim), and the consuming admission
+runner automatically remember scope. Queued/Paused/Rejected do not establish it.
+
+Legacy join has no success acknowledgement: scope is remembered after sending
+`join_session` and cleared on an observed join rejection. The additive
+`leave_session(reason: impl AsRef<str>)` leaves the remembered session and clears
+it. Admission abort, stream I/O failure, and observed invalid-session log errors
+also clear scope; close consumes the client. A later log requires another
+join/admission. Protocol tooling exports `ClientLog { level, message }`,
+`LogLevel` (Info=1, Warn=2, Error=3), and `CAPABILITY_CLIENT_LOG = 2` from
+`woven-protocol`. If the server did not negotiate `CAPABILITY_CLIENT_LOG`, all
+logger methods and `log` reject locally with `ClientError::UnsupportedCapability("ClientLog")`
+before writing bytes, while retaining joined scope and leaving the connection usable.
+
 ## Managed native admission (wire/client slice)
 
 Host supplies the endpoint, opaque token, namespace/session, allowed spaces/channels,
@@ -46,6 +83,145 @@ and covered by `woven-server/tests/managed_quic.rs`. The cross-repository
 Woven's root): real Host HTTP APIs provision the managed node and supply descriptors
 used by this native client. It uses isolated Firebase Auth/Firestore emulators and
 loopback sockets, not a cloud deployment or browser UI; ordinary Cargo runs ignore it.
+
+## Payload guardrails
+
+The default payload limit is **64 KiB (65,536 bytes) per update**, measured in
+serialized bytes, with a separate **1 MiB frame limit** for protocol metadata.
+`publish_state`, `publish_positioned_state`, `publish_event`, `publish_unreliable_state`, and
+`publish_unreliable_positioned_state` reject larger values before serialization or transport writes
+with `ClientError::Protocol(CodecError::PayloadTooLarge)`;
+the error includes the actual and maximum byte counts. The connection remains
+usable after a local size rejection. A smaller configured or server-advertised
+limit also restricts outgoing payloads; raising client receive limits does not
+raise the 64 KiB publish ceiling. Individual server channels may impose an even
+smaller limit and remain authoritative.
+
+Send granular entity/component deltas rather than a serialized world in one
+property/state update. Oversized values are rejected, not truncated. Incoming
+frames and payloads are bounded by the limits advertised in `ClientConfig`.
+
+## Positioned entity state
+
+The client advertises `CAPABILITY_POSITIONED_ENTITY_STATE` and retains the intersection returned
+by the server. Check `client.supports_positioned_state()`. Both positioned methods fail locally
+with `ClientError::UnsupportedCapability("positioned EntityState")` before serialization or I/O
+when the capability was not negotiated.
+
+```rust,ignore
+use woven_client::RoutingPosition3D;
+
+client.publish_positioned_state(
+    namespace_id, session_id, space_id, space_epoch, latest_value_channel_id,
+    entity_id, sequence, type_id,
+    RoutingPosition3D { x: 9.9, y: 0.0, z: 0.0 },
+    state_bytes,
+).await?;
+
+client.publish_unreliable_positioned_state(
+    namespace_id, session_id, space_id, space_epoch, unreliable_channel_id,
+    entity_id, sequence, type_id,
+    RoutingPosition3D { x: 9.9, y: 0.0, z: 0.0 },
+    state_bytes,
+)?;
+```
+
+`publish_positioned_state` sends `EntityState/LatestValue` on the reliable control stream;
+`publish_unreliable_positioned_state` sends `EntityState/UnreliableSequenced` as one datagram.
+The finite 3D routing position is additive metadata; payload bytes remain opaque. The server
+validates space frame/bounds and applies position plus publication atomically. A local successful
+send is not a server acknowledgement.
+
+Channel policy is still server-controlled. In the current managed composition, spatial spaces
+expose channel 1 as `ReliableOrdered` events and channel 4 as `UnreliableSequenced` state, so use
+the unreliable positioned method there. The reliable positioned method is for server
+compositions that provision a matching `LatestValue` channel (for example development/static
+channel 2); it does not override managed channel 1.
+
+## Cancellation-safe control receive
+
+`Client::recv` and `recv_timeout` retain an incomplete control-stream frame on the
+client across timeout or cancellation. The next call resumes the same frame,
+including when cancellation occurred partway through its four-byte prefix or body.
+Short polling intervals therefore do not discard reliable chat/profile/control bytes.
+The exclusive `&mut Client` reader and public API are unchanged; no background reader
+or decoded inbox is added.
+
+Only a partial four-byte prefix plus one frame are retained. The complete prefix is
+validated against the configured incoming frame limit **before** allocating its body;
+complete frames still use the configured incoming payload limit. Transport reads
+commit their byte counts before another await, so datagram reception can run
+independently without resetting stream framing. Negotiated outgoing limits are unchanged.
+Managed admission still fails closed on cancellation/timeouts: writes or admission
+outcomes can remain ambiguous even though receive framing is now resumable.
+
+## Unreliable entity-state datagrams
+
+`Client::publish_unreliable_state(&self, namespace_id, session_id, space_id,
+space_epoch, channel_id, entity_id, sequence, type_id, payload: Vec<u8>)`
+is synchronous and returns `Result<(), ClientError>`. It sends exactly one
+size-prefixed WVN1 `EntityState` envelope with `UnreliableSequenced` delivery over
+native QUIC or WebTransport. The route must already be provisioned by the server
+with matching policy; this method cannot change channel delivery or persistence.
+Existing `publish_state` and `publish_positioned_state` remain `LatestValue` over the control stream.
+
+Publishing preserves the negotiated outgoing frame/payload limits and the 64 KiB
+payload ceiling. The **whole encoded frame**, including its four-byte prefix and
+metadata, must additionally fit the transport's current `max_datagram_size()`.
+That budget can change with the path MTU; it is checked for every send, and a
+send-time transport failure is also returned. Unsupported/disabled datagrams and
+MTU-size failures return `ClientError::Transport`; size errors include the actual
+frame length and current limit. Local rejection leaves the connection usable.
+There is no fragmentation, truncation, stream fallback, retry, or application queue.
+
+**`Ok(())` means local transport submission, not server acceptance or delivery.**
+Congestion may discard this or older queued datagrams. Continue receiving control
+traffic to observe server errors; track submissions separately from received updates.
+Sender sequences must be strictly monotone per connection × space × epoch × entity
+× channel. Receivers must reject stale sequences/epochs in bounded application state;
+transport datagrams can arrive out of order, including across lifecycle messages.
+
+After admission/setup, call
+`client.take_datagram_receiver() -> Result<DatagramReceiver, ClientError>` once:
+
+```rust,ignore
+// Assume the server provisioned this route, and the client owns `entity_id`.
+let mut poses = client.take_datagram_receiver()?;
+client.publish_unreliable_state(
+    namespace_id, session_id, space_id, space_epoch, channel_id, entity_id,
+    sequence, type_id, transform.encode().to_vec(),
+)?;
+if let Some(envelope) = poses.recv_timeout(std::time::Duration::from_millis(5)).await? {
+    // Apply only current-epoch, newer-sequence updates for known entities.
+}
+```
+
+The public, non-`Clone` `DatagramReceiver` exposes
+`recv(&mut self) -> Result<Envelope, ClientError>` and
+`recv_timeout(&mut self, Duration) -> Result<Option<Envelope>, ClientError>` as
+async methods. A receive consumes exactly one complete datagram and decodes one
+complete frame under the configured **incoming** limits. Only valid-scoped
+`EntityState / UnreliableSequenced` is accepted. Malformed, oversized,
+trailing-byte, or wrong-kind/class packets return `ClientError::Protocol`;
+the packet is consumed without closing the connection, so the next receive can
+continue. Packet errors are never converted into timeout results.
+
+Datagram receive timeout/cancellation is safe: no partial frame is consumed, no
+pending application read is retained, and no control-stream read is cancelled.
+There is no background reader, application inbox, or unbounded sequence cache;
+only the underlying bounded transport buffers are used. The handle does not borrow
+the client, so datagram reception can run alongside the exclusive control reader.
+Control `recv`/`recv_timeout` remain stream-only and retain partial framing across
+cancellation as described above. The datagram receiver remains independent.
+
+Handout is permanent, even after dropping the receiver. All managed admission and
+queue APIs are rejected before stream I/O after handout. The consuming
+`admit_with_cancellation` runner also explicitly closes the shared connection when
+rejecting handout, preserving cleanup despite the receiver's connection clone.
+Finish managed admission first. The client still owns the endpoint and shutdown:
+keep it and its runtime alive, and explicitly `close`/`close_gracefully` it when
+stopping. The receiver alone is not an independent connection owner or close API;
+already-buffered datagrams may drain after closure before a transport error.
 
 ## Bounded shutdown
 

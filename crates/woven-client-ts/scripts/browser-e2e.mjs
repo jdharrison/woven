@@ -33,6 +33,7 @@ let pageConfig;
 let serverOutput = "";
 let failureDiagnostic = "";
 let completed = 0;
+let totalDatagramAttempts = 0;
 
 try {
   run("cargo", ["build", "--offline", "--locked", "-p", "woven-server"], wovenRoot, 180_000);
@@ -126,12 +127,18 @@ try {
   });
   woven.stderr.on("data", (chunk) => rememberServerOutput(chunk));
   const addresses = await managedAddresses(woven);
+  assert.equal(new URL(addresses.webTransportUrl).hostname, "127.0.0.1");
+  assert.match(addresses.admin, /^127\.0\.0\.1:[0-9]+$/);
+  assert.match(addresses.management, /^127\.0\.0\.1:[0-9]+$/);
   const adminUrl = `http://${addresses.admin}`;
   const node = await adminJson(adminUrl, "/v1/node", { method: "GET" });
   assert.equal(node.transports?.quic, true);
   assert.equal(node.transports?.webTransport?.enabled, true);
   assert.match(node.transports?.webTransport?.certificateSha256 ?? "", /^[0-9a-f]{64}$/);
   assert.equal(addresses.webTransportUrl.endsWith("/webtransport"), true);
+  const unreliableChannel = node.channels?.find((channel) => channel.channelId === "4");
+  assert.equal(unreliableChannel?.delivery, "UnreliableSequenced");
+  assert.equal(unreliableChannel?.persistence, "Ephemeral");
 
   const provision = await adminRequest(adminUrl, scopePath, {
     method: "PUT",
@@ -142,7 +149,12 @@ try {
     body: JSON.stringify({ revision: "1", allocatedCCU: 1, clientToken }),
   });
   assert.equal(provision.status, 201);
-  await boundedBody(provision);
+  const provisioned = JSON.parse(new TextDecoder().decode(await boundedResponseBytes(provision)));
+  assert.deepEqual(
+    provisioned.spaces?.find((space) => space.spaceId === "1")?.channelIds,
+    ["1", "4"],
+    "local fixture must provision both reliable and unreliable channels in space 1",
+  );
 
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
@@ -165,6 +177,16 @@ try {
       const result = await page.evaluate(() => window.__WOVEN_BROWSER_RESULT__);
       assert.equal(result?.ok, true, result?.ok === false ? result.error : "missing browser result");
       assert.match(result.entityId, /^[1-9][0-9]*$/);
+      assert.ok(Number.isInteger(result.datagramAttempts) && result.datagramAttempts >= 1 && result.datagramAttempts <= 20);
+      assert.match(result.datagramEchoSequence, /^[1-9][0-9]*$/);
+      assert.ok(BigInt(result.datagramEchoSequence) <= BigInt(result.datagramAttempts));
+      assert.equal(result.reliablePoseWrites, 0);
+      totalDatagramAttempts += result.datagramAttempts;
+      if (completed === 0) {
+        console.log(
+          `browser datagram echo: channel=4 type=1 bytes=25 sequence=${result.datagramEchoSequence}; attempts=${result.datagramAttempts}; reliable pose writes=${result.reliablePoseWrites}; reliable channel 1 echo passed`,
+        );
+      }
     } catch (error) {
       failureDiagnostic = await browserFailureDiagnostic({
         iteration: completed + 1,
@@ -199,7 +221,7 @@ try {
   assert.equal(remove.status, 204);
   await boundedBody(remove);
   console.log(
-    `PASS: real Chromium TypeScript/WebTransport smoke completed ${completed} iteration${completed === 1 ? "" : "s"}`,
+    `PASS: real Chromium TypeScript/WebTransport smoke completed ${completed} iteration${completed === 1 ? "" : "s"}; actual datagram echoes=${completed}; datagram attempts=${totalDatagramAttempts}; reliable pose writes=0`,
   );
 } catch (error) {
   if (failureDiagnostic) console.error(failureDiagnostic);

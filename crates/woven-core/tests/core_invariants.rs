@@ -1,16 +1,19 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use woven_core::{
-    AccessGrant, AdmissionMetadata, AuthenticatedPrincipal, AuthorizationGrants, CapacityUpdate,
+    AccessGrant, AdmissionMetadata, AuthenticatedPrincipal, AuthorityContext, AuthorityEmission,
+    AuthorityOutcome, AuthorityPolicy, AuthorityTransform, AuthorizationGrants, CapacityUpdate,
     ChannelDefinition, ChannelId, ChannelScope, CoalesceKey, Command, CommandResult,
     CoordinateFrame, CoreConfig, CoreError, Credentials, DeliveryClass, DevAuthenticator, EntityId,
     EntityPosition, EntityTransitionRequest, HarnessError, IdKind, IdempotencyKey, JoinDecision,
     JournalRecord, JournalSink, NamespaceId, NodeId, NoopJournalSink, OutboundMessage,
-    OutboundQueueConfig, ParentAnchor, PersistenceClass, PrincipalId, PublishRateLimit,
-    PublishRequest, QueuePolicy, RoutingPolicy, SessionId, SessionKey, SpaceDescriptor, SpaceEpoch,
-    SpaceId, SpaceKey, TransportIndependentWorker, WorkerHarness, WovenCore,
+    OutboundQueueConfig, ParentAnchor, PersistenceClass, PositionValidationError, PrincipalId,
+    ProposedMessage, PublishRateLimit, PublishRequest, QueuePolicy, RoutingPolicy, SessionId,
+    SessionKey, SpaceDescriptor, SpaceEpoch, SpaceId, SpaceKey, SpatialBounds3D,
+    TransportIndependentWorker, WorkerHarness, WovenCore,
 };
 
 const NAMESPACE_A: NamespaceId = NamespaceId::new(10);
@@ -96,6 +99,7 @@ fn root_descriptor(id: SpaceId) -> SpaceDescriptor {
     SpaceDescriptor {
         id,
         local_frame: CoordinateFrame::Logical,
+        bounds: None,
         parent: None,
         epoch: EPOCH_ONE,
         routing: RoutingPolicy::BroadcastAll,
@@ -144,6 +148,34 @@ fn make_core(config: CoreConfig) -> WovenCore<DevAuthenticator> {
     core.install_space(session_a(), root_descriptor(ROOT))
         .expect("root space installation");
     core
+}
+
+fn make_core_with_channels(
+    config: CoreConfig,
+    channels: impl IntoIterator<Item = ChannelDefinition>,
+) -> WovenCore<DevAuthenticator> {
+    let mut core = WovenCore::new(authenticator(), config).expect("valid core config");
+    for channel in channels {
+        core.register_channel(channel)
+            .expect("channel registration");
+    }
+    core.provision_session(session_a())
+        .expect("session provisioning");
+    core.install_space(session_a(), root_descriptor(ROOT))
+        .expect("root space installation");
+    core
+}
+
+struct TestAuthority(fn(ProposedMessage<'_>) -> AuthorityOutcome);
+
+impl AuthorityPolicy for TestAuthority {
+    fn evaluate(
+        &self,
+        _context: &AuthorityContext,
+        proposed: ProposedMessage<'_>,
+    ) -> AuthorityOutcome {
+        (self.0)(proposed)
+    }
 }
 
 fn connect_authenticated(
@@ -201,6 +233,7 @@ fn spatial_descriptor(
     SpaceDescriptor {
         id,
         local_frame,
+        bounds: None,
         parent: None,
         epoch: EPOCH_ONE,
         routing,
@@ -232,6 +265,7 @@ fn publish_request(
         coalesce_key: delivery
             .is_replaceable()
             .then(|| CoalesceKey::new(channel, Some(entity), component)),
+        routing_position: None,
         payload: payload.to_vec(),
     }
 }
@@ -666,6 +700,7 @@ fn nested_spaces_require_advanced_epochs_after_destruction() {
         local_frame: CoordinateFrame::Cartesian3D {
             meters_per_unit: 0.01,
         },
+        bounds: None,
         parent: Some(ParentAnchor {
             parent_space: ROOT,
             anchor_entity: anchor,
@@ -846,6 +881,7 @@ fn transport_loss_removes_owned_entities_and_anchored_descendants() {
             local_frame: CoordinateFrame::Cartesian2D {
                 meters_per_unit: 1.0,
             },
+            bounds: None,
             parent: Some(ParentAnchor {
                 parent_space: ROOT,
                 anchor_entity: anchor,
@@ -1059,6 +1095,373 @@ fn payload_connection_and_session_limits_are_enforced() {
         )),
         Err(CoreError::PayloadTooLarge { .. })
     ));
+}
+
+#[test]
+fn default_payload_limit_accepts_64_kib_and_rejects_one_extra_byte() {
+    assert_eq!(CoreConfig::default().max_payload_bytes, 65_536);
+    for channel_limit in [65_536, 131_072] {
+        for channel in [EVENT_CHANNEL, STATE_CHANNEL, DURABLE_CHANNEL] {
+            let (delivery, persistence) = channel_policy(channel);
+            let mut core = make_core_with_channels(
+                CoreConfig::default(),
+                [ChannelDefinition::relay_owned(
+                    channel,
+                    delivery,
+                    persistence,
+                    channel_limit,
+                )],
+            );
+            let alice = connect_authenticated(&mut core, "alice");
+            join_and_subscribe(&mut core, alice, ROOT);
+            let entity = core
+                .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+                .expect("entity spawn");
+            let payload = vec![0; 65_536];
+            let mut request =
+                publish_request(alice, ROOT, EPOCH_ONE, entity, channel, 1, 42, &payload);
+            core.publish(request.clone())
+                .expect("64 KiB is within the default node limit");
+            let outbound = core.drain_outbound(alice).expect("recipient drain");
+            assert_eq!(outbound.len(), 1);
+            assert_eq!(outbound[0].payload, payload);
+
+            request.sequence = 2;
+            request.payload.push(0);
+            assert_eq!(
+                core.publish(request),
+                Err(CoreError::PayloadTooLarge {
+                    actual: 65_537,
+                    limit: 65_536,
+                }),
+                "channel {channel} with ceiling {channel_limit} must respect the node limit",
+            );
+            assert!(
+                core.drain_outbound(alice)
+                    .expect("recipient drain")
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn smaller_channel_payload_limit_is_enforced_at_its_boundary() {
+    let mut core = make_core(CoreConfig::default());
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    for channel in [EVENT_CHANNEL, STATE_CHANNEL, DURABLE_CHANNEL] {
+        let payload = vec![0; 1_024];
+        let mut request = publish_request(alice, ROOT, EPOCH_ONE, entity, channel, 1, 42, &payload);
+        core.publish(request.clone())
+            .expect("payload at the channel ceiling");
+        let outbound = core.drain_outbound(alice).expect("recipient drain");
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].payload, payload);
+
+        request.sequence = 2;
+        request.payload.push(0);
+        assert_eq!(
+            core.publish(request),
+            Err(CoreError::PayloadTooLarge {
+                actual: 1_025,
+                limit: 1_024,
+            }),
+        );
+        assert!(
+            core.drain_outbound(alice)
+                .expect("recipient drain")
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn oversized_payload_preserves_state_queue_sequences_and_journal() {
+    let mut core = make_core(CoreConfig {
+        max_payload_bytes: 3,
+        ..CoreConfig::default()
+    });
+    let alice = connect_authenticated(&mut core, "alice");
+    let bob = connect_authenticated(&mut core, "bob");
+    join_and_subscribe(&mut core, alice, ROOT);
+    join_and_subscribe(&mut core, bob, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    core.publish(publish_request(
+        alice,
+        ROOT,
+        EPOCH_ONE,
+        entity,
+        DURABLE_CHANNEL,
+        1,
+        0,
+        b"log",
+    ))
+    .expect("initial journal record");
+    let durable = core.drain_outbound(alice).expect("durable drain");
+    assert_eq!(durable.len(), 1);
+    assert_eq!(core.drain_outbound(bob).expect("durable drain"), durable);
+
+    core.publish(publish_request(
+        alice,
+        ROOT,
+        EPOCH_ONE,
+        entity,
+        STATE_CHANNEL,
+        1,
+        42,
+        b"old",
+    ))
+    .expect("initial state");
+    let queued = core.drain_outbound(alice).expect("publisher drain");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].payload, b"old");
+    assert_eq!(queued[0].sequence, 1);
+    let before = core.snapshot(bob, session_a()).expect("initial snapshot");
+    assert_eq!(before.state_bytes, 3);
+    assert_eq!(core.sequence_key_count(session_a()), Some(2));
+    assert_eq!(core.journal_outbox_len(), 1);
+
+    for channel in [STATE_CHANNEL, DURABLE_CHANNEL] {
+        assert_eq!(
+            core.publish(publish_request(
+                alice, ROOT, EPOCH_ONE, entity, channel, 2, 42, b"four",
+            )),
+            Err(CoreError::PayloadTooLarge {
+                actual: 4,
+                limit: 3,
+            }),
+        );
+        assert_eq!(core.snapshot(bob, session_a()).expect("snapshot"), before);
+        assert_eq!(core.sequence_key_count(session_a()), Some(2));
+        assert_eq!(core.journal_outbox_len(), 1);
+    }
+    assert!(
+        core.drain_outbound(alice)
+            .expect("publisher drain")
+            .is_empty()
+    );
+    assert_eq!(core.drain_outbound(bob).expect("recipient drain"), queued);
+    assert_eq!(
+        core.pop_journal_record()
+            .expect("preserved journal record")
+            .message,
+        durable[0],
+    );
+    assert!(core.pop_journal_record().is_none());
+
+    core.publish(publish_request(
+        alice,
+        ROOT,
+        EPOCH_ONE,
+        entity,
+        STATE_CHANNEL,
+        2,
+        42,
+        b"new",
+    ))
+    .expect("corrected update reuses the rejected sequence");
+    let after = core.snapshot(bob, session_a()).expect("updated snapshot");
+    assert_eq!(after.state.len(), 1);
+    assert_eq!(after.state_bytes, 3);
+    assert_eq!(after.state[0].payload, b"new");
+    assert_eq!(after.state[0].sequence, 2);
+    let outbound = core.drain_outbound(bob).expect("recipient drain");
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].payload, b"new");
+    assert_eq!(outbound[0].sequence, 2);
+}
+
+#[test]
+fn authority_transform_payload_limit_rejection_preserves_state_and_sequence() {
+    let authority = TestAuthority(|proposed| {
+        if proposed.payload == b"expand" {
+            AuthorityOutcome::Transform(AuthorityTransform {
+                coalesce_key: proposed.coalesce_key,
+                payload: vec![0; 1_025],
+            })
+        } else {
+            AuthorityOutcome::Accept
+        }
+    });
+    let mut core = make_core_with_channels(
+        CoreConfig::default(),
+        [ChannelDefinition::with_authority(
+            STATE_CHANNEL,
+            DeliveryClass::LatestValue,
+            PersistenceClass::Stateful { ttl: None },
+            1_024,
+            Arc::new(authority),
+        )],
+    );
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    core.publish(publish_request(
+        alice,
+        ROOT,
+        EPOCH_ONE,
+        entity,
+        STATE_CHANNEL,
+        1,
+        42,
+        b"old",
+    ))
+    .expect("initial state");
+    let before = core.snapshot(alice, session_a()).expect("initial snapshot");
+    assert_eq!(before.state_bytes, 3);
+    assert_eq!(core.sequence_key_count(session_a()), Some(1));
+
+    assert_eq!(
+        core.publish(publish_request(
+            alice,
+            ROOT,
+            EPOCH_ONE,
+            entity,
+            STATE_CHANNEL,
+            2,
+            42,
+            b"expand",
+        )),
+        Err(CoreError::PayloadTooLarge {
+            actual: 1_025,
+            limit: 1_024,
+        }),
+    );
+    assert_eq!(core.snapshot(alice, session_a()).expect("snapshot"), before);
+    assert_eq!(core.sequence_key_count(session_a()), Some(1));
+    assert_eq!(core.journal_outbox_len(), 0);
+    let outbound = core.drain_outbound(alice).expect("recipient drain");
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].payload, b"old");
+    assert_eq!(outbound[0].sequence, 1);
+
+    core.publish(publish_request(
+        alice,
+        ROOT,
+        EPOCH_ONE,
+        entity,
+        STATE_CHANNEL,
+        2,
+        42,
+        b"new",
+    ))
+    .expect("corrected update reuses the rejected sequence");
+    let after = core.snapshot(alice, session_a()).expect("updated snapshot");
+    assert_eq!(after.state_bytes, 3);
+    assert_eq!(after.state[0].payload, b"new");
+    assert_eq!(after.state[0].sequence, 2);
+}
+
+#[test]
+fn authority_emission_payload_limit_rejection_is_atomic() {
+    let authority = TestAuthority(|proposed| {
+        let last_payload: &[u8] = if proposed.payload == b"emit" {
+            b"four"
+        } else {
+            b"new"
+        };
+        let emissions = [
+            (DURABLE_CHANNEL, 0, b"log".as_slice()),
+            (STATE_CHANNEL, 42, b"new".as_slice()),
+            (STATE_CHANNEL, 43, last_payload),
+        ]
+        .into_iter()
+        .map(|(channel, component, payload)| {
+            let (delivery, persistence) = channel_policy(channel);
+            AuthorityEmission {
+                space: proposed.space,
+                space_epoch: proposed.space_epoch,
+                entity: proposed.entity,
+                channel,
+                sequence: proposed.sequence + 1,
+                delivery,
+                persistence,
+                coalesce_key: delivery
+                    .is_replaceable()
+                    .then(|| CoalesceKey::new(channel, proposed.entity, component)),
+                payload: payload.to_vec(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+        AuthorityOutcome::Emit(emissions)
+    });
+    let mut core = make_core_with_channels(
+        CoreConfig::default(),
+        [
+            ChannelDefinition::with_authority(
+                EVENT_CHANNEL,
+                DeliveryClass::ReliableOrdered,
+                PersistenceClass::Ephemeral,
+                1_024,
+                Arc::new(authority),
+            ),
+            ChannelDefinition::relay_owned(
+                DURABLE_CHANNEL,
+                DeliveryClass::ReliableOrdered,
+                PersistenceClass::Durable,
+                1_024,
+            ),
+            ChannelDefinition::relay_owned(
+                STATE_CHANNEL,
+                DeliveryClass::LatestValue,
+                PersistenceClass::Stateful { ttl: None },
+                3,
+            ),
+        ],
+    );
+    let alice = connect_authenticated(&mut core, "alice");
+    join_and_subscribe(&mut core, alice, ROOT);
+    let entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), ROOT), EPOCH_ONE)
+        .expect("entity spawn");
+    let before = core.snapshot(alice, session_a()).expect("initial snapshot");
+    assert_eq!(before.state_bytes, 0);
+    let mut request = publish_request(alice, ROOT, EPOCH_ONE, entity, EVENT_CHANNEL, 1, 0, b"emit");
+    assert_eq!(
+        core.publish(request.clone()),
+        Err(CoreError::PayloadTooLarge {
+            actual: 4,
+            limit: 3,
+        }),
+    );
+    assert_eq!(core.snapshot(alice, session_a()).expect("snapshot"), before);
+    assert_eq!(core.sequence_key_count(session_a()), Some(0));
+    assert_eq!(core.journal_outbox_len(), 0);
+    assert!(
+        core.drain_outbound(alice)
+            .expect("recipient drain")
+            .is_empty()
+    );
+
+    request.payload = b"ok".to_vec();
+    let outcome = core
+        .publish(request)
+        .expect("corrected batch reuses rejected source and emission sequences");
+    assert_eq!(outcome.authorized_messages, 3);
+    let after = core.snapshot(alice, session_a()).expect("updated snapshot");
+    assert_eq!(after.state.len(), 2);
+    assert_eq!(after.state_bytes, 6);
+    assert!(
+        after
+            .state
+            .iter()
+            .all(|state| state.payload == b"new" && state.sequence == 2)
+    );
+    assert_eq!(core.sequence_key_count(session_a()), Some(4));
+    assert_eq!(core.journal_outbox_len(), 1);
+    assert_eq!(
+        core.drain_outbound(alice).expect("recipient drain").len(),
+        3
+    );
 }
 
 #[test]
@@ -1423,6 +1826,228 @@ fn spatial_grid_3d_rejects_dimension_mismatches_and_routes_nearby_entities() {
 }
 
 #[test]
+fn routing_positions_on_non_state_delivery_are_rejected_before_publication() {
+    for delivery in [
+        DeliveryClass::ReliableOrdered,
+        DeliveryClass::ReliableUnordered,
+        DeliveryClass::BestEffortEvent,
+    ] {
+        let mut core = make_core_with_channels(
+            CoreConfig::default(),
+            [ChannelDefinition::relay_owned(
+                EVENT_CHANNEL,
+                delivery,
+                PersistenceClass::Durable,
+                1_024,
+            )],
+        );
+        core.install_space(
+            session_a(),
+            spatial_descriptor(
+                SECONDARY,
+                RoutingPolicy::BroadcastAll,
+                CoordinateFrame::Cartesian3D {
+                    meters_per_unit: 1.0,
+                },
+            ),
+        )
+        .unwrap();
+        let connection = connect_authenticated(&mut core, "alice");
+        join_and_subscribe(&mut core, connection, SECONDARY);
+        let entity = core
+            .spawn_entity(connection, SpaceKey::new(session_a(), SECONDARY), EPOCH_ONE)
+            .unwrap();
+        let mut request = PublishRequest {
+            connection,
+            session: session_a(),
+            space: SECONDARY,
+            space_epoch: EPOCH_ONE,
+            entity: Some(entity),
+            channel: EVENT_CHANNEL,
+            sequence: 1,
+            delivery,
+            persistence: PersistenceClass::Durable,
+            coalesce_key: None,
+            routing_position: Some(EntityPosition::Cartesian3D {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            }),
+            payload: b"event".to_vec(),
+        };
+        assert!(matches!(
+            core.publish(request.clone()),
+            Err(CoreError::AuthorityRejected(
+                woven_core::AuthorityRejection::PolicyDenied
+            ))
+        ));
+        assert!(
+            core.snapshot(connection, session_a())
+                .unwrap()
+                .state
+                .is_empty()
+        );
+        assert_eq!(core.sequence_key_count(session_a()), Some(0));
+        assert_eq!(core.journal_outbox_len(), 0);
+        assert!(core.drain_outbound(connection).unwrap().is_empty());
+
+        request.routing_position = None;
+        core.publish(request)
+            .expect("rejected position does not consume the sequence");
+        let outbound = core.drain_outbound(connection).unwrap();
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].routing_position, None);
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one atomic positioned-state and cell-boundary regression lifecycle"
+)]
+fn positioned_state_is_atomic_bounded_and_routes_across_cell_boundaries() {
+    let mut core = make_core(CoreConfig::default());
+    let mut descriptor = spatial_descriptor(
+        SECONDARY,
+        RoutingPolicy::SpatialGrid3D {
+            cell_size: 10.0,
+            interest_radius: 15.0,
+            exact_distance: true,
+        },
+        CoordinateFrame::Cartesian3D {
+            meters_per_unit: 1.0,
+        },
+    );
+    descriptor.bounds = Some(SpatialBounds3D {
+        min_x: -100.0,
+        min_y: -100.0,
+        min_z: -100.0,
+        max_x: 100.0,
+        max_y: 100.0,
+        max_z: 100.0,
+    });
+    core.install_space(session_a(), descriptor)
+        .expect("bounded spatial space");
+    let alice = connect_authenticated(&mut core, "alice");
+    let bob = connect_authenticated(&mut core, "bob");
+    join_and_subscribe(&mut core, alice, SECONDARY);
+    join_and_subscribe(&mut core, bob, SECONDARY);
+    let alice_entity = core
+        .spawn_entity(alice, SpaceKey::new(session_a(), SECONDARY), EPOCH_ONE)
+        .expect("alice entity");
+    let bob_entity = core
+        .spawn_entity(bob, SpaceKey::new(session_a(), SECONDARY), EPOCH_ONE)
+        .expect("bob entity");
+    core.update_entity_position(
+        bob,
+        session_a(),
+        bob_entity,
+        EntityPosition::Cartesian3D {
+            x: 20.1,
+            y: 0.0,
+            z: 0.0,
+        },
+    )
+    .expect("bob position");
+    for x in [-100.0, 100.0] {
+        core.update_entity_position(
+            alice,
+            session_a(),
+            alice_entity,
+            EntityPosition::Cartesian3D { x, y: 0.0, z: 0.0 },
+        )
+        .expect("inclusive boundary");
+    }
+
+    let mut wrong_dimension = publish_request(
+        alice,
+        SECONDARY,
+        EPOCH_ONE,
+        alice_entity,
+        STATE_CHANNEL,
+        1,
+        1,
+        b"2d-routing-position",
+    );
+    wrong_dimension.routing_position = Some(EntityPosition::Cartesian2D { x: 9.9, y: 0.0 });
+    assert_eq!(
+        core.publish(wrong_dimension),
+        Err(CoreError::InvalidEntityPosition(
+            PositionValidationError::DimensionMismatch
+        ))
+    );
+
+    let mut first = publish_request(
+        alice,
+        SECONDARY,
+        EPOCH_ONE,
+        alice_entity,
+        STATE_CHANNEL,
+        1,
+        1,
+        b"boundary",
+    );
+    first.routing_position = Some(EntityPosition::Cartesian3D {
+        x: 9.9,
+        y: 0.0,
+        z: 0.0,
+    });
+    core.publish(first).expect("positioned publish");
+    let received = core.drain_outbound(bob).expect("bob outbound");
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].routing_position,
+        Some(EntityPosition::Cartesian3D {
+            x: 9.9,
+            y: 0.0,
+            z: 0.0,
+        })
+    );
+
+    let mut rejected = publish_request(
+        alice,
+        SECONDARY,
+        EPOCH_ONE,
+        alice_entity,
+        STATE_CHANNEL,
+        2,
+        1,
+        b"rejected",
+    );
+    rejected.routing_position = Some(EntityPosition::Cartesian3D {
+        x: 100.1,
+        y: 0.0,
+        z: 0.0,
+    });
+    assert_eq!(
+        core.publish(rejected),
+        Err(CoreError::InvalidEntityPosition(
+            PositionValidationError::OutOfBounds
+        ))
+    );
+    let snapshot = core.snapshot(alice, session_a()).expect("snapshot");
+    assert!(snapshot.state.iter().all(|state| state.sequence != 2));
+
+    let mut retry = publish_request(
+        alice,
+        SECONDARY,
+        EPOCH_ONE,
+        alice_entity,
+        STATE_CHANNEL,
+        2,
+        1,
+        b"accepted",
+    );
+    retry.routing_position = Some(EntityPosition::Cartesian3D {
+        x: 10.0,
+        y: 0.0,
+        z: 0.0,
+    });
+    core.publish(retry)
+        .expect("same sequence remains available after atomic rejection");
+}
+
+#[test]
 fn worker_handles_entity_transition_command() {
     let mut core = make_core(CoreConfig::default());
     core.install_space(session_a(), root_descriptor(SECONDARY))
@@ -1466,6 +2091,7 @@ fn no_op_journal_and_bounded_worker_harness_are_runtime_independent() {
         delivery: DeliveryClass::ReliableOrdered,
         persistence: PersistenceClass::Durable,
         coalesce_key: None,
+        routing_position: None,
         payload: b"journal".to_vec(),
     };
     let sink = NoopJournalSink;

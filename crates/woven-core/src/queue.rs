@@ -219,6 +219,56 @@ impl OutboundQueue {
         self.critical_capacity_exhausted
     }
 
+    /// Drain eligible messages without moving deferred messages out of the bounded queue.
+    pub(crate) fn drain_matching(
+        &mut self,
+        mut eligible: impl FnMut(&OutboundMessage) -> bool,
+    ) -> Vec<OutboundMessage> {
+        let mut messages = Vec::with_capacity(self.len());
+        for _ in 0..self.critical.len() {
+            let message = self
+                .critical
+                .pop_front()
+                .expect("critical length is unchanged by rotation");
+            if eligible(&message) {
+                messages.push(message);
+            } else {
+                self.critical.push_back(message);
+            }
+        }
+        for _ in 0..self.latest_order.len() {
+            let key = self
+                .latest_order
+                .pop_front()
+                .expect("latest order length is unchanged by rotation");
+            let message = self
+                .latest
+                .get(&key)
+                .expect("latest order and values remain synchronized");
+            if eligible(message) {
+                messages.push(
+                    self.latest
+                        .remove(&key)
+                        .expect("eligible latest value exists"),
+                );
+            } else {
+                self.latest_order.push_back(key);
+            }
+        }
+        for _ in 0..self.best_effort.len() {
+            let message = self
+                .best_effort
+                .pop_front()
+                .expect("best-effort length is unchanged by rotation");
+            if eligible(&message) {
+                messages.push(message);
+            } else {
+                self.best_effort.push_back(message);
+            }
+        }
+        messages
+    }
+
     pub fn drain(&mut self) -> Vec<OutboundMessage> {
         let mut messages = Vec::with_capacity(self.len());
         while let Some(message) = self.pop() {

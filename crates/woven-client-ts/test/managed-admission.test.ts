@@ -8,6 +8,7 @@ import {
   QueueUpdatePayload, RequestAdmissionPayload, QueueStatusRequestPayload,
   QueueHeartbeatPayload, QueueClaimPayload, QueueCancelPayload,
 } from "../generated/woven/protocol/v1.js";
+import { createEnvelope } from "./wire-helpers.js";
 
 const codec = new EnvelopeCodec();
 
@@ -44,7 +45,7 @@ function request(kind: MessageKind, invalid = false): Uint8Array {
       payload = QueueCancelPayload.createQueueCancelPayload(b, ticket); break;
     default: throw new Error("not a request");
   }
-  const root = Envelope.createEnvelope(b, 1, kind, DeliveryClass.ReliableOrdered,
+  const root = createEnvelope(b, 1, kind, DeliveryClass.ReliableOrdered,
     1n, 2n, 0n, 0n, 0n, 0n, 0n, 3n, 0n, 0, (kind - 3) as ControlPayload, payload, 0n);
   Envelope.finishSizePrefixedEnvelopeBuffer(b, root);
   return b.asUint8Array();

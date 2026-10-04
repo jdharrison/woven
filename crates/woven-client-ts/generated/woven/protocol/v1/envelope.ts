@@ -7,6 +7,7 @@ import * as flatbuffers from 'flatbuffers';
 import { ControlPayload, unionToControlPayload, unionListToControlPayload } from '../../../woven/protocol/v1/control-payload.js';
 import { DeliveryClass } from '../../../woven/protocol/v1/delivery-class.js';
 import { MessageKind } from '../../../woven/protocol/v1/message-kind.js';
+import { RoutingPosition3D } from '../../../woven/protocol/v1/routing-position3-d.js';
 
 
 export class Envelope {
@@ -121,8 +122,13 @@ channelId():bigint {
   return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
 }
 
+routingPosition(obj?:RoutingPosition3D):RoutingPosition3D|null {
+  const offset = this.bb!.__offset(this.bb_pos, 36);
+  return offset ? (obj || new RoutingPosition3D()).__init(this.bb!.__indirect(this.bb_pos + offset), this.bb!) : null;
+}
+
 static startEnvelope(builder:flatbuffers.Builder) {
-  builder.startObject(16);
+  builder.startObject(17);
 }
 
 static addProtocolVersion(builder:flatbuffers.Builder, protocolVersion:number) {
@@ -201,6 +207,10 @@ static addChannelId(builder:flatbuffers.Builder, channelId:bigint) {
   builder.addFieldInt64(15, channelId, BigInt('0'));
 }
 
+static addRoutingPosition(builder:flatbuffers.Builder, routingPositionOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(16, routingPositionOffset, 0);
+}
+
 static endEnvelope(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   return offset;
@@ -214,24 +224,4 @@ static finishSizePrefixedEnvelopeBuffer(builder:flatbuffers.Builder, offset:flat
   builder.finish(offset, 'WVN1', true);
 }
 
-static createEnvelope(builder:flatbuffers.Builder, protocolVersion:number, messageKind:MessageKind, deliveryClass:DeliveryClass, namespaceId:bigint, sessionId:bigint, spaceId:bigint, entityId:bigint, spaceEpoch:bigint, serverTick:bigint, senderSequence:bigint, correlationId:bigint, payloadTypeId:bigint, payloadOffset:flatbuffers.Offset, controlType:ControlPayload, controlOffset:flatbuffers.Offset, channelId:bigint):flatbuffers.Offset {
-  Envelope.startEnvelope(builder);
-  Envelope.addProtocolVersion(builder, protocolVersion);
-  Envelope.addMessageKind(builder, messageKind);
-  Envelope.addDeliveryClass(builder, deliveryClass);
-  Envelope.addNamespaceId(builder, namespaceId);
-  Envelope.addSessionId(builder, sessionId);
-  Envelope.addSpaceId(builder, spaceId);
-  Envelope.addEntityId(builder, entityId);
-  Envelope.addSpaceEpoch(builder, spaceEpoch);
-  Envelope.addServerTick(builder, serverTick);
-  Envelope.addSenderSequence(builder, senderSequence);
-  Envelope.addCorrelationId(builder, correlationId);
-  Envelope.addPayloadTypeId(builder, payloadTypeId);
-  Envelope.addPayload(builder, payloadOffset);
-  Envelope.addControlType(builder, controlType);
-  Envelope.addControl(builder, controlOffset);
-  Envelope.addChannelId(builder, channelId);
-  return Envelope.endEnvelope(builder);
-}
 }

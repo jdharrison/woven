@@ -22,10 +22,13 @@ export interface WebTransportBidirectionalStream {
 export interface WebTransportDatagramDuplexStream {
   readonly readable: ReadableStream<Uint8Array>;
   readonly writable: WritableStream<Uint8Array>;
-  readonly incomingMaxAge: number | null;
-  readonly outgoingMaxAge: number | null;
-  readonly incomingHighWaterMark: number;
-  readonly outgoingHighWaterMark: number;
+  /** Current maximum outgoing datagram size, including the entire encoded WVN1 frame. */
+  readonly maxDatagramSize: number;
+  /** Writable WHATWG queue/age settings; ages are milliseconds, null disables expiry. */
+  incomingMaxAge: number | null;
+  outgoingMaxAge: number | null;
+  incomingHighWaterMark: number;
+  outgoingHighWaterMark: number;
 }
 
 export interface WebTransportHash {
@@ -85,6 +88,8 @@ export interface WebTransport {
   readonly ready: Promise<void>;
   readonly closed: Promise<WebTransportCloseInfo>;
   readonly datagrams: WebTransportDatagramDuplexStream;
+  /** Newer runtimes report negotiated reliability; older shims may omit it. */
+  readonly reliability?: "pending" | "reliable-only" | "supports-unreliable";
   createBidirectionalStream(): Promise<WebTransportBidirectionalStream>;
   close(info?: WebTransportCloseInfo): void;
 }

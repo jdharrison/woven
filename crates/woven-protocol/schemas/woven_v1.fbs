@@ -47,7 +47,8 @@ enum MessageKind : ubyte {
   QueueHeartbeat = 36,
   QueueClaim = 37,
   QueueCancel = 38,
-  QueueUpdate = 39
+  QueueUpdate = 39,
+  ClientLog = 40
 }
 
 enum DeliveryClass : ubyte {
@@ -57,6 +58,15 @@ enum DeliveryClass : ubyte {
   LatestValue = 3,
   UnreliableSequenced = 4,
   BestEffortEvent = 5
+}
+
+enum LogLevel : ubyte { Unknown = 0, Info = 1, Warn = 2, Error = 3 }
+
+// Client-to-server only, session-scoped ReliableOrdered; never broadcast.
+// message must contain 1..1024 UTF-8 bytes. Unknown level is invalid.
+table ClientLogPayload {
+  level:LogLevel = Unknown;
+  message:string;
 }
 
 enum AuthenticationScheme : ubyte {
@@ -319,7 +329,14 @@ union ControlPayload {
   QueueHeartbeatPayload = 33,
   QueueClaimPayload = 34,
   QueueCancelPayload = 35,
-  QueueUpdatePayload = 36
+  QueueUpdatePayload = 36,
+  ClientLogPayload = 37
+}
+
+table RoutingPosition3D {
+  x:double;
+  y:double;
+  z:double;
 }
 
 table Envelope {
@@ -339,6 +356,8 @@ table Envelope {
   control:ControlPayload;
   // Appended in v1; 0 means this message is not channel-bearing.
   channel_id:ulong;
+  // Additive positioned-state metadata. Valid only on EntityState when negotiated.
+  routing_position:RoutingPosition3D;
 }
 
 root_type Envelope;

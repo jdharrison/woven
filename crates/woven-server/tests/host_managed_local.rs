@@ -36,6 +36,19 @@ fn scope(value: &Value) -> (u64, u64) {
     )
 }
 
+async fn assert_retained(clients: &mut [Client]) {
+    for client in clients {
+        assert!(
+            client
+                .recv_timeout(Duration::from_millis(25))
+                .await
+                .expect("capacity edit closed an existing native connection")
+                .is_none(),
+            "unexpected traffic on an unsubscribed retained connection"
+        );
+    }
+}
+
 async fn command(
     input: &mut tokio::process::ChildStdin,
     output: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -127,8 +140,8 @@ async fn host_api_to_managed_node() {
         assert_eq!(
             a["spaces"],
             json!([
-                {"spaceId": "1", "epoch": "1", "channelIds": ["1"]},
-                {"spaceId": "2", "epoch": "1", "channelIds": ["1"]}
+                {"kind": "logical", "spaceId": "1", "epoch": "1", "channelIds": ["1", "4"]},
+                {"kind": "logical", "spaceId": "2", "epoch": "1", "channelIds": ["1", "4"]}
             ])
         );
         assert_eq!(a["spaces"], b["spaces"]);
@@ -154,7 +167,7 @@ async fn host_api_to_managed_node() {
             .close_gracefully(Duration::from_secs(2))
             .await
             .unwrap();
-        eprintln!("QUIC: filling Lite 10 slots");
+        eprintln!("QUIC: filling 10 admitted slots");
         let mut admitted = Vec::with_capacity(10);
         for index in 0..10 {
             let mut client = connect(a).await.unwrap();
@@ -199,8 +212,41 @@ async fn host_api_to_managed_node() {
                 .state,
             QueueState::Admitted
         );
-        command(&mut input, &mut output, "claimed").await;
         admitted.push(waiter);
+        assert_eq!(admitted.len(), 10);
+        assert_retained(&mut admitted).await;
+        command(&mut input, &mut output, "claimed").await;
+        assert_retained(&mut admitted).await;
+
+        eprintln!("QUIC: draining five admitted clients, including the claimed waiter");
+        for _ in 0..5 {
+            admitted
+                .pop()
+                .unwrap()
+                .close_gracefully(Duration::from_secs(2))
+                .await
+                .unwrap();
+        }
+        assert_eq!(admitted.len(), 5);
+        assert_retained(&mut admitted).await;
+        command(&mut input, &mut output, "drained").await;
+        assert_retained(&mut admitted).await;
+
+        eprintln!("QUIC: refilling the five restored admission slots before deletion");
+        for index in 0..5 {
+            let mut client = connect(a).await.unwrap();
+            assert_eq!(
+                client
+                    .request_admission(ns, session, 1, format!("refill-{index}"))
+                    .await
+                    .unwrap()
+                    .status,
+                AdmissionStatus::Admitted
+            );
+            admitted.push(client);
+        }
+        assert_eq!(admitted.len(), 10);
+        assert_retained(&mut admitted).await;
         let mut waiting = connect(a).await.unwrap();
         assert_eq!(
             waiting

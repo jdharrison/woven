@@ -40,7 +40,12 @@ impl Client {
             )
             .await?;
         match reply {
-            ControlPayload::AdmissionResult(value) => Ok(value),
+            ControlPayload::AdmissionResult(value) => {
+                if value.status == AdmissionStatus::Admitted {
+                    self.session_scope = Some((namespace_id, session_id));
+                }
+                Ok(value)
+            }
             _ => unreachable!("exchange checks reply kind"),
         }
     }
@@ -136,7 +141,12 @@ impl Client {
             )
             .await?;
         match reply {
-            ControlPayload::QueueUpdate(value) if value.ticket_id == ticket_id => Ok(value),
+            ControlPayload::QueueUpdate(value) if value.ticket_id == ticket_id => {
+                if value.state == QueueState::Admitted {
+                    self.session_scope = Some((namespace_id, session_id));
+                }
+                Ok(value)
+            }
             _ => {
                 self.abort_admission();
                 Err(ClientError::Transport(
@@ -146,8 +156,9 @@ impl Client {
         }
     }
 
-    // Exclusive pre-join exchange: never silently discard application traffic. A timeout
-    // may interrupt read_exact/write_all mid-frame, so the stream must not be reused.
+    // Exclusive pre-join exchange: never silently discard application traffic. Reads
+    // retain framing on cancellation, but write_all and request/reply outcomes can
+    // remain ambiguous after a timeout, so admission still fails closed.
     async fn admission_exchange(
         &mut self,
         namespace_id: u64,
@@ -156,6 +167,7 @@ impl Client {
         control: ControlPayload,
         expected: MessageKind,
     ) -> Result<ControlPayload, ClientError> {
+        self.ensure_admission_allowed()?;
         let mut envelope = Envelope::control(DeliveryClass::ReliableOrdered, control);
         envelope.namespace_id = namespace_id;
         envelope.session_id = session_id;
@@ -196,7 +208,17 @@ impl Client {
         result
     }
 
-    fn abort_admission(&self) {
+    fn ensure_admission_allowed(&self) -> Result<(), ClientError> {
+        if self.datagram_receiver_taken {
+            return Err(ClientError::Transport(
+                "managed admission is unavailable after taking the datagram receiver".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn abort_admission(&mut self) {
+        self.session_scope = None;
         match &self.transport {
             Transport::Quic { connection, .. } => {
                 connection.close(quinn::VarInt::from_u32(0), b"admission stopped");
@@ -213,7 +235,8 @@ impl Client {
     /// Cancellation/timeout closes the connection (including an in-flight admitted
     /// claim), letting the worker release tickets/leases. No transport retries are
     /// attempted: partial stream I/O cannot safely be replayed on this connection.
-    /// Dropping this future also drops the owned client/transport.
+    /// Dropping this future also drops the owned client/transport. Taking a
+    /// datagram receiver first is rejected and closes the connection.
     pub async fn admit_with_cancellation(
         mut self,
         namespace_id: u64,
@@ -222,6 +245,12 @@ impl Client {
         timeout: Duration,
         cancellation: impl Future<Output = ()>,
     ) -> Result<(Self, ManagedAdmissionOutcome), ClientError> {
+        if let Err(error) = self.ensure_admission_allowed() {
+            // The receiver retains a connection clone, so dropping this client alone
+            // cannot be relied on to release the server-side admission.
+            self.abort_admission();
+            return Err(error);
+        }
         if timeout.is_zero() || timeout > MAX_WAIT {
             return Err(ClientError::Transport(
                 "admission deadline must be positive and at most 15 minutes".to_owned(),

@@ -1,16 +1,28 @@
 export {
   WovenClient,
   type WovenConfig,
+  type ClientLogger,
   type WovenError,
   type AdmissionResult,
   type QueueUpdate,
   type ManagedAdmissionOutcome,
 } from "./client.js";
-export { EnvelopeCodec, CodecError, PROTOCOL_VERSION, FILE_IDENTIFIER } from "./codec.js";
-export type { DecodedEnvelope } from "./codec.js";
+export {
+  EnvelopeCodec,
+  CodecError,
+  PROTOCOL_VERSION,
+  FILE_IDENTIFIER,
+  CAPABILITY_POSITIONED_ENTITY_STATE,
+  CAPABILITY_CLIENT_LOG,
+  MAX_LOG_MESSAGE_BYTES,
+} from "./codec.js";
+export type { DecodedEnvelope, RoutingPosition3D } from "./codec.js";
 export {
   AuthenticationScheme,
+  DeliveryClass,
   MessageKind,
+  LogLevel,
+  ClientLogPayload,
   RequestAdmissionPayload,
   AdmissionResultPayload,
   AdmissionStatus,
@@ -26,12 +38,15 @@ export {
   encodeHello,
   encodeAuthenticate,
   encodeJoinSession,
+  encodeLeaveSession,
+  encodeClientLog,
   encodeSubscribeSpace,
   encodeSnapshotRequest,
   encodeSpaceTransition,
   encodeInferenceRequested,
   encodeReliableEvent,
   encodeEntityState,
+  encodeUnreliableEntityState,
   encodeRequestAdmission,
   encodeQueueStatusRequest,
   encodeQueueHeartbeat,

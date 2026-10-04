@@ -53,10 +53,20 @@ The independent admin listener requires a Bearer admin credential on every route
 
 - `GET /v1/node`
 - `PUT`, `GET`, `PATCH`, `DELETE /v1/namespaces/{namespaceId}/sessions/{sessionId}`
+- `PUT /v1/namespaces/{namespaceId}/sessions/{sessionId}/spaces/{spaceId}`
 
 Mutations require the current `Woven-Node-Incarnation` header. PUT accepts
 `revision` (canonical nonzero decimal string), `allocatedCCU` (0–4096), and a
-Host-supplied 64-lowercase-hex `clientToken`. PATCH accepts only revision/capacity;
+Host-supplied 64-lowercase-hex `clientToken`. PUT and PATCH additionally accept optional
+`tickRateHz` (integer 1–120): a publish budget per connected session member per second,
+aggregated across channels/spaces, **not** a simulation scheduler. PUT omission keeps legacy
+session-unlimited behavior (the core connection limit still applies); PATCH omission preserves
+the configured ceiling. Snapshots omit `tickRateHz` unless configured. Rate changes/retries do
+not reset connection/session windows, including across LeaveSession/re-admission/resubscription;
+same-revision retries cannot change the requested rate or its presence. Bounded histories share
+the core membership cap (32 by default), prune expired detached windows before joining, and
+reject a new session rather than evict an unexpired budget. Never-limited sessions drop history
+on leave; disconnect and managed deletion reclaim it. PATCH otherwise accepts only revision/capacity;
 DELETE requires quoted current-revision `If-Match`. Authenticated `GET /v1/node` includes
 `"transports": { "quic": true, "webTransport": { "enabled": <boolean>,
 "certificateSha256"?: "<lowercase-hex>" } }`. The hash is SHA-256 over the DER bytes of the
@@ -65,6 +75,39 @@ listener is enabled. This strict object contains no endpoint address or URL; Hos
 externally reachable endpoint separately. Responses match Host's monitoring contract and never
 return tokens or verifiers. The separate read-only management listener does not expose these
 routes or standalone HTTP admission routes.
+
+Managed Lite exposes spaces 1/2 at epoch 1 with exactly `channelIds: ["1", "4"]`.
+Channel 1 remains ReliableOrdered/Ephemeral; channel 4 is generic opaque
+UnreliableSequenced/Ephemeral state. Both have a 64 KiB payload ceiling. No Stateful
+channel is registered or granted. The authenticated `/v1/node` channel definitions
+and scoped grants match this contract. Host consumers of the former one-channel
+contract must update their exact schema and descriptor channel IDs.
+
+Managed sessions may add at most 64 spatial subspaces (66 spaces total including system scopes
+1/2) with authenticated add-only `PUT
+/v1/namespaces/{namespaceId}/sessions/{sessionId}/spaces/{spaceId}`. The strict body is:
+
+```json
+{
+  "revision": "2",
+  "metersPerUnit": 1.0,
+  "cellSize": 10.0,
+  "interestRadius": 15.0,
+  "exactDistance": true,
+  "bounds": {
+    "min": { "x": -1000.0, "y": -1000.0, "z": -1000.0 },
+    "max": { "x": 1000.0, "y": 1000.0, "z": 1000.0 }
+  }
+}
+```
+
+The node fixes Cartesian3D/SpatialGrid3D, epoch 1, no parent, and channels 1/4. Scale, cell size,
+and radius must be finite and positive; bounds are finite with strict min < max and inclusive at
+runtime. The endpoint shares the session revision, returns `201` for an add and `200` for an exact
+same-revision retry, and never updates/deletes an existing definition. It atomically updates live
+and future exact grants. Unknown/ad-hoc spaces remain unauthorized; there is no wildcard grant.
+Session snapshots expose complete definitions. `/v1/node` advertises the positioned-state and
+managed-spatial capabilities plus 64-additional/66-total limits.
 
 The core worker atomically installs scoped grants, spaces and mandatory admission.
 Tokens are retained only as SHA-256 verifiers; each authenticated connection gets a
@@ -134,6 +177,83 @@ a browser connection descriptor, it must consume an explicitly configured extern
 WebTransport URL; the returned `webtransport_url` is actual local listener metadata and must not
 be relabeled as a public URL behind NAT, ingress, or port mapping.
 
+## Local node/client log capture and Host feed
+
+The shared worker captures `ClientLog` (WVN1 kind 40, capability mask `CAPABILITY_CLIENT_LOG = 2`)
+locally, never broadcasts logs to peers, and never writes them to a database, cloud
+service, or disk. Messages contain 1–1,024 UTF-8 bytes and an Info/Warn/Error level.
+Authorization requires the **actual authenticated joined session**, not merely a
+credential grant or an asserted namespace/session. The worker attaches connection ID,
+namespace/session, capture timestamp, and node-global sequence. Client logs are limited
+to 10 per connection per rolling second and 1,024 aggregate per rolling second;
+rejections do not consume retained-ring capacity. Do not put credentials or sensitive
+application payloads in log messages.
+
+Node entries are limited to `client.connected` on each first successful session
+membership (including admission/queue claim) and `client.disconnected` on leave,
+transport loss, managed revocation, or internal slow-consumer cleanup. Failed/queued
+admissions, duplicate joins/cleanup, and publications/position updates add no entries.
+Node messages are fixed server text, never client-supplied leave reasons.
+
+Managed mode exposes **only on the independent authenticated admin listener**:
+
+```text
+GET /v1/logs?after=0&limit=32
+Authorization: Bearer <independent admin credential>
+Woven-Node-Incarnation: <current incarnation>
+```
+
+Both query parameters are required. `after` is a canonical `u64` decimal (zero allowed);
+`limit` is canonical decimal 1–32. Unknown/duplicate/encoded/noncanonical parameters,
+request bodies, and duplicate headers fail closed. Every log read requires the exact
+current incarnation; missing/stale/duplicate incarnation returns `409`. Existing admin
+concurrency, rate, timeout and `Cache-Control: no-store` safeguards apply. The
+unauthenticated read-only management listener does **not** expose this feed.
+
+The Host-facing JSON contract is:
+
+```json
+{
+  "nodeIncarnation": "current-incarnation",
+  "entries": [{
+    "sequence": "1",
+    "occurredAtMs": 1800000000000,
+    "namespaceId": "1",
+    "sessionId": "1",
+    "connectionId": "1",
+    "source": "node",
+    "event": "client.connected",
+    "level": "info",
+    "message": "session joined"
+  }],
+  "nextSequence": "1",
+  "droppedThrough": "0"
+}
+```
+
+`source` is `client|node`, `event` is
+`client.log|client.connected|client.disconnected`, and `level` is `info|warn|error`.
+IDs/sequences are decimal strings; timestamps are numeric capture-time milliseconds.
+Sequences start at 1 and never wrap within a node incarnation. The global ring retains
+at most **2,048** entries across all tenants. `droppedThrough` is the highest evicted
+sequence (initially `"0"`). Entries are strictly after the requested cursor;
+`nextSequence` is the last **returned** sequence, or `after` when empty. Pages may
+contain fewer than `limit` entries: the total serialized JSON is capped at **48 KiB**,
+including actual worst-case string escaping, safely below the 65,536-byte collection
+ceiling. Use `nextSequence` unchanged for continuation and detect gaps with
+`droppedThrough`.
+
+This is a volatile, best-effort buffer pending external Host collection, **not durable
+logging** or an ACK of Host receipt. Collection does not consume entries. Slow collection,
+eviction, shutdown, or restart can lose logs; a new incarnation requires deliberate
+cursor reconciliation. Host owns any persistence/retention outside Woven.
+
+Bridge-level log authorization, rate, scope, and size rejections return `ProtocolError`
+without closing a healthy connection. **Current adapter limitation:** an oversized or
+otherwise semantically invalid wire `ClientLog` is rejected by the protocol codec before
+it reaches the bridge; QUIC/WebTransport currently treat that decode failure as fatal.
+Nonfatal oversized-wire rejection requires a separate adapter read-loop change.
+
 ## Opt-in static remote native QUIC
 
 The default remains local development: loopback HTTP/QUIC/WebTransport, generated
@@ -189,19 +309,40 @@ the credential file is capped at 4098 bytes.
 ### Deliberately fixed scope, not production tenant authentication
 
 The server explicitly provisions namespace **1**, session **1**, logical broadcast
-spaces **1 and 2**, epoch **1**. The single supplied credential authenticates all
-holders as principal **1**, with read/write grants for that fixed session, those spaces,
-and these channels only:
+spaces **1 and 2**, and bounded Cartesian3D/SpatialGrid3D space **3**, all at epoch **1**.
+Space 3 uses 1 meter/unit, 10-unit cells, a 25-unit exact interest radius, and inclusive
+bounds from `(-1000, -100, -1000)` through `(1000, 500, 1000)`. The single supplied
+credential authenticates all holders as principal **1**, with read/write grants for that
+fixed session, those spaces, and these channels only:
 
 | Channel | Delivery | Persistence | Payload ceiling |
 |---|---|---|---|
 | 1 | ReliableOrdered | Ephemeral | 64 KiB |
 | 2 | LatestValue | Stateful, no TTL | 64 KiB |
+| 4 | UnreliableSequenced | Ephemeral | 64 KiB |
 
 Entity ownership remains per connection and server-assigned; channel 2 requires the
 normal entity/coalescing-key semantics (`Client::publish_state`). Client frame limits
 may impose a smaller practical payload than the channel ceiling. Existing core rate,
 capacity, queue, and policy limits apply; no client policy overrides are introduced.
+
+Development uses the same channels 1/2/4 and separately retains AI status channel 3.
+Channel 4 carries opaque `EntityState`; the server does not impose an application
+payload format. Persistence is resolved from the registered channel via the bounded
+worker. UnreliableSequenced frames use datagrams on every outbound path, including immediate
+flushes and direct write-queue delivery. Unsupported, oversized, or failed datagram
+sends drop without reliable-stream fallback. The 64 KiB payload ceiling is not a
+promise that such a payload fits a negotiated datagram budget. Ephemeral state is
+not cached or replayed to late joiners. Duplicate/older UnreliableSequenced updates
+are rejected without disconnecting; client datagrams carrying control or reliable
+traffic are ignored.
+
+QUIC and WebTransport keep one pending reliable-frame read pinned across datagram
+processing, so a partial size prefix/body cannot lose framing. Transport subscriptions
+activate only after `SubscriptionAccepted` and the client's own `EntityEntered` are
+queued. Peer payloads for pending spaces remain in the original bounded outbound queue
+until activation; other active spaces continue draining. This adds no initial-roster
+message or replay protocol.
 
 This reuses the existing bounded `DevAuthenticator` and WVN1 `Development` authentication
 scheme as a **static scoped credential**. It is not OIDC/JWT validation, per-user tenant

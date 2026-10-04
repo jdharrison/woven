@@ -228,6 +228,7 @@ fn subscription(namespace: u64, session: u64) -> Envelope {
         server_tick: 0,
         sender_sequence: 0,
         correlation_id: None,
+        routing_position: None,
         message: MessagePayload::Control(ControlPayload::SubscribeSpace(SubscribeSpace)),
     }
 }
@@ -329,6 +330,70 @@ async fn provision(server: &ManagedServer, allocated_ccu: u32, token: &str) {
     )
     .await;
     assert_eq!(status, 201);
+}
+
+#[tokio::test]
+async fn managed_channel_four_datagrams_are_ephemeral_and_channel_three_stays_denied() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "f".repeat(64);
+        provision(&server, 1, &token).await;
+        let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN)).await.unwrap();
+        let MessagePayload::Control(ControlPayload::Authenticated(auth)) = peer.authenticate(&token).await.unwrap().message else { panic!("expected authentication") };
+        assert!(matches!(request_admission(&mut peer, "unreliable", 1).await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+        let mut envelope = subscription(1, 1);
+        peer.send(envelope.clone()).await.unwrap();
+        assert!(matches!(peer.recv().await.unwrap().message, MessagePayload::Control(ControlPayload::SubscriptionAccepted(_))));
+        let entered = peer.recv().await.unwrap();
+        assert!(matches!(entered.message, MessagePayload::Control(ControlPayload::EntityEntered(_))));
+        envelope.entity_id = entered.entity_id;
+        envelope.channel_id = Some(4);
+        envelope.delivery_class = DeliveryClass::UnreliableSequenced;
+        envelope.sender_sequence = 1;
+        envelope.message = MessagePayload::EntityState(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7; 25] });
+        let codec = Codec::default();
+        peer.connection.send_datagram(codec.encode(&envelope).unwrap()).unwrap();
+        let datagram = tokio::time::timeout(Duration::from_secs(3), peer.connection.receive_datagram()).await.unwrap().unwrap();
+        assert_eq!(codec.decode(datagram.payload().as_ref()).unwrap(), envelope);
+        let session = woven_core::SessionKey::new(woven_core::NamespaceId::new(1), woven_core::SessionId::new(1));
+        let woven_core::CommandResult::Snapshot(snapshot) = server.worker.execute(woven_core::Command::Snapshot { connection: woven_core::ConnectionId::new(auth.principal_id), session }).await.unwrap() else { panic!("expected snapshot") };
+        assert!(snapshot.state.is_empty());
+        assert_eq!(snapshot.state_bytes, 0);
+        envelope.channel_id = Some(3);
+        peer.connection.send_datagram(codec.encode(&envelope).unwrap()).unwrap();
+        assert!(matches!(peer.recv().await.unwrap().message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::Unauthorized));
+        peer.close();
+    }).await.expect("bounded managed datagram check");
+}
+
+#[tokio::test]
+async fn managed_webtransport_publish_ceiling_is_shared_by_stream_and_datagram_channels() {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new();
+        let server = fixture.server().await;
+        let token = "f".repeat(64);
+        let body = json!({"revision":"1", "allocatedCCU":1, "clientToken":token, "tickRateHz":1}).to_string();
+        assert_eq!(http(server.admin_address, "PUT", "/v1/namespaces/1/sessions/1", &admin_headers(&server), &body).await.0, 201);
+        let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN)).await.unwrap();
+        authenticate(&mut peer, &token).await;
+        assert!(matches!(request_admission(&mut peer, "publish-rate", 1).await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
+        let mut envelope = subscription(1, 1);
+        peer.send(envelope.clone()).await.unwrap();
+        assert!(matches!(peer.recv().await.unwrap().message, MessagePayload::Control(ControlPayload::SubscriptionAccepted(_))));
+        let entered = peer.recv().await.unwrap();
+        envelope.entity_id = entered.entity_id;
+        envelope.sender_sequence = 1;
+        envelope.message = MessagePayload::ReliableEvent(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7] });
+        peer.send(envelope.clone()).await.unwrap();
+        assert_eq!(peer.recv().await.unwrap(), envelope);
+        envelope.message = MessagePayload::EntityState(woven_protocol::OpaquePayload { type_id: 1, bytes: vec![7] });
+        envelope.channel_id = Some(4);
+        envelope.delivery_class = DeliveryClass::UnreliableSequenced;
+        peer.connection.send_datagram(Codec::default().encode(&envelope).unwrap()).unwrap();
+        assert!(matches!(peer.recv().await.unwrap().message, MessagePayload::Control(ControlPayload::ProtocolError(error)) if error.code == ProtocolErrorCode::RateLimited && error.related_message_kind == woven_protocol::MessageKind::EntityState));
+        peer.close();
+    }).await.expect("bounded managed WebTransport publish ceiling");
 }
 
 #[tokio::test]
