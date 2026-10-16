@@ -177,6 +177,23 @@ test("bootstrap is one bounded, cookie-free request; target and cache policy are
     async () => new Response("x".repeat(8_193), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store, private" } })), /bootstrap-too-large/);
 });
 
+for (const cache of ["no-store", "private, no-store"]) {
+  test(`bootstrap accepts Cache-Control: ${cache}`, async () => {
+    const credential = await fetchBootstrap("/api/lobby", target, "https://jdharrison.com", new AbortController().signal,
+      async () => response({}, { "Cache-Control": cache }));
+    assert.equal(credential === syntheticToken, true);
+  });
+}
+
+for (const cache of [null, "private", "no-cache", "max-age=0"]) {
+  test(`bootstrap rejects ${cache === null ? "missing Cache-Control" : `Cache-Control: ${cache}`} without no-store`, async () => {
+    const reply = response({}, { "Cache-Control": cache ?? "" });
+    if (cache === null) reply.headers.delete("Cache-Control");
+    await assert.rejects(fetchBootstrap("/api/lobby", target, "https://jdharrison.com", new AbortController().signal,
+      async () => reply), /bootstrap-cache-policy-unsafe/);
+  });
+}
+
 test("descriptors reject unsafe URLs, imprecise IDs, extra fields and noncanonical routes", () => {
   assert.deepEqual(validateTarget({ ...target }, target.url), target);
   for (const value of ["0", "01", "18446744073709551616", 1]) assert.throws(() => positiveId(value));

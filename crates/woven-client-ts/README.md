@@ -369,9 +369,11 @@ All four scope IDs may be supplied together using `--namespace-id`, `--session-i
 
 Bootstrap performs at most one cookie-free, no-store GET with redirect refusal,
 a shared 10-second request/body deadline, and an 8 KiB streaming ceiling. It requires
-`application/json`, `Cache-Control: no-store, private`, and exactly the pinned target
-fields plus a 64-lowercase-hex session `token`. No invented TTL/identity fields are
-accepted. A browser-delivered shared Bearer is extractable, not a per-visitor secret.
+`application/json`, a `Cache-Control` directive of `no-store` (with or without
+`private`), and exactly the pinned target fields plus a 64-lowercase-hex session
+`token`. Missing cache policy, `no-cache`, `private`, or `max-age` without `no-store`
+are rejected. No invented TTL/identity fields are accepted. A browser-delivered
+shared Bearer is extractable, not a per-visitor secret.
 
 If no approved bootstrap is available, use the same command with
 `--operator-input`. This opens a **headed** isolated Chromium and a trusted password

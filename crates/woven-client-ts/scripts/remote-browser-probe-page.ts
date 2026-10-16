@@ -175,7 +175,7 @@ export async function fetchBootstrap(
       fail("bootstrap-not-json");
     }
     const cache = response.headers.get("cache-control") ?? "";
-    if (!/(?:^|,)\s*no-store\s*(?:,|$)/i.test(cache) || !/(?:^|,)\s*private\s*(?:,|$)/i.test(cache)) {
+    if (!/(?:^|,)\s*no-store\s*(?:,|$)/i.test(cache)) {
       fail("bootstrap-cache-policy-unsafe");
     }
     if (Number(response.headers.get("content-length")) > 8_192 || !response.body) fail("bootstrap-body-invalid");
