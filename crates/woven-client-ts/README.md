@@ -327,6 +327,93 @@ if (outcome.kind === "admission") {
 Calling `cancellation.abort()` closes the connection. Create a fresh client before
 attempting another admission operation.
 
+## Remote browser admission/subscription probe (approval-gated)
+
+This repository-only probe uses the existing SDK, esbuild, and Playwright Chromium;
+no additional dependencies, local Woven server, admin API, or provisioning are involved.
+**Coordinate target/scope recovery and live-traffic approval before using `--run`.**
+A node restart loses in-memory managed sessions; an existing public descriptor or Host
+binding does not prove that its scope/credential exists in the current incarnation.
+
+From `crates/woven-client-ts`, inspect public document metadata without fetching a
+credential or opening WebTransport:
+
+```sh
+npm run probe:remote -- --inspect --page=https://jdharrison.com/weaver/host.html
+```
+
+After the coordinated rollout and managed-scope recovery, the exact live command is:
+
+```sh
+npm run probe:remote -- --run --page=https://jdharrison.com/weaver/host.html
+```
+
+The actual HTTPS document is loaded normally with verified TLS. No document is
+fulfilled/replaced, no Origin header is spoofed, and no certificate hash, insecure
+TLS flag, or proxy is supplied. Its scripts/event handlers and other resources are
+suppressed before injecting the trusted SDK probe; the room therefore cannot
+silently autojoin, publish poses/profiles, or send delayed logs. Script execution is
+then enabled for the probe, without changing the document origin or its CSP headers.
+This is a network admission/subscription check, **not** renderer or two-peer QA.
+The default document is the apex `/`; use the actual client document when its
+bootstrap metas live elsewhere. Dynamically inserted app configuration is not run.
+
+The probe recognizes `weaver-lobby-bootstrap` and `weaver-lobby-target` metas.
+The target is exact v1 JSON with `version: 1`, `url`, and canonical decimal-string
+`namespaceId`, `sessionId`, `spaceId`, `spaceEpoch`. The default pinned endpoint is
+`https://api.woven.host:4434/webtransport`; `--endpoint=https://…/webtransport` selects
+another explicit verified endpoint. `--channel-id=1` is the default subscription.
+All four scope IDs may be supplied together using `--namespace-id`, `--session-id`,
+`--space-id`, and `--space-epoch` with `=value`; never infer current IDs from examples.
+`--bootstrap-path=/route` can select an explicitly approved same-origin route.
+
+Bootstrap performs at most one cookie-free, no-store GET with redirect refusal,
+a shared 10-second request/body deadline, and an 8 KiB streaming ceiling. It requires
+`application/json`, `Cache-Control: no-store, private`, and exactly the pinned target
+fields plus a 64-lowercase-hex session `token`. No invented TTL/identity fields are
+accepted. A browser-delivered shared Bearer is extractable, not a per-visitor secret.
+
+If no approved bootstrap is available, use the same command with
+`--operator-input`. This opens a **headed** isolated Chromium and a trusted password
+dialog on the loaded document. Enter the current matching **session Bearer** there;
+never pass it in argv, environment variables, source, chat, or a file for this tool.
+The input is cleared/removed and credentials remain in browser memory. The tool has
+no credential-file reader or token CLI flag. Never supply owner/admin credentials.
+An interactive desktop/display is required; operator entry consumes the same deadline.
+
+Bounds and evidence:
+
+- One connection, one authentication and `RequestAdmission`, no retries or queue
+  polling. Only `AdmissionStatus.Admitted` succeeds; queued/offered/rejected is not
+  success and the connection is closed.
+- Maximum **90 seconds overall**, including build, navigation, operator input, and
+  cleanup. Connect, admission, subscription write, and startup receive phases each
+  have a maximum 10-second operation deadline; startup reads at most 64 envelopes.
+- Subscription write completion is not an acknowledgement. Require matching
+  `SubscriptionAccepted` namespace/session/space/epoch/channel, a nonzero subscription
+  ID and matching accepted epoch, then a matching-scope nonzero `EntityEntered`.
+- Outbound stream frames are checked against exactly `Hello`, `Authenticate`,
+  `RequestAdmission`, `SubscribeSpace` (`[1, 3, 33, 7]`). Application publishes,
+  `ClientLog`, legacy `JoinSession`, and any other writes are blocked.
+- Always close; success also requires `closeGracefully(2000)` to complete within its
+  two-second bound. Failed construction closes the owned native transport too.
+  Browser cleanup shares that same two-second teardown budget; the isolated
+  Chromium is force-terminated if needed (`browserTeardown: "forced"`).
+  Closure is client-observed, not proof of server CCU release or log persistence.
+- JSON output contains only sanitized metadata, resolved scope, browser/version and
+  timestamps, stage flags, acknowledgement/entity evidence, outbound kinds, and
+  closure outcome. Raw remote errors, bootstrap bodies, tokens, screenshots, HAR,
+  traces, and storage dumps are never emitted or saved. Debug/TLS-key logging
+  environments are refused. No existing browser profile is used.
+
+Focused local/mock checks (no hosted traffic):
+
+```sh
+npm run test:probe
+npm run typecheck
+npm run format:check
+```
+
 ## Running the tests
 
 ```sh

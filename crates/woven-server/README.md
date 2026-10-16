@@ -26,16 +26,25 @@ Managed WebTransport is optional and all-or-nothing. To enable it, also set:
 WOVEN_MANAGED_WEBTRANSPORT=1
 WOVEN_WEBTRANSPORT_BIND=0.0.0.0:8082
 WOVEN_WEBTRANSPORT_PATH=/webtransport
-WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https
 ```
 
 The bind address and request path are explicit; there is no QUIC-plus-one port convention in
-managed mode. The entire comma-separated origin value is limited to 2,048 bytes and contains
-1–64 exact canonical HTTP(S) URL origins. Canonical values use lowercase schemes/hosts, omit
-HTTP/HTTPS default ports, and contain no trailing slash, path, query, fragment, credentials, or
-whitespace. Duplicates are rejected. Requests with a missing `Origin` are rejected, as are exact
-scheme, host, or port mismatches. The path is at most 256 bytes and must be an absolute path
-without a query or fragment. Supplying only part of this group, setting an enable flag other than
+managed mode. `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https` accepts any canonical HTTPS origin,
+including non-default ports, and missing Origin headers from native/service clients. Present
+origins are bounded to 2,048 bytes; HTTP, opaque `null`, userinfo, paths, queries, fragments,
+whitespace, and noncanonical values are rejected. No product-domain registration is required.
+This is only a transport-origin gate: Bearer authentication, exact grants, admission, CCU,
+publish limits, and private admin boundaries remain unchanged.
+
+Restricted/self-hosted and local-development deployments can omit the policy or set it to
+`allowlist`, then supply `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS`. That legacy setting accepts
+1–64 unique canonical HTTP(S) origins in at most 2,048 total bytes, and rejects missing Origin
+headers or exact scheme/host/port mismatches. Canonical values use lowercase schemes/hosts,
+omit default ports, and contain no trailing slash or other URL components. HTTPS mode and an
+allowlist cannot be supplied together. Native QUIC has no browser-origin requirement.
+
+The path is at most 256 bytes and must be an absolute path without a query or fragment. Supplying only part of this group, setting an enable flag other than
 exactly `1`, reusing the native QUIC UDP address, or supplying invalid values fails startup
 closed. When the group is absent, no managed WebTransport socket or task is created and
 capabilities continue to report QUIC only.
@@ -135,7 +144,8 @@ admission semantics. Both listeners use the same managed `WorkerHandle` and WVN1
 isolation, and teardown coverage. `tests/managed_webtransport.rs` adds real TLS-verified
 WebTransport coverage for Bearer authentication, Development-scheme rejection, direct admission,
 queue claim, atomic admission/join followed by subscription, wrong token/scope, exact-origin
-rejection, leaf-fingerprint metadata, scope deletion, and server-drop teardown. The TypeScript
+and generic HTTPS policies, publish limits, leaf-fingerprint metadata, scope deletion, and
+server-drop teardown. The TypeScript
 WebTransport client exposes the same bounded admission/queue operations and cancellation helper;
 its coverage includes a mock WHATWG transport, Rust wire-compatibility fixtures, and a bounded
 headless-Chromium E2E connected to a disposable managed listener.
@@ -155,7 +165,12 @@ descriptors.
 pub struct ManagedWebTransportConfig {
     pub bind_address: std::net::SocketAddr,
     pub path: String,
-    pub allowed_origins: Vec<String>,
+    pub origin_policy: ManagedWebTransportOriginPolicy,
+}
+
+pub enum ManagedWebTransportOriginPolicy {
+    Allowlist(Vec<String>),
+    Https,
 }
 
 pub struct ManagedServerConfig {
@@ -171,7 +186,11 @@ pub struct ManagedServer {
 }
 ```
 
-An embedding Host that constructs `ManagedServerConfig` must now set `webtransport: None` to
+In server `0.5.0`, Rust embeddings replace `allowed_origins: origins` with
+`origin_policy: ManagedWebTransportOriginPolicy::Allowlist(origins)` to retain exact-origin
+behavior, or explicitly select `ManagedWebTransportOriginPolicy::Https`.
+
+An embedding Host that constructs `ManagedServerConfig` must set `webtransport: None` to
 preserve native-QUIC-only behavior, or provide the complete nested configuration. If Host exposes
 a browser connection descriptor, it must consume an explicitly configured externally reachable
 WebTransport URL; the returned `webtransport_url` is actual local listener metadata and must not

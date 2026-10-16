@@ -31,6 +31,8 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
     "test:browser": "node scripts/browser-e2e.mjs",
+    "probe:remote": "node scripts/remote-browser-probe.mjs",
+    "test:probe": "tsx --test test/remote-browser-probe.test.ts test/remote-browser-probe.test.mjs",
     "build": "tsc --project tsconfig.build.json",
     "prepack": "npm run build",
     "test:decode-fixture": "tsx test/decode-fixture.ts",

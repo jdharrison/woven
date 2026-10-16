@@ -1,6 +1,6 @@
 [package]
 name = "woven-transport-quic"
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "QUIC/WebTransport adapter for Woven"
@@ -19,6 +19,7 @@ quinn.workspace = true
 rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 wtransport.workspace = true
 
 [dev-dependencies]

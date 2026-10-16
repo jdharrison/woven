@@ -47,6 +47,9 @@ impl ActivityLogMode {
          Managed mode: set WOVEN_MANAGED_QUIC=1 and the required managed settings.\n\
          Optionally add WOVEN_MANAGED_WEBTRANSPORT=1, WOVEN_WEBTRANSPORT_BIND,\n\
          WOVEN_WEBTRANSPORT_PATH, and WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS.\n\
+         WOVEN_WEBTRANSPORT_ORIGIN_POLICY defaults to allowlist (exact required origins).\n\
+         Set it to https to accept canonical HTTPS origins and missing Origin; omit\n\
+         WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS in https mode. Bearer auth remains required.\n\
          Static remote QUIC: set WOVEN_REMOTE_QUIC=1 and its required settings.\n\
          Management HTTP must remain loopback; inference is disabled in managed/remote modes."
     }

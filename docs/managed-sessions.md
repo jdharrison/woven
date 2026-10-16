@@ -20,14 +20,18 @@ No hosted product/tier names or account models enter core.
   *any* listener binds. No fallback to development credentials or certificates.
 - Optional managed WebTransport is all-or-nothing:
   `WOVEN_MANAGED_WEBTRANSPORT=1`, `WOVEN_WEBTRANSPORT_BIND`,
-  `WOVEN_WEBTRANSPORT_PATH`, and `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS`. It binds a separate,
+  `WOVEN_WEBTRANSPORT_PATH`, and an explicit origin configuration. It binds a separate,
   explicit UDP endpoint; managed mode does not apply the development QUIC-plus-one convention.
-  The path is an exact absolute path of at most 256 bytes with no query or fragment. The entire
-  comma-separated origin setting is at most 2,048 bytes and contains 1–64 exact canonical
-  HTTP(S) URL origins. Schemes and hosts must already be lowercase, default ports must be omitted,
-  and paths (including a trailing slash), queries, fragments, credentials, whitespace, and
-  duplicates are rejected. Browser requests require an exact allowed `Origin`; missing origins
-  are rejected.
+  `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https` accepts every canonical HTTPS origin and missing
+  Origin headers from native/service clients, without per-product domain registration. Present
+  origins are limited to 2,048 bytes; HTTP, opaque `null`, credentials, URL components, whitespace,
+  and noncanonical values are rejected. Authentication and authorization remain independent.
+  For restricted/self-hosted or local-development deployments, omit the policy or choose
+  `allowlist` and supply `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS`: 1–64 unique exact canonical
+  HTTP(S) origins in at most 2,048 total bytes. That mode rejects missing Origin headers and
+  exact scheme/host/port mismatches. Schemes/hosts must be lowercase and default ports omitted.
+  HTTPS mode cannot be combined with an allowlist. The request path remains an exact absolute
+  path of at most 256 bytes without a query or fragment; partial/conflicting settings fail closed.
 - The admin listener is loopback-only in this slice. Host on another machine must
   use an operator-configured authenticated encrypted tunnel/private gateway to it;
   direct private-IP HTTP and public admin exposure are not supported. Host supplies
@@ -449,7 +453,7 @@ policy, distinct principals, correlated rate errors, CCU-one queue/heartbeat/cla
 operations, ticket ownership/cancellation, scope isolation, ordinary-join rejection, DELETE
 teardown, and bounded helper cancellation. `woven-server/tests/managed_webtransport.rs` uses a
 real TLS-verified WebTransport socket and explicit `Origin` to cover Bearer enforcement and
-Development rejection, exact-origin admission, direct/queued admission and claim, atomic
+Development rejection, exact-origin and generic HTTPS admission, direct/queued admission and claim, atomic
 admission/join then subscription, wrong token/scope, DELETE and server-drop teardown, capability
 metadata, and the leaf fingerprint returned by `/v1/node`. Protocol tests cover semantic
 validation and the additive `queue_update_v1` golden.
@@ -500,7 +504,10 @@ expiry and bounds, real loopback QUIC tests for the network path):
    all resources, revokes old tokens, and defeats stale create/update/delete replays.
 8. Wrong CA/hostname fails native TLS; legacy development/static remote tests pass. Managed QUIC
    and WebTransport reject the Development scheme even when the token is otherwise valid.
-9. Managed WebTransport rejects missing/wrong origins, reports only local capability metadata on
+9. Managed WebTransport preserves exact-origin rejection in allowlist mode. HTTPS mode accepts
+   arbitrary canonical HTTPS origins and missing Origin, but rejects HTTP/null/malformed origins
+   and wrong paths without bypassing Bearer auth, scope grants, capacity, or publish limits.
+   It reports only local capability metadata on
    the read-only listener, and reports enabled state plus the live leaf SHA-256 fingerprint—but no
    endpoint URL—through authenticated `/v1/node`.
 

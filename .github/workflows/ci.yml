@@ -83,6 +83,9 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Cache Rust dependencies for the offline browser E2E build
         run: cargo fetch --locked
+      - name: Test bounded remote-probe helpers locally
+        working-directory: crates/woven-client-ts
+        run: npm run test:probe
       - name: Test real browser WebTransport path
         working-directory: crates/woven-client-ts
         run: npm run test:browser -- --iterations=1

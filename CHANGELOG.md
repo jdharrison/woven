@@ -6,6 +6,25 @@ the repository [README](README.md#current-release-versions-and-publication-order
 
 ## Unreleased
 
+### Public HTTPS WebTransport origins
+
+- `woven-transport-quic` `0.4.1` adds `OriginPolicy::https()`: any canonical HTTPS
+  origin or no Origin for native/service clients, with bounded URL validation.
+- `woven-server` `0.5.0` adds explicit `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https`
+  configuration and `ManagedWebTransportOriginPolicy`. Rust embeddings replace
+  `allowed_origins` with `origin_policy`; the environment's legacy exact allowlist
+  remains available and is incompatible with simultaneous HTTPS-mode selection.
+- The reviewed public service unit no longer enumerates consumer domains. Bearer
+  authentication, exact grants, admission/CCU/publish limits, TLS, and loopback/private
+  management boundaries are unchanged. The WVN1 schema and client SDK APIs are unchanged.
+- Add a bounded real-document browser probe that verifies authentication, admitted
+  membership, matching subscription acknowledgement, and entity assignment without
+  application publishes or logging credentials. Local tests do not imply hosted success.
+- Patch `quinn-proto` to `0.11.18` and require `rustls` `0.23.46`, clearing seven
+  QUIC/TLS advisories without suppressions or unrelated registry upgrades.
+- Node activation still clears in-memory managed state and changes incarnation;
+  this change does not implement automatic Host session recovery.
+
 ### Release hardening
 
 - Include the Apache-2.0 license text in every publishable Rust crate and in the npm package.

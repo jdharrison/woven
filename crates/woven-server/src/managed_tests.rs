@@ -88,11 +88,11 @@ fn environment_requires_complete_explicit_nonmixed_configuration() {
     let webtransport = config.webtransport.unwrap();
     assert_eq!(webtransport.path, "/managed-webtransport");
     assert_eq!(
-        webtransport.allowed_origins,
-        [
-            "https://console.example.test",
-            "https://operator.example.test:8443"
-        ]
+        webtransport.origin_policy,
+        ManagedWebTransportOriginPolicy::Allowlist(vec![
+            "https://console.example.test".to_owned(),
+            "https://operator.example.test:8443".to_owned()
+        ])
     );
 
     for (key, value) in [
@@ -168,6 +168,83 @@ fn environment_requires_complete_explicit_nonmixed_configuration() {
     );
     assert!(
         ManagedServerConfig::from_lookup(|key| Ok(too_many_origins.get(key).cloned())).is_err()
+    );
+}
+
+#[test]
+fn webtransport_origin_policy_is_explicit_and_fails_closed() {
+    let mut values = settings();
+    values.extend([
+        ("WOVEN_MANAGED_WEBTRANSPORT", "1".to_owned()),
+        ("WOVEN_WEBTRANSPORT_BIND", "127.0.0.1:0".to_owned()),
+        (
+            "WOVEN_WEBTRANSPORT_PATH",
+            "/managed-webtransport".to_owned(),
+        ),
+        ("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", "https".to_owned()),
+    ]);
+    let parse = |values: &BTreeMap<&str, String>| {
+        ManagedServerConfig::from_lookup(|key| Ok(values.get(key).cloned()))
+    };
+    assert_eq!(
+        parse(&values)
+            .unwrap()
+            .unwrap()
+            .webtransport
+            .unwrap()
+            .origin_policy,
+        ManagedWebTransportOriginPolicy::Https
+    );
+    for missing in values.keys() {
+        let mut incomplete = values.clone();
+        incomplete.remove(missing);
+        assert!(parse(&incomplete).is_err(), "missing {missing}");
+    }
+    for value in ["", "HTTPS", "https ", "unknown", "allowlist"] {
+        let mut invalid_values = values.clone();
+        invalid_values.insert("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", value.to_owned());
+        assert!(parse(&invalid_values).is_err(), "policy {value:?}");
+    }
+    for origins in ["", "https://jdharrison.com"] {
+        let mut conflicting = values.clone();
+        conflicting.insert("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS", origins.to_owned());
+        assert!(parse(&conflicting).is_err());
+    }
+    for policy in ["https", "allowlist", "unknown", ""] {
+        let orphan = BTreeMap::from([("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", policy.to_owned())]);
+        assert!(parse(&orphan).is_err());
+        let mut orphan = settings();
+        orphan.insert("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", policy.to_owned());
+        assert!(parse(&orphan).is_err());
+    }
+
+    values.insert("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", "allowlist".to_owned());
+    values.insert(
+        "WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS",
+        "http://localhost:5173,https://jdharrison.com".to_owned(),
+    );
+    let expected = ManagedWebTransportOriginPolicy::Allowlist(vec![
+        "http://localhost:5173".to_owned(),
+        "https://jdharrison.com".to_owned(),
+    ]);
+    assert_eq!(
+        parse(&values)
+            .unwrap()
+            .unwrap()
+            .webtransport
+            .unwrap()
+            .origin_policy,
+        expected
+    );
+    values.remove("WOVEN_WEBTRANSPORT_ORIGIN_POLICY");
+    assert_eq!(
+        parse(&values)
+            .unwrap()
+            .unwrap()
+            .webtransport
+            .unwrap()
+            .origin_policy,
+        expected
     );
 }
 

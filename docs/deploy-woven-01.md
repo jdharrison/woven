@@ -56,21 +56,28 @@ The reviewed unit requires these listeners:
 | TCP `127.0.0.1:8083` | Loopback only | Authenticated managed admin API |
 | TCP `10.128.0.2:8443` | Private VPC, tagged Host source only | TLS gateway to telemetry and admin |
 
-The browser endpoint permits only these exact origins:
+The reviewed public unit selects `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https`.
+Every canonical HTTPS browser origin, including non-default ports, may open the
+WebTransport connection; native/service clients may omit Origin. No per-product
+origin registration is required. Present HTTP, opaque `null`, malformed, and
+noncanonical origins remain rejected. This does not grant a session: WVN1 Bearer
+authentication, exact scope authorization, admission, capacity, and publish limits
+remain mandatory.
 
-```text
-https://woven.host
-https://signalweave-112358.web.app
-http://127.0.0.1:8000
-http://localhost:8000
-```
+Restricted/self-hosted or local-development nodes may retain the explicit exact
+allowlist mode. Do not combine an allowlist with HTTPS mode. Native QUIC does not
+use browser Origin. Do not expose either loopback listener, add public TCP 8443
+access, or infer client endpoints from the private management address. Ordinary
+HTTP CORS headers do not replace WebTransport's HTTP/3 origin-policy check.
 
-The two HTTP entries are narrowly scoped local-development origins for browser
-validation against the hosted data plane; they do not authorize arbitrary ports or
-non-loopback HTTP sites. A future portfolio deployment must add its exact HTTPS
-origin before browser clients can connect. Certificate hostname coverage does not
-authorize browser origins. Do not add wildcard or arbitrary origins, expose either
-loopback listener, or infer client endpoints from the management address.
+Deploy the matching binary and service configuration together, retaining both the
+previous release and previous unit for rollback. Restarting changes node incarnation
+and clears in-memory managed sessions; inventory existing bindings and use an approved
+recovery/provisioning plan before claiming authenticated readiness. Process health or
+`WebTransport.ready` alone is not admission/subscription validation. The bounded
+`probe:remote` tool in `crates/woven-client-ts` can verify the real HTTPS document
+origin through Bearer authentication, admission, subscription acknowledgement, and
+entity assignment without application publishes or credential logging.
 
 The production firewall should permit public UDP `4433` and `4434`. ACME HTTP-01
 also requires public TCP `80`; Certbot binds it only while issuing or renewing.

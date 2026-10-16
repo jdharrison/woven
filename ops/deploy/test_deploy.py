@@ -29,16 +29,14 @@ class ValidationTests(unittest.TestCase):
         origin_lines = [
             line
             for line in unit.splitlines()
-            if line.startswith("Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=")
+            if line.startswith("Environment=WOVEN_WEBTRANSPORT_ORIGIN_POLICY=")
         ]
         self.assertEqual(
             origin_lines,
-            [
-                "Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS="
-                "https://woven.host,https://signalweave-112358.web.app,"
-                "http://127.0.0.1:8000,http://localhost:8000"
-            ],
+            ["Environment=WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https"],
         )
+        self.assertNotIn("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=", unit)
+        self.assertIn("Environment=WOVEN_MANAGEMENT_BIND=127.0.0.1:8080\n", unit)
         self.assertIn("Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083\n", unit)
         self.assertIn("Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem\n", unit)
         self.assertIn("Environment=WOVEN_TLS_KEY_FILE=/etc/woven/tls/current/privkey.pem\n", unit)
