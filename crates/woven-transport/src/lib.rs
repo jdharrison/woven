@@ -5,6 +5,10 @@
 mod admission;
 mod logging;
 mod metrics;
+mod persistence;
+pub use persistence::{MANAGED_PERSISTENCE_TIMEOUT, ManagedPersistence, ManagedPersistenceError};
+#[cfg(test)]
+mod persistence_tests;
 #[cfg(test)]
 mod tests;
 
@@ -163,6 +167,18 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Resolves when the single owner stops accepting commands, including persistence failure.
+    /// The server must withdraw readiness and stop listeners when this completes.
+    pub async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    /// Synchronous readiness guard; does not imply that any particular mutation is durable.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
     /// Capture a client message through the bounded owner; success is not a persistence ACK.
     pub async fn capture_client_log(
         &self,
@@ -371,9 +387,34 @@ impl WorkerHandle {
     }
 }
 
-/// Spawn the bounded, single-owner core command worker.
-#[allow(clippy::too_many_lines)]
+/// Spawn an ephemeral bounded, single-owner worker (no managed configuration persistence).
 pub fn spawn_worker<A>(worker: TransportIndependentWorker<A>) -> WorkerHandle
+where
+    A: Authenticator + Send + 'static,
+{
+    spawn_worker_inner(worker, None)
+}
+
+/// Spawn with managed mutation durability. Restore the core before calling this function.
+/// Every successful PUT/PATCH/space PUT/DELETE, including retries, saves before its reply
+/// or transport-peer teardown. GETs and rejected mutations never save. Save/export failure
+/// or timeout permanently closes the mailbox; observe `WorkerHandle::closed` to fail readiness.
+/// Only one save can run at a time, with all other commands and maintenance paused.
+pub fn spawn_worker_with_managed_persistence<A>(
+    worker: TransportIndependentWorker<A>,
+    persistence: Arc<dyn ManagedPersistence>,
+) -> WorkerHandle
+where
+    A: Authenticator + Send + 'static,
+{
+    spawn_worker_inner(worker, Some(persistence))
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_worker_inner<A>(
+    worker: TransportIndependentWorker<A>,
+    persistence: Option<Arc<dyn ManagedPersistence>>,
+) -> WorkerHandle
 where
     A: Authenticator + Send + 'static,
 {
@@ -435,7 +476,31 @@ where
                     let _ = reply.send(logs.page(after, limit));
                 }
                 WorkerRequest::Managed { request, reply } => {
+                    let mutating = !matches!(request, woven_core::ManagedRequest::Get { .. });
                     let result = worker.core_mut().manage_at(request, Instant::now());
+                    if mutating
+                        && result.is_ok()
+                        && let Some(persistence) = &persistence
+                    {
+                        let saved = match worker.core().export_managed_checkpoint() {
+                            Ok(checkpoint) => matches!(
+                                tokio::time::timeout(
+                                    MANAGED_PERSISTENCE_TIMEOUT,
+                                    persistence.save(checkpoint),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ),
+                            Err(_) => false,
+                        };
+                        if !saved {
+                            // The in-memory mutation cannot be rolled back safely. Do not ACK,
+                            // process queued work, or expose the undurable state to any caller.
+                            receiver.close();
+                            tracing::error!("managed persistence failed; core worker stopped");
+                            break;
+                        }
+                    }
                     if let Ok(woven_core::ManagedOutcome::Deleted { connections }) = &result {
                         for connection in connections {
                             logs.observe_connection(
@@ -645,6 +710,10 @@ where
                     subscriptions.remove(&connection);
                 }
             }
+        }
+        receiver.close();
+        for recipient in recipients.into_values() {
+            let _ = recipient.shutdown.try_send(());
         }
     });
     WorkerHandle { sender, metrics }

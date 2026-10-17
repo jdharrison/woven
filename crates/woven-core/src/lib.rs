@@ -28,8 +28,11 @@ pub use authority::{
 };
 pub use cache::{CacheEntry, CacheError, CacheKey, CacheService, InMemoryCacheService};
 pub use core::managed::{
-    MAX_MANAGED_SPACES, MAX_MANAGED_SPATIAL_SPACES, ManagedAdmissionSnapshot, ManagedBounds3D,
-    ManagedError, ManagedOutcome, ManagedPoint3D, ManagedRequest, ManagedSnapshot,
+    MANAGED_CHECKPOINT_VERSION, MANAGED_MIGRATION_BASELINE_VERSION, MAX_MANAGED_CCU,
+    MAX_MANAGED_HISTORY, MAX_MANAGED_MIGRATION_ID_BYTES, MAX_MANAGED_SCOPES, MAX_MANAGED_SPACES,
+    MAX_MANAGED_SPATIAL_SPACES, ManagedAdmissionSnapshot, ManagedBounds3D, ManagedCheckpoint,
+    ManagedCheckpointMutation, ManagedCheckpointScope, ManagedCheckpointSpace, ManagedError,
+    ManagedMigrationBaseline, ManagedOutcome, ManagedPoint3D, ManagedRequest, ManagedSnapshot,
     ManagedSpaceSnapshot,
 };
 pub use core::{

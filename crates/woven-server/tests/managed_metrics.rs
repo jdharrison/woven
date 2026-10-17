@@ -46,6 +46,7 @@ impl Fixture {
             private_key_file: self.0.join("key.pem"),
             admin_token_file: self.0.join("admin"),
             webtransport: None,
+            state_directory: None,
         }
     }
 }
@@ -56,7 +57,7 @@ impl Drop for Fixture {
     }
 }
 
-async fn scrape(server: &ManagedServer) -> (String, String) {
+async fn scrape(server: &ManagedServer) -> (String, String, String) {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = tokio::net::TcpStream::connect(server.management_address)
             .await
@@ -77,32 +78,39 @@ async fn scrape(server: &ManagedServer) -> (String, String) {
         assert!(head.lines().any(|line| {
             line.eq_ignore_ascii_case("content-type: text/plain; version=0.0.4; charset=utf-8")
         }));
-        let mut incarnations = head.lines().filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Woven-Node-Incarnation")
-                .then(|| value.trim())
-        });
-        let incarnation = incarnations.next().expect("managed metrics carry identity");
-        assert!(incarnations.next().is_none(), "one incarnation per sample");
-        assert_eq!(incarnation.len(), 48);
-        assert!(
-            incarnation
-                .bytes()
-                .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
-        );
-        (incarnation.to_owned(), body.to_owned())
+        let identity = |header: &str| {
+            let mut values = head.lines().filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(header).then(|| value.trim())
+            });
+            let value = values.next().expect("managed metrics carry identity");
+            assert!(values.next().is_none(), "one value per identity header");
+            assert_eq!(value.len(), 48);
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            value.to_owned()
+        };
+        (
+            identity("Woven-Node-Incarnation"),
+            identity("Woven-Boot-Id"),
+            body.to_owned(),
+        )
     })
     .await
     .expect("bounded metrics scrape")
 }
 
 #[tokio::test]
-async fn managed_metrics_identity_is_stable_and_changes_on_restart() {
+async fn ephemeral_managed_metrics_keep_identity_within_boot_and_reset_on_restart() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let fixture = Fixture::new();
         let first = start_managed(fixture.config()).await.unwrap();
-        let (incarnation, initial) = scrape(&first).await;
+        let (incarnation, boot, initial) = scrape(&first).await;
         assert_eq!(incarnation, first.node_incarnation);
+        assert_eq!(boot, first.boot_id);
         assert!(
             initial
                 .lines()
@@ -115,7 +123,11 @@ async fn managed_metrics_identity_is_stable_and_changes_on_restart() {
         );
         assert!(initial.contains("# TYPE woven_publish_bytes_delivered_total counter\n"));
         assert!(!initial.contains(&incarnation));
-        assert_eq!(scrape(&first).await, (incarnation.clone(), initial.clone()));
+        assert!(!initial.contains(&boot));
+        assert_eq!(
+            scrape(&first).await,
+            (incarnation.clone(), boot.clone(), initial.clone())
+        );
 
         assert!(matches!(
             first
@@ -125,8 +137,9 @@ async fn managed_metrics_identity_is_stable_and_changes_on_restart() {
                 .unwrap(),
             CommandResult::Connected(_)
         ));
-        let (updated_incarnation, updated) = scrape(&first).await;
+        let (updated_incarnation, updated_boot, updated) = scrape(&first).await;
         assert_eq!(updated_incarnation, incarnation);
+        assert_eq!(updated_boot, boot);
         assert!(
             updated
                 .lines()
@@ -137,15 +150,23 @@ async fn managed_metrics_identity_is_stable_and_changes_on_restart() {
                 .lines()
                 .any(|line| line == "woven_connections_active 1")
         );
-        assert_eq!(scrape(&first).await, (incarnation.clone(), updated));
+        assert_eq!(
+            scrape(&first).await,
+            (incarnation.clone(), boot.clone(), updated)
+        );
         drop(first);
 
         let second = start_managed(fixture.config()).await.unwrap();
-        let (new_incarnation, restarted) = scrape(&second).await;
+        let (new_incarnation, new_boot, restarted) = scrape(&second).await;
+        assert_eq!(new_boot, second.boot_id);
+        assert_ne!(new_boot, boot);
         assert_eq!(new_incarnation, second.node_incarnation);
         assert_ne!(new_incarnation, incarnation);
         assert_eq!(restarted, initial);
-        assert_eq!(scrape(&second).await, (new_incarnation, restarted));
+        assert_eq!(
+            scrape(&second).await,
+            (new_incarnation, new_boot, restarted)
+        );
     })
     .await
     .expect("bounded managed metrics lifecycle");

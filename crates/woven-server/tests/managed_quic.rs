@@ -489,6 +489,7 @@ impl Fixture {
             private_key_file: self.path.join("key.pem"),
             admin_token_file: self.path.join("admin"),
             webtransport: None,
+            state_directory: None,
         })
         .await
         .unwrap()

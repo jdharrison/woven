@@ -49,6 +49,11 @@ pub(super) async fn dispatch(state: &AdminState, request: Request) -> Response {
     {
         return error(StatusCode::CONFLICT, "incarnation_conflict");
     }
+    if request.headers().contains_key("woven-boot-id")
+        && single_header(request.headers(), "woven-boot-id") != Some(state.boot_id.as_str())
+    {
+        return error(StatusCode::CONFLICT, "boot_conflict");
+    }
     let bad = || error(StatusCode::BAD_REQUEST, "invalid_request");
     if request.method() != Method::GET || request.headers().contains_key(header::TRANSFER_ENCODING)
     {
@@ -69,7 +74,7 @@ pub(super) async fn dispatch(state: &AdminState, request: Request) -> Response {
     let Ok(page) = state.worker.read_logs(after, limit).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable");
     };
-    match serialize_page(&state.incarnation, after, page) {
+    match serialize_page(&state.incarnation, &state.boot_id, after, page) {
         Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "serialization_failed"),
     }
@@ -96,11 +101,13 @@ fn entry_json(entry: &LogEntry) -> Value {
 
 fn serialize_page(
     incarnation: &str,
+    boot_id: &str,
     after: u64,
     page: LogPage,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut value = json!({
         "nodeIncarnation": incarnation,
+        "bootId": boot_id,
         "entries": [],
         "nextSequence": after.to_string(),
         "droppedThrough": page.dropped_through.to_string(),

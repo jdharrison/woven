@@ -9,6 +9,7 @@ use woven_core::{
 use woven_transport::spawn_worker;
 
 const ADMIN: &str = "log-feed-admin-test-credential-0123456789";
+const BOOT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn request(query: &str, bearer: Option<&str>, incarnation: Option<&str>) -> Request {
     let mut request = Request::builder().uri(format!("/v1/logs{query}"));
@@ -26,6 +27,8 @@ fn state() -> Arc<AdminState> {
     Arc::new(AdminState::new(
         spawn_worker(TransportIndependentWorker::new(core)),
         "node".into(),
+        BOOT.into(),
+        json!({"mode": "ephemeral"}),
         ADMIN,
         None,
     ))
@@ -90,7 +93,82 @@ async fn feed_requires_admin_and_explicit_single_matching_incarnation_on_every_r
     let json: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         json,
-        json!({"nodeIncarnation": "node", "entries": [], "nextSequence": "18446744073709551615", "droppedThrough": "0"})
+        json!({"nodeIncarnation": "node", "bootId": BOOT, "entries": [], "nextSequence": "18446744073709551615", "droppedThrough": "0"})
+    );
+}
+
+#[tokio::test]
+async fn optional_boot_guard_is_exact_single_authenticated_and_never_rewinds_cursors() {
+    let state = state();
+    for token in [None, Some("client-token-is-not-admin-0123456789012")] {
+        let mut request = request("?after=0&limit=1", token, Some("node"));
+        request
+            .headers_mut()
+            .insert("woven-boot-id", "old-boot".parse().unwrap());
+        let response = admin_request(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+    for boot in [
+        "",
+        "old-boot",
+        "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcdef0123456789abcdef,old",
+    ] {
+        let mut request = request("?after=0&limit=1", Some(ADMIN), Some("node"));
+        request
+            .headers_mut()
+            .insert("woven-boot-id", boot.parse().unwrap());
+        let response = admin_request(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"error":{"code":"boot_conflict"}})
+        );
+    }
+    let mut duplicate = request("?after=0&limit=1", Some(ADMIN), Some("node"));
+    for _ in 0..2 {
+        duplicate
+            .headers_mut()
+            .append("woven-boot-id", BOOT.parse().unwrap());
+    }
+    let response = admin_request(State(state.clone()), duplicate).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":{"code":"boot_conflict"}})
+    );
+    for boot in [None, Some(BOOT)] {
+        let mut request = request(
+            "?after=18446744073709551615&limit=1",
+            Some(ADMIN),
+            Some("node"),
+        );
+        if let Some(boot) = boot {
+            request
+                .headers_mut()
+                .insert("woven-boot-id", boot.parse().unwrap());
+        }
+        let response = admin_request(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(page["bootId"], BOOT);
+        assert_eq!(page["entries"], json!([]));
+        assert_eq!(page["nextSequence"], u64::MAX.to_string());
+    }
+    let mut wrong_lineage = request("?after=0&limit=1", Some(ADMIN), Some("other-node"));
+    wrong_lineage
+        .headers_mut()
+        .insert("woven-boot-id", BOOT.parse().unwrap());
+    let response = admin_request(State(state), wrong_lineage).await;
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":{"code":"incarnation_conflict"}})
     );
 }
 
@@ -192,10 +270,13 @@ fn serialized_escaping_budget_preserves_contract_and_continuation_without_skips(
         next_sequence: 32,
         dropped_through: 0,
     };
-    let bytes = serialize_page("incarnation", 0, page).unwrap();
+    let incarnation = "a".repeat(48);
+    let bytes = serialize_page(&incarnation, BOOT, 0, page).unwrap();
     assert!(bytes.len() <= MAX_LOG_RESPONSE_BYTES);
     assert!(bytes.len() < 65536);
     let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["nodeIncarnation"], incarnation);
+    assert_eq!(value["bootId"], BOOT);
     let returned = value["entries"].as_array().unwrap();
     assert!(!returned.is_empty() && returned.len() < 32);
     assert_eq!(value["nextSequence"], returned.last().unwrap()["sequence"]);
@@ -218,7 +299,8 @@ fn serialized_escaping_budget_preserves_contract_and_continuation_without_skips(
         .filter(|entry| entry.sequence > after)
         .collect();
     let bytes = serialize_page(
-        "incarnation",
+        &incarnation,
+        BOOT,
         after,
         LogPage {
             entries: remainder,
@@ -230,5 +312,6 @@ fn serialized_escaping_budget_preserves_contract_and_continuation_without_skips(
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["entries"][0]["sequence"], (after + 1).to_string());
     assert_eq!(value["droppedThrough"], "17");
+    assert_eq!(value["bootId"], BOOT);
     assert!(bytes.len() <= MAX_LOG_RESPONSE_BYTES);
 }

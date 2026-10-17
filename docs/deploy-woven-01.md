@@ -74,6 +74,23 @@ use browser Origin. Do not expose either loopback listener, add public TCP 8443
 access, or infer client endpoints from the private management address. Ordinary
 HTTP CORS headers do not replace WebTransport's HTTP/3 origin-policy check.
 
+## Durable-state activation gate
+
+The opt-in `ops/deploy/woven-server-durability.conf` sets
+`WOVEN_MANAGED_STATE_DIR=/var/lib/woven-managed` and a private systemd
+`StateDirectory`. It is **not installed by the ordinary unit or deploy helper**.
+Do not activate it until an approved complete import exists under the runtime user
+and the binary supports it; missing state must fail closed. Do not add an automatic
+empty initialization or overwrite an existing store. See the
+[durability/import runbook](managed-durability-runbook.md) for file permissions,
+locking, the offline importer and migration blockers.
+
+After activation, normal restarts restore the same scopes/configuration/verifiers
+and managed lineage, with a fresh process boot ID. Configure Host's boot-aware
+metrics/log handling before serving a durable node. Existing deployments whose
+old ephemeral history is lost require a separately reviewed migration; saved
+registration configuration alone is not a complete historical checkpoint.
+
 Deploy the matching binary and service configuration together, retaining both the
 previous release and previous unit for rollback. Restarting changes node incarnation
 and clears in-memory managed sessions; inventory existing bindings and use an approved

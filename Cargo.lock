@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "woven-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ring",
  "serde",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "woven-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "libc",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "woven-transport"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "tokio",
  "tracing",

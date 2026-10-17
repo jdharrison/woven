@@ -6,6 +6,28 @@ the repository [README](README.md#current-release-versions-and-publication-order
 
 ## Unreleased
 
+### Durable managed configuration
+
+- `woven-core` `0.4.1` adds bounded privileged checkpoint export/restore for
+  managed scope IDs, exact revisions/mutation identities, client verifiers,
+  spatial definitions, limits and retired scope/verifier tombstones. No plaintext
+  token, connection, admission queue, entity or application payload is persisted.
+- `woven-transport` `0.4.1` adds a single-owner durable worker that saves successful
+  management mutations before acknowledgement or peer teardown. Save failure or
+  timeout permanently closes the worker and discards queued work.
+- `woven-server` `0.7.0` adds `ManagedServerConfig.state_directory` (a public Rust
+  struct-literal source compatibility change), optional `WOVEN_MANAGED_STATE_DIR`,
+  Linux private/locked atomic state storage, and explicit offline stdin import.
+  Startup validates/restores before binding; missing/corrupt/unsafe state has no
+  empty fallback. Persistence failure withdraws listeners/readiness; unavailable
+  metrics return 503 rather than invented zero gauges.
+- Verified durable stores retain managed lineage across restarts. A fresh `bootId`
+  is exposed in authenticated node/log metadata and `Woven-Boot-Id` metrics headers
+  to distinguish volatile cursor/counter resets. WVN1/client bindings are unchanged.
+- The opt-in production unit drop-in is deliberately separate: approve a complete
+  import/migration before enabling it. Tests use synthetic local state only; they
+  do not imply deployed durability or restoration of lost production history.
+
 ### Exact local origins alongside open HTTPS
 
 - `woven-transport-quic` `0.4.2` adds `OriginPolicy::https_with_allowed_origins`:

@@ -1,9 +1,13 @@
 #![deny(unsafe_code)]
 
-use std::process::ExitCode;
+use std::{
+    io::{IsTerminal, Read},
+    process::ExitCode,
+};
 
 use woven_server::{
-    ManagedServerConfig, RemoteServerConfig, ServerConfig, serve, serve_managed, serve_remote,
+    MAX_MANAGED_STATE_BYTES, ManagedServerConfig, RemoteServerConfig, ServerConfig,
+    import_managed_state, import_managed_state_baseline, serve, serve_managed, serve_remote,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +49,11 @@ impl ActivityLogMode {
          --log-transform  Print entity position and entity-scoped latest-state activity only.\n\
          --log-none       Disable development activity logging (the default).\n\
          Managed mode: set WOVEN_MANAGED_QUIC=1 and the required managed settings.\n\
+         WOVEN_MANAGED_STATE_DIR enables durable managed configuration (existing 0700 dir).\n\
+         --managed-state-import reads a privileged manifest from stdin, initializes only\n\
+         an empty private store, and exits without listeners. Missing state never initializes empty.\n\
+         --managed-state-import-baseline is the separate lost-history baseline importer;\n\
+         it requires migrationBaseline metadata, a new lineage and explicit stdin approval.\n\
          Optionally add WOVEN_MANAGED_WEBTRANSPORT=1, WOVEN_WEBTRANSPORT_BIND,\n\
          WOVEN_WEBTRANSPORT_PATH, and WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS.\n\
          WOVEN_WEBTRANSPORT_ORIGIN_POLICY defaults to allowlist (exact required origins).\n\
@@ -57,7 +66,23 @@ impl ActivityLogMode {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let activity_log_mode = match ActivityLogMode::parse(std::env::args().skip(1)) {
+    let mut arguments = std::env::args().skip(1);
+    let first = arguments.next();
+    let baseline_import = match first.as_deref() {
+        Some("--managed-state-import") => Some(false),
+        Some("--managed-state-import-baseline") => Some(true),
+        _ => None,
+    };
+    if let Some(baseline) = baseline_import {
+        if arguments.next().is_some() {
+            eprintln!(
+                "Offline import flags must be used alone; supply approval only in the privileged stdin manifest."
+            );
+            return ExitCode::FAILURE;
+        }
+        return import_state_cli(baseline).await;
+    }
+    let activity_log_mode = match ActivityLogMode::parse(first.into_iter().chain(arguments)) {
         Ok(mode) => mode,
         Err(message) => {
             println!("{message}");
@@ -97,6 +122,44 @@ async fn main() -> ExitCode {
             eprintln!("Woven node stopped: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+async fn import_state_cli(baseline: bool) -> ExitCode {
+    let result = async {
+        let config = ManagedServerConfig::from_env()?
+            .ok_or_else(|| std::io::Error::other("managed configuration required"))?;
+        if std::io::stdin().is_terminal() {
+            return Err(woven_server::ServerError::Io(std::io::Error::other(
+                "privileged manifest must be supplied on stdin, not interactively",
+            )));
+        }
+        let manifest = tokio::task::spawn_blocking(|| {
+            let mut manifest = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(MAX_MANAGED_STATE_BYTES as u64 + 1)
+                .read_to_end(&mut manifest)?;
+            Ok::<_, std::io::Error>(manifest)
+        })
+        .await
+        .map_err(|_| std::io::Error::other("manifest read failed"))??;
+        if baseline {
+            import_managed_state_baseline(config, manifest).await
+        } else {
+            import_managed_state(config, manifest).await
+        }
+    }
+    .await;
+    if let Ok(receipt) = result {
+        // The receipt contains only the approved lineage, never checkpoint/verifier bytes.
+        println!("{}", serde_json::to_string(&receipt).unwrap_or_default());
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "Managed state import failed; check import mode, approved manifest, baseline approval/new lineage when required, current admin credential, empty private directory and exclusive access. No listeners started."
+        );
+        ExitCode::FAILURE
     }
 }
 

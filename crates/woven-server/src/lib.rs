@@ -5,8 +5,9 @@
 pub mod admission;
 mod managed;
 pub use managed::{
-    ManagedServer, ManagedServerConfig, ManagedWebTransportConfig, ManagedWebTransportOriginPolicy,
-    serve_managed, start_managed,
+    MANAGED_BASELINE_IMPORT_APPROVAL, MAX_MANAGED_STATE_BYTES, ManagedServer, ManagedServerConfig,
+    ManagedStateImportResult, ManagedWebTransportConfig, ManagedWebTransportOriginPolicy,
+    import_managed_state, import_managed_state_baseline, serve_managed, start_managed,
 };
 mod remote;
 pub use remote::{RemoteServer, RemoteServerConfig, serve_remote, start_remote};
@@ -83,6 +84,7 @@ struct AppState {
     inference_enabled: bool,
     worker: WorkerHandle,
     node_incarnation: Option<header::HeaderValue>,
+    boot_id: Option<header::HeaderValue>,
     max_connections: usize,
     max_sessions: usize,
 }
@@ -108,6 +110,7 @@ fn router_with_transports(
         inference_enabled,
         worker,
         None,
+        None,
     )
 }
 
@@ -118,6 +121,7 @@ fn router_with_transports_and_incarnation(
     inference_enabled: bool,
     worker: WorkerHandle,
     node_incarnation: Option<header::HeaderValue>,
+    boot_id: Option<header::HeaderValue>,
 ) -> Router {
     let default_core_config = CoreConfig::default();
     let state = Arc::new(AppState {
@@ -127,6 +131,7 @@ fn router_with_transports_and_incarnation(
         inference_enabled,
         worker,
         node_incarnation,
+        boot_id,
         max_connections: default_core_config.max_connections,
         max_sessions: default_core_config.max_sessions,
     });
@@ -405,10 +410,18 @@ struct HealthResponse {
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
-        status: overall_health(state.quic_enabled),
+        status: overall_health(state.quic_enabled && !state.worker.is_closed()),
         layers: HealthLayers {
-            core: LayerHealth::Active,
-            transport_worker: LayerHealth::Active,
+            core: if state.worker.is_closed() {
+                LayerHealth::Degraded
+            } else {
+                LayerHealth::Active
+            },
+            transport_worker: if state.worker.is_closed() {
+                LayerHealth::Degraded
+            } else {
+                LayerHealth::Active
+            },
             http_control_plane: LayerHealth::Active,
             quic: layer_health(state.quic_enabled),
             webtransport: layer_health(state.webtransport_enabled),
@@ -434,7 +447,7 @@ const fn overall_health(quic_enabled: bool) -> LayerHealth {
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.quic_enabled {
+    if state.quic_enabled && !state.worker.is_closed() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -445,7 +458,9 @@ async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
 /// atomic counters maintained on the hot path regardless of build profile — unlike the
 /// debug-only activity log, this is meant to run in production.
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
-    let live = state.worker.live_counts().await.unwrap_or_default();
+    let Ok(live) = state.worker.live_counts().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let counters = state.worker.metrics().snapshot();
     let mut body = String::new();
 
@@ -534,10 +549,18 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         counters.queue_evicted_total,
     );
 
-    metrics_response(body, state.node_incarnation.as_ref())
+    metrics_response(
+        body,
+        state.node_incarnation.as_ref(),
+        state.boot_id.as_ref(),
+    )
 }
 
-fn metrics_response(body: String, node_incarnation: Option<&header::HeaderValue>) -> Response {
+fn metrics_response(
+    body: String,
+    node_incarnation: Option<&header::HeaderValue>,
+    boot_id: Option<&header::HeaderValue>,
+) -> Response {
     let mut response = (
         [(
             header::CONTENT_TYPE,
@@ -550,6 +573,11 @@ fn metrics_response(body: String, node_incarnation: Option<&header::HeaderValue>
         response
             .headers_mut()
             .insert("woven-node-incarnation", incarnation.clone());
+    }
+    if let Some(boot_id) = boot_id {
+        response
+            .headers_mut()
+            .insert("woven-boot-id", boot_id.clone());
     }
     response
 }
@@ -1002,13 +1030,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_incarnation_header_preserves_exposition() {
+    async fn metrics_identity_headers_preserve_exposition() {
         let worker = test_worker();
         worker
             .execute(woven_core::Command::TransportConnected)
             .await
             .expect("connection is accepted");
         let incarnation = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let boot_id = "abcdef0123456789abcdef0123456789abcdef0123456789";
         let apps = [
             router_with_transports(true, false, None, false, worker.clone()),
             router_with_transports_and_incarnation(
@@ -1018,6 +1047,7 @@ mod tests {
                 false,
                 worker,
                 Some(incarnation.parse().expect("valid incarnation header")),
+                Some(boot_id.parse().expect("valid boot header")),
             ),
         ];
         let mut bodies = Vec::with_capacity(2);
@@ -1043,6 +1073,13 @@ mod tests {
                     .map(|value| value.to_str().expect("ASCII incarnation")),
                 expected_incarnation
             );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("woven-boot-id")
+                    .map(|value| value.to_str().expect("ASCII boot id")),
+                expected_incarnation.map(|_| boot_id),
+            );
             bodies.push(
                 to_bytes(response.into_body(), 16 * 1024)
                     .await
@@ -1053,6 +1090,7 @@ mod tests {
         let body = std::str::from_utf8(&bodies[0]).expect("UTF-8 metrics");
         assert!(body.lines().any(|line| line == "woven_connections_total 1"));
         assert!(!body.contains(incarnation));
+        assert!(!body.contains(boot_id));
     }
 
     #[tokio::test]

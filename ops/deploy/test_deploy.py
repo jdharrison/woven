@@ -53,6 +53,17 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("WOVEN_REMOTE_QUIC", unit)
         self.assertNotIn("ConditionPathIsExecutable", unit)
 
+    def test_durability_dropin_requires_explicit_private_store(self):
+        dropin = Path(__file__).with_name("woven-server-durability.conf").read_text()
+        self.assertEqual(
+            dropin,
+            "[Service]\nStateDirectory=woven-managed\nStateDirectoryMode=0700\n"
+            "Environment=WOVEN_MANAGED_STATE_DIR=/var/lib/woven-managed\n",
+        )
+        self.assertNotIn("ExecStartPre", dropin)
+        self.assertNotIn("--managed-state-import", dropin)
+        self.assertNotIn("WOVEN_ADMIN_TOKEN=", dropin)
+
     def test_exact_sha_only(self):
         self.assertEqual(deploy.validate_args([A]), A)
         for args in [[], [A, B], ["main"], ["a" * 39], ["a" * 41], ["A" * 40],

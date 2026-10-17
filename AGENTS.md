@@ -331,6 +331,18 @@ default); joins prune expired detached histories, but never evict an unexpired b
 history cap rejects a new scope with MembershipLimitReached. Never-limited sessions drop history
 on leave, preserving unlimited-only churn; transport loss/managed teardown remove histories.
 Core connection limits still apply.
+Optional `ManagedServerConfig.state_directory` / `WOVEN_MANAGED_STATE_DIR` restores
+bounded private managed checkpoints before binding listeners. It persists scopes,
+verifiers (never plaintext tokens/admin verifier), revisions/exact last mutations,
+spatial configuration and deletion tombstones. Durable mutations save before ACK;
+save failure/timeout closes the worker and listeners. Missing/corrupt/locked state
+never silently initializes empty. The Linux private store uses a lifetime writer
+lock and atomic file+directory fsync; offline import is explicit stdin only.
+Verified durable `nodeIncarnation` is a managed lineage, not a boot nonce. Fresh
+`bootId`, `Woven-Boot-Id` metrics headers and log pages identify volatile resets.
+Do not infer restored history from a copied lineage or current Host configuration.
+See `docs/managed-durability-runbook.md`; activation/migration remain approval-gated.
+
 No WVN1/schema/binding change. See `docs/managed-sessions.md` for fixed-window semantics.
 
 Managed Lite provisions compatibility/system spaces 1/2 at epoch 1 with exactly channels 1 and 4:

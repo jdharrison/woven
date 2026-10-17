@@ -86,6 +86,7 @@ impl Fixture {
             certificate_file: self.path.join("cert.pem"),
             private_key_file: self.path.join("key.pem"),
             admin_token_file: self.path.join("admin"),
+            state_directory: None,
             webtransport: Some(ManagedWebTransportConfig {
                 bind_address: "127.0.0.1:0".parse().unwrap(),
                 path: "/managed-webtransport".to_owned(),

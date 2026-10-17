@@ -171,6 +171,148 @@ fn environment_requires_complete_explicit_nonmixed_configuration() {
     );
 }
 
+#[tokio::test]
+async fn metrics_returns_unavailable_instead_of_fabricated_zeros_after_worker_failure() {
+    use tower::ServiceExt;
+    use woven_transport::{ManagedPersistence, ManagedPersistenceError};
+    struct FailingStore;
+    impl ManagedPersistence for FailingStore {
+        fn save(
+            &self,
+            _: woven_core::ManagedCheckpoint,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), ManagedPersistenceError>> + Send + '_>,
+        > {
+            Box::pin(std::future::ready(Err(ManagedPersistenceError)))
+        }
+    }
+    let worker = spawn_worker_with_managed_persistence(
+        TransportIndependentWorker::new(
+            managed_core("synthetic-metrics-admin-0123456789").unwrap(),
+        ),
+        Arc::new(FailingStore),
+    );
+    let app = crate::router_with_transports(true, false, None, false, worker.clone());
+    worker
+        .execute(woven_core::Command::TransportConnected)
+        .await
+        .unwrap();
+    let request = || {
+        Request::builder()
+            .uri("/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .any(|line| line == "woven_connections_active 1")
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        worker.manage(ManagedRequest::Put {
+            session: SessionKey::new(NamespaceId::new(1), SessionId::new(1)),
+            revision: 1,
+            allocated_ccu: 1,
+            tick_rate_hz: None,
+            credentials: Credentials::new("a".repeat(64)),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, Err(ManagedError::WorkerUnavailable));
+    assert!(worker.is_closed());
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn stalled_persistence_times_out_permanently_and_readiness_rejects_closed_worker() {
+    use tower::ServiceExt;
+    use woven_transport::{
+        MANAGED_PERSISTENCE_TIMEOUT, ManagedPersistence, ManagedPersistenceError,
+    };
+    struct StalledStore;
+    impl ManagedPersistence for StalledStore {
+        fn save(
+            &self,
+            _: woven_core::ManagedCheckpoint,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), ManagedPersistenceError>> + Send + '_>,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+    let worker = spawn_worker_with_managed_persistence(
+        TransportIndependentWorker::new(
+            managed_core("synthetic-timeout-admin-0123456789").unwrap(),
+        ),
+        Arc::new(StalledStore),
+    );
+    let app = crate::router_with_transports(true, false, None, false, worker.clone());
+    let session = SessionKey::new(NamespaceId::new(1), SessionId::new(1));
+    let outcome = tokio::time::timeout(
+        MANAGED_PERSISTENCE_TIMEOUT + Duration::from_secs(3),
+        worker.manage(ManagedRequest::Put {
+            session,
+            revision: 1,
+            allocated_ccu: 1,
+            tick_rate_hz: None,
+            credentials: Credentials::new("a".repeat(64)),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, Err(ManagedError::WorkerUnavailable));
+    assert!(worker.is_closed());
+    assert!(
+        worker
+            .manage(ManagedRequest::Get { session })
+            .await
+            .is_err()
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
+fn durable_directory_is_explicit_and_never_enables_development_fallback() {
+    let mut values = settings();
+    values.insert("WOVEN_MANAGED_STATE_DIR", "/var/lib/woven-managed".into());
+    let config = ManagedServerConfig::from_lookup(|key| Ok(values.get(key).cloned()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        config.state_directory,
+        Some(PathBuf::from("/var/lib/woven-managed"))
+    );
+    values.remove("WOVEN_MANAGED_QUIC");
+    assert!(ManagedServerConfig::from_lookup(|key| Ok(values.get(key).cloned())).is_err());
+    values.insert("WOVEN_MANAGED_QUIC", "1".into());
+    for path in ["", "relative/state"] {
+        values.insert("WOVEN_MANAGED_STATE_DIR", path.into());
+        assert!(ManagedServerConfig::from_lookup(|key| Ok(values.get(key).cloned())).is_err());
+    }
+}
+
 #[test]
 fn webtransport_origin_policy_is_explicit_and_fails_closed() {
     let mut values = settings();
@@ -362,6 +504,8 @@ async fn admin_limits_and_secret_separation_are_enforced_before_dispatch() {
     let state = Arc::new(AdminState::new(
         worker,
         "node".into(),
+        "b".repeat(48),
+        json!({"mode": "ephemeral"}),
         "test-admin-credential-0123456789012345",
         None,
     ));

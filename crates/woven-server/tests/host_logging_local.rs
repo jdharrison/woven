@@ -150,6 +150,7 @@ async fn host_logging_over_real_local_quic() {
             private_key_file: fixture.join("key.pem"),
             admin_token_file: fixture.join("admin"),
             webtransport: None,
+            state_directory: None,
         })
         .await
         .unwrap();

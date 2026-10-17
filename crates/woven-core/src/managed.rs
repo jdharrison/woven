@@ -7,6 +7,14 @@ use super::{
 };
 use crate::{AuthorizationGrants, CoordinateFrame, NodeId, PublishRateLimit, SpatialBounds3D};
 
+#[path = "managed_checkpoint.rs"]
+mod checkpoint;
+pub use checkpoint::{
+    MANAGED_CHECKPOINT_VERSION, MANAGED_MIGRATION_BASELINE_VERSION, MAX_MANAGED_MIGRATION_ID_BYTES,
+    ManagedCheckpoint, ManagedCheckpointMutation, ManagedCheckpointScope, ManagedCheckpointSpace,
+    ManagedMigrationBaseline,
+};
+
 pub const MAX_MANAGED_SCOPES: usize = 1024;
 pub const MAX_MANAGED_HISTORY: usize = 4096;
 pub const MAX_MANAGED_CCU: u32 = 4096;
@@ -145,6 +153,7 @@ fn client_digest(credentials: &Credentials) -> Result<[u8; 32], ManagedError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedMutation {
+    MigrationBaseline,
     Provision,
     Configuration {
         allocated_ccu: u32,
@@ -223,6 +232,7 @@ fn managed_space_snapshots(scope: &Scope) -> Vec<ManagedSpaceSnapshot> {
 
 pub(super) struct ManagedState {
     admin_verifier: [u8; 32],
+    migration_baseline: Option<ManagedMigrationBaseline>,
     scopes: BTreeMap<SessionKey, Scope>,
     pub(super) connections: BTreeMap<ConnectionId, SessionKey>,
     pub(super) operations: BTreeMap<ConnectionId, (Instant, u8)>,
@@ -271,6 +281,20 @@ impl ManagedState {
             grants,
         ))
     }
+}
+
+fn validate_managed_spatial_descriptor(descriptor: &SpaceDescriptor) -> Result<(), ManagedError> {
+    if descriptor.id.get() <= MANAGED_SYSTEM_SPACE_COUNT as u64
+        || descriptor.epoch != SpaceEpoch::new(1)
+        || descriptor.parent.is_some()
+        || descriptor.bounds.is_none()
+        || !matches!(descriptor.local_frame, CoordinateFrame::Cartesian3D { .. })
+        || !matches!(descriptor.routing, RoutingPolicy::SpatialGrid3D { .. })
+        || descriptor.validate().is_err()
+    {
+        return Err(ManagedError::InvalidRequest);
+    }
+    Ok(())
 }
 
 fn managed_publish_rate_limit(
@@ -330,6 +354,7 @@ impl<A: Authenticator> WovenCore<A> {
         }
         self.managed = Some(ManagedState {
             admin_verifier: digest(admin.token()),
+            migration_baseline: None,
             scopes: BTreeMap::new(),
             connections: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -438,7 +463,8 @@ impl<A: Authenticator> WovenCore<A> {
             if scope.retired {
                 return Err(ManagedError::ScopeRetired);
             }
-            if scope.revision != revision
+            if scope.last_mutation == ManagedMutation::MigrationBaseline
+                || scope.revision != revision
                 || scope.allocated_ccu != allocated_ccu
                 || scope.tick_rate_hz != tick_rate_hz
                 || scope.verifier != verifier
@@ -446,6 +472,12 @@ impl<A: Authenticator> WovenCore<A> {
                 return Err(ManagedError::RevisionConflict);
             }
             return self.managed_snapshot(session, false, now);
+        }
+        if state.migration_baseline.as_ref().is_some_and(|baseline| {
+            session.namespace.get() <= baseline.closed_scope_through
+                || session.session.get() <= baseline.closed_scope_through
+        }) {
+            return Err(ManagedError::ScopeRetired);
         }
         if verifier == state.admin_verifier
             || state
@@ -461,37 +493,7 @@ impl<A: Authenticator> WovenCore<A> {
         }
         self.provision_session(session)
             .map_err(|_| ManagedError::CapacityExhausted)?;
-        let result = (|| {
-            self.set_session_publish_rate_limit(session, policy)?;
-            for id in 1..=2 {
-                self.install_space(
-                    session,
-                    SpaceDescriptor {
-                        id: SpaceId::new(id),
-                        local_frame: CoordinateFrame::Logical,
-                        bounds: None,
-                        parent: None,
-                        epoch: SpaceEpoch::new(1),
-                        routing: RoutingPolicy::BroadcastAll,
-                    },
-                )?;
-            }
-            self.configure_session_admission(
-                session,
-                AdmissionMetadata {
-                    node_id: NodeId::new(1),
-                    session,
-                },
-                QueuePolicy {
-                    reconnect_grace: Duration::ZERO,
-                    ..QueuePolicy::default()
-                },
-                CapacityUpdate {
-                    allocated_ccu,
-                    revision,
-                },
-            )
-        })();
+        let result = self.configure_managed_session(session, revision, allocated_ccu, policy);
         if result.is_err() {
             self.sessions.remove(&session);
             self.admissions.remove(&session);
@@ -514,6 +516,44 @@ impl<A: Authenticator> WovenCore<A> {
                 },
             );
         self.managed_snapshot(session, true, now)
+    }
+
+    fn configure_managed_session(
+        &mut self,
+        session: SessionKey,
+        revision: u64,
+        allocated_ccu: u32,
+        policy: Option<PublishRateLimit>,
+    ) -> Result<(), CoreError> {
+        self.set_session_publish_rate_limit(session, policy)?;
+        for id in 1..=MANAGED_SYSTEM_SPACE_COUNT as u64 {
+            self.install_space(
+                session,
+                SpaceDescriptor {
+                    id: SpaceId::new(id),
+                    local_frame: CoordinateFrame::Logical,
+                    bounds: None,
+                    parent: None,
+                    epoch: SpaceEpoch::new(1),
+                    routing: RoutingPolicy::BroadcastAll,
+                },
+            )?;
+        }
+        self.configure_session_admission(
+            session,
+            AdmissionMetadata {
+                node_id: NodeId::new(1),
+                session,
+            },
+            QueuePolicy {
+                reconnect_grace: Duration::ZERO,
+                ..QueuePolicy::default()
+            },
+            CapacityUpdate {
+                allocated_ccu,
+                revision,
+            },
+        )
     }
 
     fn managed_patch(
@@ -545,7 +585,10 @@ impl<A: Authenticator> WovenCore<A> {
                 Err(ManagedError::RevisionConflict)
             };
         }
-        if revision < scope.revision {
+        if revision < scope.revision
+            || (scope.last_mutation == ManagedMutation::MigrationBaseline
+                && scope.revision.checked_add(1) != Some(revision))
+        {
             return Err(ManagedError::RevisionConflict);
         }
         let resolved_tick_rate_hz = tick_rate_hz.or(scope.tick_rate_hz);
@@ -585,16 +628,7 @@ impl<A: Authenticator> WovenCore<A> {
         now: Instant,
     ) -> Result<ManagedOutcome, ManagedError> {
         self.validate_managed_update(session, revision, 0)?;
-        if descriptor.id.get() <= MANAGED_SYSTEM_SPACE_COUNT as u64
-            || descriptor.epoch != SpaceEpoch::new(1)
-            || descriptor.parent.is_some()
-            || descriptor.bounds.is_none()
-            || !matches!(descriptor.local_frame, CoordinateFrame::Cartesian3D { .. })
-            || !matches!(descriptor.routing, RoutingPolicy::SpatialGrid3D { .. })
-            || descriptor.validate().is_err()
-        {
-            return Err(ManagedError::InvalidRequest);
-        }
+        validate_managed_spatial_descriptor(&descriptor)?;
         let scope = self
             .managed
             .as_ref()

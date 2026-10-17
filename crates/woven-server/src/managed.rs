@@ -1,6 +1,14 @@
 //! Opt-in managed QUIC/WebTransport and an independently authenticated loopback admin listener.
+#[path = "managed_state.rs"]
+mod durable;
 #[path = "managed_logs.rs"]
 mod logs;
+#[path = "managed_import.rs"]
+mod state_import;
+pub use state_import::{
+    MANAGED_BASELINE_IMPORT_APPROVAL, MAX_MANAGED_STATE_BYTES, ManagedStateImportResult,
+    import_managed_state, import_managed_state_baseline,
+};
 #[cfg(test)]
 #[path = "managed_tests.rs"]
 mod tests;
@@ -36,7 +44,7 @@ use woven_core::{
     SpaceDescriptor, SpaceEpoch, SpaceId, SpatialBounds3D, TransportIndependentWorker, WovenCore,
 };
 use woven_protocol::AuthenticationScheme;
-use woven_transport::{WorkerHandle, spawn_worker};
+use woven_transport::{WorkerHandle, spawn_worker, spawn_worker_with_managed_persistence};
 use woven_transport_quic::webtransport::{
     OriginPolicy, ServerEndpoint as WebTransportEndpoint, WebTransportConfig,
     serve_shared_endpoint as serve_webtransport_endpoint,
@@ -147,6 +155,8 @@ pub struct ManagedServerConfig {
     pub admin_token_file: PathBuf,
     /// Optional real WebTransport listener using the same worker and PEM TLS identity.
     pub webtransport: Option<ManagedWebTransportConfig>,
+    /// Existing private Linux VM directory. None preserves ephemeral behavior.
+    pub state_directory: Option<PathBuf>,
 }
 
 impl ManagedServerConfig {
@@ -164,6 +174,8 @@ impl ManagedServerConfig {
         let flag = lookup("WOVEN_MANAGED_QUIC")?;
         let admin_bind = lookup("WOVEN_ADMIN_BIND")?;
         let admin_file = lookup("WOVEN_ADMIN_TOKEN_FILE")?;
+        let state_directory = lookup("WOVEN_MANAGED_STATE_DIR")?;
+
         let webtransport_flag = lookup("WOVEN_MANAGED_WEBTRANSPORT")?;
         let webtransport_bind = lookup("WOVEN_WEBTRANSPORT_BIND")?;
         let webtransport_path = lookup("WOVEN_WEBTRANSPORT_PATH")?;
@@ -172,6 +184,7 @@ impl ManagedServerConfig {
         if flag.is_none() {
             if admin_bind.is_some()
                 || admin_file.is_some()
+                || state_directory.is_some()
                 || webtransport_flag.is_some()
                 || webtransport_bind.is_some()
                 || webtransport_path.is_some()
@@ -250,13 +263,18 @@ impl ManagedServerConfig {
             private_key_file: lookup("WOVEN_TLS_KEY_FILE")?.ok_or_else(invalid)?.into(),
             admin_token_file: admin_file.ok_or_else(invalid)?.into(),
             webtransport,
+            state_directory: state_directory.map(PathBuf::from),
         };
         config.validate()?;
         Ok(Some(config))
     }
 
     fn validate(&self) -> Result<(), ServerError> {
-        if !self.management_bind_address.ip().is_loopback()
+        if self
+            .state_directory
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+            || !self.management_bind_address.ip().is_loopback()
             || !self.admin_bind_address.ip().is_loopback()
             || (self.admin_bind_address.port() != 0
                 && self.admin_bind_address == self.management_bind_address)
@@ -291,6 +309,8 @@ pub struct ManagedServer {
     pub management_address: SocketAddr,
     pub admin_address: SocketAddr,
     pub node_incarnation: String,
+    /// Fresh process identity, independent of the durable managed lineage.
+    pub boot_id: String,
     /// Trusted local integration boundary; never expose this as an unauthenticated HTTP API.
     pub worker: WorkerHandle,
     endpoint: quinn::Endpoint,
@@ -299,6 +319,7 @@ pub struct ManagedServer {
     webtransport_task: Option<tokio::task::JoinHandle<()>>,
     management_task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     admin_task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    closure_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for ManagedServer {
@@ -313,6 +334,7 @@ impl Drop for ManagedServer {
         }
         self.management_task.abort();
         self.admin_task.abort();
+        self.closure_task.abort();
     }
 }
 
@@ -432,32 +454,37 @@ fn spawn_managed_webtransport(
     ))))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "validate and restore all state before composing owned listeners and their closure watcher"
+)]
 pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer, ServerError> {
     config.validate()?;
     let tls = load_managed_tls(&config)?;
     let admin_bytes = read_bounded(&config.admin_token_file, 4098, true)?;
     let admin = validate_token(&admin_bytes)?;
-    let node_incarnation = new_node_incarnation()?;
-    let mut core =
-        WovenCore::new(DevAuthenticator::new(), CoreConfig::default()).map_err(|_| invalid())?;
-    core.enable_managed(&Credentials::new(admin))
-        .map_err(|_| invalid())?;
-    core.register_channel(ChannelDefinition::relay_owned(
-        ChannelId::new(1),
-        DeliveryClass::ReliableOrdered,
-        PersistenceClass::Ephemeral,
-        65536,
-    ))
-    .map_err(|_| invalid())?;
-    core.register_channel(ChannelDefinition::relay_owned(
-        ChannelId::new(4),
-        DeliveryClass::UnreliableSequenced,
-        PersistenceClass::Ephemeral,
-        65536,
-    ))
-    .map_err(|_| invalid())?;
 
-    // No listener or worker is started until all configuration, TLS and secrets validate.
+    let boot_id = durable::boot_id()?;
+    let mut core = managed_core(admin)?;
+    let (node_incarnation, store, managed_state) =
+        if let Some(path) = config.state_directory.clone() {
+            let (store, state) = tokio::task::spawn_blocking(move || durable::Store::load(&path))
+                .await
+                .map_err(|_| state_error())?
+                .map_err(|_| state_error())?;
+            let baseline = state.checkpoint.migration_baseline.clone();
+            core.restore_managed_checkpoint(state.checkpoint)
+                .map_err(|_| state_error())?;
+            (
+                state.node_incarnation,
+                Some(store),
+                state_import::durable_status(baseline.as_ref()),
+            )
+        } else {
+            (new_node_incarnation()?, None, json!({"mode": "ephemeral"}))
+        };
+
+    // No listener or worker starts before the complete durable checkpoint has been restored.
     let endpoint = server_endpoint(config.quic_bind_address, tls.quic)?;
     let webtransport_endpoint = tls
         .webtransport
@@ -480,14 +507,25 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
     let management_address = management_listener.local_addr()?;
     let admin_address = admin_listener.local_addr()?;
     let webtransport_enabled = webtransport_endpoint.is_some();
-    let worker = spawn_worker(TransportIndependentWorker::new(core));
-    let state = Arc::new(AdminState::new(
+    let worker = match store {
+        Some(store) => spawn_worker_with_managed_persistence(
+            TransportIndependentWorker::new(core),
+            durable::Store::persistence(&store),
+        ),
+        None => spawn_worker(TransportIndependentWorker::new(core)),
+    };
+    let state = AdminState::new(
         worker.clone(),
         node_incarnation.clone(),
+        boot_id.clone(),
+        managed_state,
         admin,
         tls.webtransport_certificate_sha256,
-    ));
-    let admin_router = Router::new().fallback(admin_request).with_state(state);
+    );
+
+    let admin_router = Router::new()
+        .fallback(admin_request)
+        .with_state(Arc::new(state));
     let management_router = router_with_transports_and_incarnation(
         true,
         webtransport_enabled,
@@ -495,6 +533,7 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
         false,
         worker.clone(),
         Some(header::HeaderValue::from_str(&node_incarnation).map_err(|_| invalid())?),
+        Some(header::HeaderValue::from_str(&boot_id).map_err(|_| invalid())?),
     );
     let mut quic_config = QuicConfig::new(worker.clone());
     quic_config.expected_authentication_scheme = AuthenticationScheme::Bearer;
@@ -507,6 +546,23 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
     let management_task =
         tokio::spawn(async move { axum::serve(management_listener, management_router).await });
     let admin_task = tokio::spawn(async move { axum::serve(admin_listener, admin_router).await });
+    let closure_task = watch_worker_closure(
+        worker.clone(),
+        endpoint.clone(),
+        webtransport_endpoint.clone(),
+        vec![
+            quic_task.abort_handle(),
+            management_task.abort_handle(),
+            admin_task.abort_handle(),
+        ]
+        .into_iter()
+        .chain(
+            webtransport_task
+                .as_ref()
+                .map(tokio::task::JoinHandle::abort_handle),
+        )
+        .collect(),
+    );
     Ok(ManagedServer {
         quic_address,
         webtransport_address,
@@ -514,6 +570,7 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
         management_address,
         admin_address,
         node_incarnation,
+        boot_id,
         worker,
         endpoint,
         webtransport_endpoint,
@@ -521,7 +578,56 @@ pub async fn start_managed(config: ManagedServerConfig) -> Result<ManagedServer,
         webtransport_task,
         management_task,
         admin_task,
+        closure_task,
     })
+}
+
+fn state_error() -> ServerError {
+    ServerError::QuicConfiguration("managed durable state unavailable or invalid; no empty fallback; use offline --managed-state-import for an approved new store".into())
+}
+
+fn watch_worker_closure(
+    worker: WorkerHandle,
+    endpoint: quinn::Endpoint,
+    webtransport: Option<Arc<WebTransportEndpoint>>,
+    tasks: Vec<tokio::task::AbortHandle>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        worker.closed().await;
+        endpoint.close(0_u32.into(), b"managed worker unavailable");
+        if let Some(endpoint) = webtransport {
+            endpoint.close(
+                wtransport::VarInt::from_u32(0),
+                b"managed worker unavailable",
+            );
+        }
+        for task in tasks {
+            task.abort();
+        }
+    })
+}
+
+fn managed_core(admin: &str) -> Result<WovenCore<DevAuthenticator>, ServerError> {
+    let mut core =
+        WovenCore::new(DevAuthenticator::new(), CoreConfig::default()).map_err(|_| invalid())?;
+    core.enable_managed(&Credentials::new(admin))
+        .map_err(|_| invalid())?;
+    core.register_channel(ChannelDefinition::relay_owned(
+        ChannelId::new(1),
+        DeliveryClass::ReliableOrdered,
+        PersistenceClass::Ephemeral,
+        65536,
+    ))
+    .map_err(|_| invalid())?;
+    core.register_channel(ChannelDefinition::relay_owned(
+        ChannelId::new(4),
+        DeliveryClass::UnreliableSequenced,
+        PersistenceClass::Ephemeral,
+        65536,
+    ))
+    .map_err(|_| invalid())?;
+
+    Ok(core)
 }
 
 async fn optional_task_finished(task: &mut Option<tokio::task::JoinHandle<()>>) {
@@ -548,6 +654,7 @@ pub async fn serve_managed(config: ManagedServerConfig) -> Result<(), ServerErro
     }
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
+        () = server.worker.closed() => return Err(state_error()),
         _ = &mut server.quic_task => return Err(invalid()),
         () = optional_task_finished(&mut server.webtransport_task) => return Err(invalid()),
         _ = &mut server.management_task => return Err(invalid()),
@@ -559,6 +666,8 @@ pub async fn serve_managed(config: ManagedServerConfig) -> Result<(), ServerErro
 struct AdminState {
     worker: WorkerHandle,
     incarnation: String,
+    boot_id: String,
+    managed_state: serde_json::Value,
     webtransport_certificate_sha256: Option<String>,
     verifier: ring::digest::Digest,
     concurrency: tokio::sync::Semaphore,
@@ -569,12 +678,16 @@ impl AdminState {
     fn new(
         worker: WorkerHandle,
         incarnation: String,
+        boot_id: String,
+        managed_state: serde_json::Value,
         admin: &str,
         webtransport_certificate_sha256: Option<String>,
     ) -> Self {
         Self {
             worker,
             incarnation,
+            boot_id,
+            managed_state,
             webtransport_certificate_sha256,
             verifier: ring::digest::digest(&ring::digest::SHA256, admin.as_bytes()),
             concurrency: tokio::sync::Semaphore::new(32),
@@ -638,7 +751,9 @@ fn managed_error(value: ManagedError) -> Response {
 }
 
 async fn admin_request(State(state): State<Arc<AdminState>>, request: Request) -> Response {
-    let mut response = if let Ok(_permit) = state.concurrency.try_acquire() {
+    let mut response = if state.worker.is_closed() {
+        managed_error(ManagedError::WorkerUnavailable)
+    } else if let Ok(_permit) = state.concurrency.try_acquire() {
         if !state.rate_permitted() {
             error(StatusCode::TOO_MANY_REQUESTS, "rate_limited")
         } else if !state.authorized(request.headers()) {
@@ -772,7 +887,7 @@ async fn dispatch(state: &AdminState, request: Request) -> Response {
             || json!({"enabled": false}),
             |certificate_sha256| json!({"enabled": true, "certificateSha256": certificate_sha256}),
         );
-        return Json(json!({"nodeIncarnation": state.incarnation, "transports": {"quic": true, "webTransport": webtransport}, "capabilities": {"positionedEntityState": true, "managedSpatialSubspaces": true}, "limits": {"maxSessions": 1024, "maxScopeHistory": 4096, "maxConnections": 4096, "maxAllocatedCCU": 4096, "maxQueueDepth": 1024, "maxAdditionalManagedSpatialSpaces": MAX_MANAGED_SPATIAL_SPACES, "maxManagedSpaces": MAX_MANAGED_SPACES}, "spaces": [{"spaceId": "1", "epoch": "1", "channelIds": ["1", "4"], "system": true}, {"spaceId": "2", "epoch": "1", "channelIds": ["1", "4"], "system": true}], "channels": [{"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536}, {"channelId": "4", "delivery": "UnreliableSequenced", "persistence": "Ephemeral", "maxPayloadBytes": 65536}]})).into_response();
+        return Json(json!({"nodeIncarnation": state.incarnation, "bootId": state.boot_id, "managedState": state.managed_state, "transports": {"quic": true, "webTransport": webtransport}, "capabilities": {"positionedEntityState": true, "managedSpatialSubspaces": true}, "limits": {"maxSessions": 1024, "maxScopeHistory": 4096, "maxConnections": 4096, "maxAllocatedCCU": 4096, "maxQueueDepth": 1024, "maxAdditionalManagedSpatialSpaces": MAX_MANAGED_SPATIAL_SPACES, "maxManagedSpaces": MAX_MANAGED_SPACES}, "spaces": [{"spaceId": "1", "epoch": "1", "channelIds": ["1", "4"], "system": true}, {"spaceId": "2", "epoch": "1", "channelIds": ["1", "4"], "system": true}], "channels": [{"channelId": "1", "delivery": "ReliableOrdered", "persistence": "Ephemeral", "maxPayloadBytes": 65536}, {"channelId": "4", "delivery": "UnreliableSequenced", "persistence": "Ephemeral", "maxPayloadBytes": 65536}]})).into_response();
     }
     let parts = request.uri().path().split('/').collect::<Vec<_>>();
     if parts.len() == 8

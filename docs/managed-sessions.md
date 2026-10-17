@@ -12,7 +12,13 @@ No hosted product/tier names or account models enter core.
 - A separate, opt-in managed composition is available. Native QUIC is mandatory and
   WebTransport is optional. Existing development and static `RemoteServerConfig` behavior remain
   unchanged; managed and static modes are mutually exclusive. Managed mode starts with no
-  sessions or client tokens.
+  sessions or client tokens in ephemeral mode. Optional `WOVEN_MANAGED_STATE_DIR`
+  restores a verified durable checkpoint before any listener binds; it never
+  silently initializes an empty configured store. See
+  [managed configuration durability](managed-durability-runbook.md). In durable
+  mode, `nodeIncarnation` identifies the retained managed lineage; fresh `bootId`
+  identifies each process for volatile log/counter cursors. Credentials, scope
+  IDs and spatial configuration survive a restart; live connections/entities do not.
 - Required environment: `WOVEN_MANAGED_QUIC=1`, `WOVEN_QUIC_BIND`,
   `WOVEN_MANAGEMENT_BIND` (existing read-only loopback HTTP), `WOVEN_ADMIN_BIND` (separate
   loopback listener), `WOVEN_TLS_CERT_FILE`, `WOVEN_TLS_KEY_FILE`, and
