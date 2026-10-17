@@ -24,13 +24,17 @@ No hosted product/tier names or account models enter core.
   explicit UDP endpoint; managed mode does not apply the development QUIC-plus-one convention.
   `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https` accepts every canonical HTTPS origin and missing
   Origin headers from native/service clients, without per-product domain registration. Present
-  origins are limited to 2,048 bytes; HTTP, opaque `null`, credentials, URL components, whitespace,
-  and noncanonical values are rejected. Authentication and authorization remain independent.
+  origins are limited to 2,048 bytes; opaque `null`, credentials, URL components, whitespace,
+  and noncanonical values are rejected. Optional `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS`
+  adds 1–64 unique canonical exact HTTP(S) exceptions in at most 2,048 total bytes,
+  including commas. For example, `http://localhost:8000,http://127.0.0.1:8000` allows
+  those local origins while retaining all HTTPS and missing-Origin access. Unlisted
+  HTTP origins/ports remain rejected. Authentication and authorization remain independent.
   For restricted/self-hosted or local-development deployments, omit the policy or choose
   `allowlist` and supply `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS`: 1–64 unique exact canonical
   HTTP(S) origins in at most 2,048 total bytes. That mode rejects missing Origin headers and
   exact scheme/host/port mismatches. Schemes/hosts must be lowercase and default ports omitted.
-  HTTPS mode cannot be combined with an allowlist. The request path remains an exact absolute
+  The request path remains an exact absolute
   path of at most 256 bytes without a query or fragment; partial/conflicting settings fail closed.
 - The admin listener is loopback-only in this slice. Host on another machine must
   use an operator-configured authenticated encrypted tunnel/private gateway to it;

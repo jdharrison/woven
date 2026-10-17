@@ -205,10 +205,31 @@ fn webtransport_origin_policy_is_explicit_and_fails_closed() {
         invalid_values.insert("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", value.to_owned());
         assert!(parse(&invalid_values).is_err(), "policy {value:?}");
     }
-    for origins in ["", "https://jdharrison.com"] {
-        let mut conflicting = values.clone();
-        conflicting.insert("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS", origins.to_owned());
-        assert!(parse(&conflicting).is_err());
+    let mut empty_exceptions = values.clone();
+    empty_exceptions.insert("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS", String::new());
+    assert!(parse(&empty_exceptions).is_err());
+    for origins in [
+        vec!["https://jdharrison.com"],
+        vec!["http://localhost:8000", "http://127.0.0.1:8000"],
+        vec![
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "https://jdharrison.com",
+        ],
+    ] {
+        let mut combined = values.clone();
+        combined.insert("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS", origins.join(","));
+        assert_eq!(
+            parse(&combined)
+                .unwrap()
+                .unwrap()
+                .webtransport
+                .unwrap()
+                .origin_policy,
+            ManagedWebTransportOriginPolicy::HttpsWithAllowlist(
+                origins.into_iter().map(str::to_owned).collect()
+            )
+        );
     }
     for policy in ["https", "allowlist", "unknown", ""] {
         let orphan = BTreeMap::from([("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", policy.to_owned())]);
@@ -245,6 +266,92 @@ fn webtransport_origin_policy_is_explicit_and_fails_closed() {
             .unwrap()
             .origin_policy,
         expected
+    );
+}
+
+#[test]
+fn combined_webtransport_origin_exceptions_are_bounded_and_canonical() {
+    let mut values = settings();
+    values.extend([
+        ("WOVEN_MANAGED_WEBTRANSPORT", "1".to_owned()),
+        ("WOVEN_WEBTRANSPORT_BIND", "127.0.0.1:0".to_owned()),
+        (
+            "WOVEN_WEBTRANSPORT_PATH",
+            "/managed-webtransport".to_owned(),
+        ),
+        ("WOVEN_WEBTRANSPORT_ORIGIN_POLICY", "https".to_owned()),
+    ]);
+    let parse = |origins: &str| {
+        let mut values = values.clone();
+        values.insert("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS", origins.to_owned());
+        ManagedServerConfig::from_lookup(|key| Ok(values.get(key).cloned()))
+    };
+    for origin in [
+        "",
+        "null",
+        "*",
+        "http://*.example.test",
+        "https://*.example.test",
+        "not-an-origin",
+        "http://localhost:8000,",
+        ",http://localhost:8000",
+        "http://localhost:8000,http://localhost:8000",
+        "http://localhost:8000, http://127.0.0.1:8000",
+        "http://localhost:8000 ",
+        "HTTP://localhost:8000",
+        "http://LOCALHOST:8000",
+        "http://localhost:80",
+        "https://example.test:443",
+        "http://localhost:8000/",
+        "http://localhost:8000/path",
+        "http://localhost:8000?query",
+        "http://localhost:8000#fragment",
+        "http://user@localhost:8000",
+        "file:///localhost",
+        "wss://localhost:8000",
+    ] {
+        assert!(parse(origin).is_err(), "accepted {origin:?}");
+        let origins = origin.split(',').map(str::to_owned).collect();
+        assert!(
+            ManagedWebTransportConfig {
+                bind_address: "127.0.0.1:0".parse().unwrap(),
+                path: "/managed-webtransport".to_owned(),
+                origin_policy: ManagedWebTransportOriginPolicy::HttpsWithAllowlist(origins),
+            }
+            .validate()
+            .is_err(),
+            "embedding accepted {origin:?}"
+        );
+    }
+    let config = |origins| ManagedWebTransportConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        path: "/managed-webtransport".to_owned(),
+        origin_policy: ManagedWebTransportOriginPolicy::HttpsWithAllowlist(origins),
+    };
+    assert!(config(vec![]).validate().is_err());
+    let mut origins: Vec<String> = (0..MAX_WEBTRANSPORT_ORIGINS)
+        .map(|index| format!("http://o{index}.test"))
+        .collect();
+    assert!(parse(&origins.join(",")).is_ok());
+    assert!(config(origins.clone()).validate().is_ok());
+    origins.push("http://extra.test".to_owned());
+    assert!(origins.join(",").len() < MAX_WEBTRANSPORT_ORIGIN_ENV_BYTES);
+    assert!(parse(&origins.join(",")).is_err());
+    assert!(config(origins).validate().is_err());
+
+    let origin = format!(
+        "http://{}.test",
+        "a".repeat(MAX_WEBTRANSPORT_ORIGIN_ENV_BYTES - "http://.test".len())
+    );
+    assert!(parse(&origin).is_ok());
+    assert!(config(vec![origin.clone()]).validate().is_ok());
+    assert!(parse(&format!("{origin}a")).is_err());
+    assert!(config(vec![format!("{origin}a")]).validate().is_err());
+    assert!(parse(&format!("{origin},http://localhost:8000")).is_err());
+    assert!(
+        config(vec![origin, "http://localhost:8000".to_owned()])
+            .validate()
+            .is_err()
     );
 }
 

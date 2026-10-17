@@ -24,8 +24,30 @@ use wtransport::{
 
 const ADMIN: &str = "managed-webtransport-admin-credential-0123456789";
 const ALLOWED_ORIGIN: &str = "https://console.example.test";
+const LOCAL_ORIGINS: [&str; 2] = ["http://localhost:8000", "http://127.0.0.1:8000"];
 const LIMIT: Duration = Duration::from_secs(30);
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn combined_origin_policy() -> ManagedWebTransportOriginPolicy {
+    ManagedWebTransportOriginPolicy::HttpsWithAllowlist(
+        LOCAL_ORIGINS
+            .into_iter()
+            .chain(["https://jdharrison.com"])
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn origin_policies() -> [(ManagedWebTransportOriginPolicy, &'static str); 3] {
+    [
+        (
+            ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
+            ALLOWED_ORIGIN,
+        ),
+        (ManagedWebTransportOriginPolicy::Https, ALLOWED_ORIGIN),
+        (combined_origin_policy(), LOCAL_ORIGINS[0]),
+    ]
+}
 
 struct Fixture {
     path: PathBuf,
@@ -345,80 +367,104 @@ async fn provision(server: &ManagedServer, allocated_ccu: u32, token: &str) {
 }
 
 #[tokio::test]
-async fn https_origins_and_native_clients_require_bearer_admission_and_subscription() {
-    tokio::time::timeout(LIMIT, async {
-        let fixture = Fixture::new();
-        let server = fixture.server(ManagedWebTransportOriginPolicy::Https).await;
-        let token = "d".repeat(64);
-        provision(&server, 3, &token).await;
-        let mut peers = Vec::new();
-        for (index, origin) in [
-            Some("https://jdharrison.com"),
-            Some("https://unrelated.example.org:8443"),
-            None,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut peer = WirePeer::connect(&fixture, &server, origin).await.unwrap();
-            authenticate(&mut peer, &token).await;
-
-            assert!(matches!(
-                request_admission(&mut peer, &format!("https-origin-{index}"), 1).await.message,
-                MessagePayload::Control(ControlPayload::AdmissionResult(result))
-                    if result.status == AdmissionStatus::Admitted
-            ));
-            assert_subscribed_without_join(&mut peer).await;
-            peers.push(peer);
-        }
-        for origin in [
-            "http://jdharrison.com",
-            "null",
-            "not-an-origin",
-            "https://jdharrison.com/path",
-            "https://jdharrison.com/",
-            "https://user@jdharrison.com",
-            "https://jdharrison.com?query=true",
-            "HTTPS://jdharrison.com",
-            "https://jdharrison.com:443",
-        ] {
-            assert!(
-                WirePeer::connect(&fixture, &server, Some(origin))
-                    .await
-                    .is_err(),
-                "unexpectedly accepted {origin}"
-            );
-        }
-        assert!(
-            WirePeer::connect_path(
-                &fixture,
-                &server,
+async fn https_origins_and_explicit_exceptions_require_bearer_admission_and_subscription() {
+    for origin_policy in [
+        ManagedWebTransportOriginPolicy::Https,
+        combined_origin_policy(),
+    ] {
+        tokio::time::timeout(LIMIT, async {
+            let fixture = Fixture::new();
+            let mut origins = vec![
                 Some("https://jdharrison.com"),
-                "/wrong-path",
-            )
-            .await
-            .is_err()
-        );
-        for peer in peers {
-            peer.close();
-        }
-    })
-    .await
-    .expect("bounded managed HTTPS origin policy checks");
+                Some("https://unrelated.example.org:8443"),
+                None,
+            ];
+            if matches!(
+                origin_policy,
+                ManagedWebTransportOriginPolicy::HttpsWithAllowlist(_)
+            ) {
+                origins.extend(LOCAL_ORIGINS.map(Some));
+            }
+            let server = fixture.server(origin_policy.clone()).await;
+            let token = "d".repeat(64);
+            provision(&server, u32::try_from(origins.len()).unwrap(), &token).await;
+            let mut peers = Vec::new();
+            for (index, origin) in origins.into_iter().enumerate() {
+                let mut peer = WirePeer::connect(&fixture, &server, origin).await.unwrap();
+                authenticate(&mut peer, &token).await;
+
+                assert!(matches!(
+                    request_admission(&mut peer, &format!("https-origin-{index}"), 1).await.message,
+                    MessagePayload::Control(ControlPayload::AdmissionResult(result))
+                        if result.status == AdmissionStatus::Admitted
+                ));
+                assert_subscribed_without_join(&mut peer).await;
+                peers.push(peer);
+            }
+            for origin in [
+                "http://localhost:8001",
+                "http://127.0.0.1:8001",
+                "http://[::1]:8000",
+                "http://localhost:8000/",
+                "http://localhost:8000/path",
+                "http://user@localhost:8000",
+                "http://localhost:8000?query=true",
+                "http://localhost:8000#fragment",
+                "http://jdharrison.com",
+                "http://public.example.org:8000",
+                "null",
+                "not-an-origin",
+                "https://jdharrison.com/path",
+                "https://jdharrison.com/",
+                "https://user@jdharrison.com",
+                "https://jdharrison.com?query=true",
+                "HTTPS://jdharrison.com",
+                "https://jdharrison.com:443",
+            ] {
+                assert!(
+                    WirePeer::connect(&fixture, &server, Some(origin))
+                        .await
+                        .is_err(),
+                    "unexpectedly accepted {origin}"
+                );
+            }
+            if origin_policy == ManagedWebTransportOriginPolicy::Https {
+                for origin in LOCAL_ORIGINS {
+                    assert!(
+                        WirePeer::connect(&fixture, &server, Some(origin))
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            assert!(
+                WirePeer::connect_path(
+                    &fixture,
+                    &server,
+                    Some("https://jdharrison.com"),
+                    "/wrong-path",
+                )
+                .await
+                .is_err()
+            );
+            for peer in peers {
+                peer.close();
+            }
+        })
+        .await
+        .expect("bounded managed HTTPS origin policy checks");
+    }
 }
 
 #[tokio::test]
 async fn managed_channel_four_datagrams_are_ephemeral_and_channel_three_stays_denied() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
         let fixture = Fixture::new();
         let server = fixture.server(origin_policy.clone()).await;
         let token = "f".repeat(64);
         provision(&server, 1, &token).await;
-        let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN)).await.unwrap();
+        let mut peer = WirePeer::connect(&fixture, &server, Some(origin)).await.unwrap();
         let MessagePayload::Control(ControlPayload::Authenticated(auth)) = peer.authenticate(&token).await.unwrap().message else { panic!("expected authentication") };
         assert!(matches!(request_admission(&mut peer, "unreliable", 1).await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
         let mut envelope = subscription(1, 1);
@@ -449,17 +495,14 @@ async fn managed_channel_four_datagrams_are_ephemeral_and_channel_three_stays_de
 
 #[tokio::test]
 async fn managed_webtransport_publish_ceiling_is_shared_by_stream_and_datagram_channels() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
         let fixture = Fixture::new();
         let server = fixture.server(origin_policy.clone()).await;
         let token = "f".repeat(64);
         let body = json!({"revision":"1", "allocatedCCU":1, "clientToken":token, "tickRateHz":1}).to_string();
         assert_eq!(http(server.admin_address, "PUT", "/v1/namespaces/1/sessions/1", &admin_headers(&server), &body).await.0, 201);
-        let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN)).await.unwrap();
+        let mut peer = WirePeer::connect(&fixture, &server, Some(origin)).await.unwrap();
         authenticate(&mut peer, &token).await;
         assert!(matches!(request_admission(&mut peer, "publish-rate", 1).await.message, MessagePayload::Control(ControlPayload::AdmissionResult(result)) if result.status == AdmissionStatus::Admitted));
         let mut envelope = subscription(1, 1);
@@ -483,10 +526,7 @@ async fn managed_webtransport_publish_ceiling_is_shared_by_stream_and_datagram_c
 
 #[tokio::test]
 async fn capabilities_bearer_direct_admission_and_atomic_subscription() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
             let fixture = Fixture::new();
             let server = fixture.server(origin_policy.clone()).await;
@@ -528,7 +568,7 @@ async fn capabilities_bearer_direct_admission_and_atomic_subscription() {
 
             let token = "a".repeat(64);
             provision(&server, 1, &token).await;
-            let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut peer = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             authenticate(&mut peer, &token).await;
@@ -547,16 +587,13 @@ async fn capabilities_bearer_direct_admission_and_atomic_subscription() {
 
 #[tokio::test]
 async fn managed_webtransport_rejects_development_authentication_scheme() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
             let fixture = Fixture::new();
             let server = fixture.server(origin_policy.clone()).await;
             let token = "f".repeat(64);
             provision(&server, 1, &token).await;
-            let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut peer = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             let response = peer
@@ -576,19 +613,16 @@ async fn managed_webtransport_rejects_development_authentication_scheme() {
 
 #[tokio::test]
 async fn queued_connection_claims_and_subscribes_after_disconnect() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
             let fixture = Fixture::new();
             let server = fixture.server(origin_policy.clone()).await;
             let token = "b".repeat(64);
             provision(&server, 1, &token).await;
-            let mut first = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut first = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
-            let mut waiting = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut waiting = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             authenticate(&mut first, &token).await;
@@ -643,15 +677,52 @@ async fn queued_connection_claims_and_subscribes_after_disconnect() {
 }
 
 #[tokio::test]
+async fn zero_capacity_clients_cannot_subscribe_without_admission() {
+    for (origin_policy, origin) in origin_policies() {
+        tokio::time::timeout(LIMIT, async {
+            let fixture = Fixture::new();
+            let server = fixture.server(origin_policy).await;
+            let token = "e".repeat(64);
+            provision(&server, 0, &token).await;
+            let mut peer = WirePeer::connect(&fixture, &server, Some(origin))
+                .await
+                .unwrap();
+            authenticate(&mut peer, &token).await;
+            assert!(matches!(
+                request_admission(&mut peer, "no-capacity", 1).await.message,
+                MessagePayload::Control(ControlPayload::AdmissionResult(result))
+                    if result.status == AdmissionStatus::Paused
+            ));
+            peer.send(subscription(1, 1)).await.unwrap();
+            assert!(matches!(
+                peer.recv().await.unwrap().message,
+                MessagePayload::Control(ControlPayload::ProtocolError(error))
+                    if error.related_message_kind == woven_protocol::MessageKind::SubscribeSpace
+            ));
+            assert!(peer.recv().await.is_err());
+            let (status, snapshot) = http(
+                server.admin_address,
+                "GET",
+                "/v1/namespaces/1/sessions/1",
+                &admin_headers(&server),
+                "",
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(snapshot["admission"]["activeCCU"], 0);
+        })
+        .await
+        .expect("bounded WebTransport capacity and subscription rejection");
+    }
+}
+
+#[tokio::test]
 async fn dropping_managed_server_closes_webtransport_sessions() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
             let fixture = Fixture::new();
             let server = fixture.server(origin_policy.clone()).await;
-            let mut peer = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut peer = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             drop(server);
@@ -664,10 +735,7 @@ async fn dropping_managed_server_closes_webtransport_sessions() {
 
 #[tokio::test]
 async fn wrong_origin_token_scope_and_deleted_scope_fail_closed() {
-    for origin_policy in [
-        ManagedWebTransportOriginPolicy::Allowlist(vec![ALLOWED_ORIGIN.to_owned()]),
-        ManagedWebTransportOriginPolicy::Https,
-    ] {
+    for (origin_policy, origin) in origin_policies() {
         tokio::time::timeout(LIMIT, async {
             let fixture = Fixture::new();
             let server = fixture.server(origin_policy.clone()).await;
@@ -688,7 +756,7 @@ async fn wrong_origin_token_scope_and_deleted_scope_fail_closed() {
 
             let token = "c".repeat(64);
             provision(&server, 2, &token).await;
-            let mut wrong_token = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut wrong_token = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             assert!(matches!(
@@ -697,7 +765,7 @@ async fn wrong_origin_token_scope_and_deleted_scope_fail_closed() {
                     if error.code == ProtocolErrorCode::Unauthorized
             ));
 
-            let mut wrong_scope = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut wrong_scope = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             authenticate(&mut wrong_scope, &token).await;
@@ -718,7 +786,7 @@ async fn wrong_origin_token_scope_and_deleted_scope_fail_closed() {
                     if error.code == ProtocolErrorCode::Unauthorized
             ));
 
-            let mut admitted = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut admitted = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             authenticate(&mut admitted, &token).await;
@@ -741,7 +809,7 @@ async fn wrong_origin_token_scope_and_deleted_scope_fail_closed() {
                 204
             );
             assert!(admitted.recv().await.is_err());
-            let mut revoked = WirePeer::connect(&fixture, &server, Some(ALLOWED_ORIGIN))
+            let mut revoked = WirePeer::connect(&fixture, &server, Some(origin))
                 .await
                 .unwrap();
             assert!(matches!(

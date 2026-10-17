@@ -59,13 +59,17 @@ The reviewed unit requires these listeners:
 The reviewed public unit selects `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https`.
 Every canonical HTTPS browser origin, including non-default ports, may open the
 WebTransport connection; native/service clients may omit Origin. No per-product
-origin registration is required. Present HTTP, opaque `null`, malformed, and
-noncanonical origins remain rejected. This does not grant a session: WVN1 Bearer
+origin registration is required. The unit also sets
+`WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000,https://jdharrison.com`
+as exact exceptions, preserving local HTTP development without narrowing HTTPS
+access. The deployed-site HTTPS entry is redundant but explicit. Other HTTP
+origins/ports, opaque `null`, malformed and noncanonical origins remain rejected. This does not grant a session: WVN1 Bearer
 authentication, exact scope authorization, admission, capacity, and publish limits
 remain mandatory.
 
 Restricted/self-hosted or local-development nodes may retain the explicit exact
-allowlist mode. Do not combine an allowlist with HTTPS mode. Native QUIC does not
+allowlist mode. In HTTPS mode, a bounded nonempty list adds exact exceptions;
+it does not restrict HTTPS origins or disable missing-Origin access. Native QUIC does not
 use browser Origin. Do not expose either loopback listener, add public TCP 8443
 access, or infer client endpoints from the private management address. Ordinary
 HTTP CORS headers do not replace WebTransport's HTTP/3 origin-policy check.

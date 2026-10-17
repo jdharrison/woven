@@ -327,6 +327,50 @@ if (outcome.kind === "admission") {
 Calling `cancellation.abort()` closes the connection. Create a fresh client before
 attempting another admission operation.
 
+## Remote origin-readiness probe (approval-gated, no authentication)
+
+From `crates/woven-client-ts`, `npm run probe:origin` (or `-- --inspect`) prints
+only a plan: **no network, browser, or local listeners**. After deployment and
+explicit operator approval for the target and document origins, run:
+
+```sh
+npm run probe:origin -- --run --endpoint=https://api.woven.host:4434/webtransport
+```
+
+This separate probe attempts WebTransport **readiness only** from real Documents
+at `http://127.0.0.1:8000`, `http://localhost:8000`, `https://woven.host`, and
+`https://jdharrison.com`, plus a negative control at `http://127.0.0.1:8001`.
+It exclusively binds its own bounded IPv4 loopback servers on ports 8000/8001
+before remote navigation; occupied ports fail safely, without killing a port
+owner. Chromium resolves only `localhost` to that owned IPv4 listener, without
+changing the Document origin. Only each requested root document can load (at
+most four requests); other redirect URLs, site resources and scripts/handlers
+are blocked, including bootstrap/auth paths. Site JavaScript remains
+disabled even while CDP evaluates the operator's single native WebTransport
+constructor. Timeout callbacks are driven by bounded Node timers through CDP,
+not disabled page timers. Main Documents are never fulfilled and Origin headers are never
+spoofed; verified TLS and the real Document's CSP remain in force.
+
+There are at most five sequential connections, one per origin, with no retries:
+6-second navigation, 4-second readiness, 500-ms transport close, a shared
+82-second work budget and bounded cleanup, with a hard watchdog at 89 seconds.
+No SDK bundle, credentials, bootstrap, WVN1 Hello/authentication, admission,
+streams, datagram writes, publications, provisioning, or saved browser artifacts
+are involved. Debug/inspector/TLS-key logging environments are refused.
+
+JSON reports only bounded metadata and fixed outcomes. Exit 0 requires all four
+positive origins ready/closed and a negative handshake rejection/closure; a
+negative timeout, CSP block, or document failure is inconclusive and exits 1.
+**Neither readiness nor a rejected handshake proves Woven authentication,
+admission, or origin-policy enforcement.** Generic handshake rejection can also
+mean TLS/network, HTTP authentication, or other endpoint failure. Even exit 0
+reports `originPolicyVerified: false`; correlate server-side evidence separately
+before attributing the negative rejection to origin policy.
+
+Pure mocked checks (no browser or network): `npm run test:probe:origin`.
+The separate `npm run test:probe:origin:local` checks real loopback HTML and CDP
+isolation with a mocked transport; it never contacts a remote site or endpoint.
+
 ## Remote browser admission/subscription probe (approval-gated)
 
 This repository-only probe uses the existing SDK, esbuild, and Playwright Chromium;

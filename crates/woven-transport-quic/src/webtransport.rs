@@ -37,7 +37,7 @@ const CLOSE_TRANSPORT: u32 = 0x101;
 /// A policy for browser `Origin` request headers.
 ///
 /// By default, only requests without that header are accepted so native local test clients
-/// can connect. Explicit policies support either a bounded exact allowlist or HTTPS origins.
+/// can connect. Explicit policies support a bounded exact allowlist, HTTPS origins, or both.
 #[derive(Clone, Debug)]
 pub struct OriginPolicy {
     allowed_origins: Arc<[Arc<str>]>,
@@ -75,8 +75,52 @@ impl OriginPolicy {
         }
     }
 
+    /// Accept HTTPS origins and missing origins as in [`Self::https`], plus exact exceptions.
+    ///
+    /// Exceptions must be 1..=64 unique canonical serialized HTTP(S) origins, totaling at most
+    /// 2,048 bytes including comma separators. Wildcards and non-origin URL components are
+    /// rejected. HTTP exceptions match only the configured scheme, host, and port; they do
+    /// not relax authentication or admission requirements.
+    pub fn https_with_allowed_origins(
+        allowed_origins: Vec<Arc<str>>,
+    ) -> Result<Self, HttpsOriginPolicyError> {
+        if allowed_origins.is_empty() || allowed_origins.len() > MAX_ALLOWED_ORIGINS {
+            return Err(HttpsOriginPolicyError);
+        }
+        let total_bytes = allowed_origins
+            .iter()
+            .fold(0_usize, |total, origin| total.saturating_add(origin.len()))
+            .saturating_add(allowed_origins.len() - 1);
+        if total_bytes > MAX_HTTPS_ORIGIN_BYTES {
+            return Err(HttpsOriginPolicyError);
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        for origin in &allowed_origins {
+            let parsed = url::Url::parse(origin).map_err(|_| HttpsOriginPolicyError)?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.origin().ascii_serialization() != origin.as_ref()
+                || origin.contains('*')
+                || !unique.insert(origin)
+            {
+                return Err(HttpsOriginPolicyError);
+            }
+        }
+        Ok(Self {
+            allowed_origins: allowed_origins.into(),
+            ..Self::https()
+        })
+    }
+
     fn allows(&self, origin: Option<&str>) -> bool {
         match origin {
+            Some(origin)
+                if self
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed.as_ref() == origin) =>
+            {
+                true
+            }
             Some(origin) if self.allow_https_origins => {
                 if origin.len() > MAX_HTTPS_ORIGIN_BYTES || origin.chars().any(char::is_whitespace)
                 {
@@ -89,10 +133,7 @@ impl OriginPolicy {
                 // the serialized origin so normalization cannot hide extra URL components.
                 parsed.scheme() == "https" && parsed.origin().ascii_serialization() == origin
             }
-            Some(origin) => self
-                .allowed_origins
-                .iter()
-                .any(|allowed| allowed.as_ref() == origin),
+            Some(_) => false,
             None => self.allow_missing_origin,
         }
     }
@@ -122,6 +163,20 @@ impl std::fmt::Display for OriginPolicyError {
 }
 
 impl std::error::Error for OriginPolicyError {}
+
+/// Invalid exact exceptions supplied to [`OriginPolicy::https_with_allowed_origins`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HttpsOriginPolicyError;
+
+impl std::fmt::Display for HttpsOriginPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "HTTPS origin exceptions require 1..=64 unique canonical HTTP(S) origins without wildcards, totaling at most 2,048 bytes including commas",
+        )
+    }
+}
+
+impl std::error::Error for HttpsOriginPolicyError {}
 
 /// Configuration shared by WebTransport session handlers.
 #[derive(Clone)]
@@ -678,64 +733,74 @@ mod tests {
 
     #[test]
     fn https_origin_policy_accepts_canonical_https_origins_and_missing_origin() {
-        let policy = OriginPolicy::https();
-        assert!(policy.allows(None));
-        for origin in [
-            "https://example.com",
-            "https://another.example.org",
-            "https://example.com:8443",
-            "https://another.example.org:9443",
-            "https://localhost:3000",
-            "https://127.0.0.1:4443",
-            "https://[::1]:4443",
-            "https://xn--bcher-kva.example",
+        for policy in [
+            OriginPolicy::https(),
+            OriginPolicy::https_with_allowed_origins(vec![Arc::from("http://localhost:8000")])
+                .unwrap(),
         ] {
-            assert!(policy.allows(Some(origin)), "rejected {origin:?}");
+            assert!(policy.allows(None));
+            for origin in [
+                "https://example.com",
+                "https://another.example.org",
+                "https://example.com:8443",
+                "https://another.example.org:9443",
+                "https://localhost:3000",
+                "https://127.0.0.1:4443",
+                "https://[::1]:4443",
+                "https://xn--bcher-kva.example",
+            ] {
+                assert!(policy.allows(Some(origin)), "rejected {origin:?}");
+            }
         }
     }
 
     #[test]
     fn https_origin_policy_rejects_invalid_or_noncanonical_origins() {
-        let policy = OriginPolicy::https();
-        for origin in [
-            "",
-            "null",
-            "http://example.com",
-            "http://example.com:443",
-            "wss://example.com",
-            "file:///example.com",
-            "https-example.com",
-            "https://",
-            "https:example.com",
-            "https:///example.com",
-            "https://example.com:invalid",
-            "https://example.com:65536",
-            "https://[::1",
-            "https://user@example.com",
-            "https://user:password@example.com",
-            "https://@example.com",
-            "https://example.com/",
-            "https://example.com/path",
-            "https://example.com?query",
-            "https://example.com?",
-            "https://example.com#fragment",
-            "https://example.com#",
-            "https://example.com:443",
-            "https://example.com:08443",
-            "HTTPS://example.com",
-            "https://EXAMPLE.com",
-            "https://%65xample.com",
-            "https://bücher.example",
-            " https://example.com",
-            "https://example.com ",
-            "https://exam\tple.com",
-            "https://example.com\n",
-            "https://example.com\u{a0}",
-            "https://example.com\0",
-            "https://example.com\\evil",
-            "https://example.com https://another.example.org",
+        for policy in [
+            OriginPolicy::https(),
+            OriginPolicy::https_with_allowed_origins(vec![Arc::from("http://localhost:8000")])
+                .unwrap(),
         ] {
-            assert!(!policy.allows(Some(origin)), "accepted {origin:?}");
+            for origin in [
+                "",
+                "null",
+                "http://example.com",
+                "http://example.com:443",
+                "wss://example.com",
+                "file:///example.com",
+                "https-example.com",
+                "https://",
+                "https:example.com",
+                "https:///example.com",
+                "https://example.com:invalid",
+                "https://example.com:65536",
+                "https://[::1",
+                "https://user@example.com",
+                "https://user:password@example.com",
+                "https://@example.com",
+                "https://example.com/",
+                "https://example.com/path",
+                "https://example.com?query",
+                "https://example.com?",
+                "https://example.com#fragment",
+                "https://example.com#",
+                "https://example.com:443",
+                "https://example.com:08443",
+                "HTTPS://example.com",
+                "https://EXAMPLE.com",
+                "https://%65xample.com",
+                "https://bücher.example",
+                " https://example.com",
+                "https://example.com ",
+                "https://exam\tple.com",
+                "https://example.com\n",
+                "https://example.com\u{a0}",
+                "https://example.com\0",
+                "https://example.com\\evil",
+                "https://example.com https://another.example.org",
+            ] {
+                assert!(!policy.allows(Some(origin)), "accepted {origin:?}");
+            }
         }
     }
 
@@ -743,7 +808,129 @@ mod tests {
     fn https_origin_policy_bounds_input_before_parsing() {
         let origin = format!("https://{}.example", "a".repeat(MAX_HTTPS_ORIGIN_BYTES));
         assert!(origin.len() > MAX_HTTPS_ORIGIN_BYTES);
-        assert!(!OriginPolicy::https().allows(Some(&origin)));
+        for policy in [
+            OriginPolicy::https(),
+            OriginPolicy::https_with_allowed_origins(vec![Arc::from("http://localhost:8000")])
+                .unwrap(),
+        ] {
+            assert!(!policy.allows(Some(&origin)));
+        }
+    }
+
+    #[test]
+    fn https_with_allowed_origins_accepts_only_exact_http_exceptions() {
+        let origins = [
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "https://jdharrison.com",
+        ];
+        let policy =
+            OriginPolicy::https_with_allowed_origins(origins.into_iter().map(Arc::from).collect())
+                .unwrap();
+        assert!(policy.allows(None));
+        assert!(policy.allows(Some("https://unlisted.example.org:8443")));
+        for origin in origins {
+            assert!(policy.allows(Some(origin)));
+        }
+        for origin in [
+            "http://localhost:8001",
+            "http://127.0.0.1:8001",
+            "http://localhost",
+            "http://[::1]:8000",
+            "http://jdharrison.com",
+            "http://other.example.org:8000",
+            "http://localhost:08000",
+            "http://LOCALHOST:8000",
+            "http://localhost:8000/",
+            "http://localhost:8000/path",
+            "http://user@localhost:8000",
+            "http://localhost:8000?query",
+            "http://localhost:8000#fragment",
+            "http://localhost:8000 http://127.0.0.1:8000",
+            "null",
+        ] {
+            assert!(!policy.allows(Some(origin)), "accepted {origin:?}");
+        }
+        for origin in ["http://localhost:8000", "http://127.0.0.1:8000"] {
+            assert!(!OriginPolicy::https().allows(Some(origin)));
+        }
+    }
+
+    #[test]
+    fn https_with_allowed_origins_rejects_invalid_exception_lists() {
+        for origins in [
+            vec![],
+            vec![""],
+            vec!["null"],
+            vec!["not-an-origin"],
+            vec!["*"],
+            vec!["http://*.example.org"],
+            vec!["https://*.example.org"],
+            vec!["wss://example.org"],
+            vec!["file:///example.org"],
+            vec!["http://localhost:8000", "http://localhost:8000"],
+            vec!["http://localhost:8000", ""],
+            vec![" http://localhost:8000"],
+            vec!["http://localhost:8000 "],
+            vec!["HTTP://localhost:8000"],
+            vec!["http://LOCALHOST:8000"],
+            vec!["http://localhost:80"],
+            vec!["https://example.org:443"],
+            vec!["http://localhost:8000/"],
+            vec!["http://localhost:8000/path"],
+            vec!["http://localhost:8000?query"],
+            vec!["http://localhost:8000#fragment"],
+            vec!["http://user@localhost:8000"],
+            vec!["http://localhost:8000,https://example.org"],
+        ] {
+            assert!(
+                OriginPolicy::https_with_allowed_origins(
+                    origins.iter().copied().map(Arc::from).collect()
+                )
+                .is_err(),
+                "accepted {origins:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_with_allowed_origins_enforces_entry_and_total_byte_bounds() {
+        let origins: Vec<Arc<str>> = (0..MAX_ALLOWED_ORIGINS)
+            .map(|index| Arc::from(format!("http://o{index}.test")))
+            .collect();
+        let policy = OriginPolicy::https_with_allowed_origins(origins.clone()).unwrap();
+        for origin in &origins {
+            assert!(policy.allows(Some(origin)));
+        }
+        let mut too_many = origins;
+        too_many.push(Arc::from("http://extra.test"));
+        assert!(OriginPolicy::https_with_allowed_origins(too_many).is_err());
+
+        let origin = format!(
+            "http://{}.test",
+            "a".repeat(MAX_HTTPS_ORIGIN_BYTES - "http://.test".len())
+        );
+        assert_eq!(origin.len(), MAX_HTTPS_ORIGIN_BYTES);
+        let policy =
+            OriginPolicy::https_with_allowed_origins(vec![Arc::from(origin.as_str())]).unwrap();
+        assert!(policy.allows(Some(&origin)));
+        assert!(
+            OriginPolicy::https_with_allowed_origins(vec![Arc::from(format!("{origin}a"))])
+                .is_err()
+        );
+        let second = "http://b.test";
+        let first = &origin[..origin.len() - second.len() - 1];
+        assert!(
+            OriginPolicy::https_with_allowed_origins(vec![Arc::from(first), Arc::from(second)])
+                .is_ok()
+        );
+        assert!(
+            OriginPolicy::https_with_allowed_origins(vec![
+                Arc::from(format!("{first}a")),
+                Arc::from(second)
+            ])
+            .is_err()
+        );
     }
 
     #[test]

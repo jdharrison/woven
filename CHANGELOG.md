@@ -6,6 +6,20 @@ the repository [README](README.md#current-release-versions-and-publication-order
 
 ## Unreleased
 
+### Exact local origins alongside open HTTPS
+
+- `woven-transport-quic` `0.4.2` adds `OriginPolicy::https_with_allowed_origins`:
+  canonical HTTPS origins and missing Origin remain accepted, with bounded exact
+  exceptions for explicitly configured HTTP(S) origins. Unlisted HTTP, opaque `null`,
+  malformed and noncanonical origins remain rejected.
+- `woven-server` `0.6.0` adds the public `HttpsWithAllowlist` enum variant (an
+  exhaustive-match source compatibility change). HTTPS mode now accepts optional
+  `WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS` without disabling open HTTPS access. Existing
+  HTTPS-only and exact-allowlist modes retain their behavior.
+- The public unit adds exact `http://127.0.0.1:8000`, `http://localhost:8000`, and
+  `https://jdharrison.com` entries. No API CORS, authentication, admission, publish
+  limits, TLS, or private management boundaries change. Wire/client versions are unchanged.
+
 ### Public HTTPS WebTransport origins
 
 - `woven-transport-quic` `0.4.1` adds `OriginPolicy::https()`: any canonical HTTPS
@@ -13,7 +27,7 @@ the repository [README](README.md#current-release-versions-and-publication-order
 - `woven-server` `0.5.0` adds explicit `WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https`
   configuration and `ManagedWebTransportOriginPolicy`. Rust embeddings replace
   `allowed_origins` with `origin_policy`; the environment's legacy exact allowlist
-  remains available and is incompatible with simultaneous HTTPS-mode selection.
+  remains available. The later combined mode above permits exact exceptions alongside HTTPS.
 - The reviewed public service unit no longer enumerates consumer domains. Bearer
   authentication, exact grants, admission/CCU/publish limits, TLS, and loopback/private
   management boundaries are unchanged. The WVN1 schema and client SDK APIs are unchanged.

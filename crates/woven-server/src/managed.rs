@@ -58,6 +58,8 @@ pub enum ManagedWebTransportOriginPolicy {
     Allowlist(Vec<String>),
     /// Any canonical HTTPS origin, or no Origin header for native clients.
     Https,
+    /// HTTPS and missing origins as in `Https`, plus nonempty, bounded canonical exact origins.
+    HttpsWithAllowlist(Vec<String>),
 }
 
 /// Optional managed WebTransport listener configuration.
@@ -90,8 +92,10 @@ impl ManagedWebTransportConfig {
         {
             return Err(invalid());
         }
-        let ManagedWebTransportOriginPolicy::Allowlist(origins) = &self.origin_policy else {
-            return Ok(());
+        let origins = match &self.origin_policy {
+            ManagedWebTransportOriginPolicy::Allowlist(origins)
+            | ManagedWebTransportOriginPolicy::HttpsWithAllowlist(origins) => origins,
+            ManagedWebTransportOriginPolicy::Https => return Ok(()),
         };
         if origins.is_empty() || origins.len() > MAX_WEBTRANSPORT_ORIGINS {
             return Err(invalid());
@@ -102,6 +106,19 @@ impl ManagedWebTransportConfig {
             .saturating_add(origins.len().saturating_sub(1));
         if total_origin_bytes > MAX_WEBTRANSPORT_ORIGIN_ENV_BYTES {
             return Err(invalid());
+        }
+        if matches!(
+            self.origin_policy,
+            ManagedWebTransportOriginPolicy::HttpsWithAllowlist(_)
+        ) {
+            OriginPolicy::https_with_allowed_origins(
+                origins
+                    .iter()
+                    .map(|origin| Arc::<str>::from(origin.as_str()))
+                    .collect(),
+            )
+            .map_err(|_| invalid())?;
+            return Ok(());
         }
         let mut unique = std::collections::BTreeSet::new();
         for origin in origins {
@@ -183,27 +200,27 @@ impl ManagedServerConfig {
                 None
             }
             Some("1") => {
-                let origin_policy = match webtransport_origin_policy.as_deref() {
-                    Some("https") => {
-                        if webtransport_origins.is_some() {
-                            return Err(invalid());
-                        }
-                        ManagedWebTransportOriginPolicy::Https
-                    }
-                    None | Some("allowlist") => {
-                        let origins = webtransport_origins.ok_or_else(invalid)?;
+                let origins = webtransport_origins
+                    .map(|origins| {
                         if origins.len() > MAX_WEBTRANSPORT_ORIGIN_ENV_BYTES {
                             return Err(invalid());
                         }
-                        ManagedWebTransportOriginPolicy::Allowlist(
-                            origins
-                                .split(',')
-                                .take(MAX_WEBTRANSPORT_ORIGINS + 1)
-                                .map(str::to_owned)
-                                .collect(),
-                        )
+                        Ok(origins
+                            .split(',')
+                            .take(MAX_WEBTRANSPORT_ORIGINS + 1)
+                            .map(str::to_owned)
+                            .collect())
+                    })
+                    .transpose()?;
+                let origin_policy = match (webtransport_origin_policy.as_deref(), origins) {
+                    (Some("https"), None) => ManagedWebTransportOriginPolicy::Https,
+                    (Some("https"), Some(origins)) => {
+                        ManagedWebTransportOriginPolicy::HttpsWithAllowlist(origins)
                     }
-                    Some(_) => return Err(invalid()),
+                    (None | Some("allowlist"), Some(origins)) => {
+                        ManagedWebTransportOriginPolicy::Allowlist(origins)
+                    }
+                    _ => return Err(invalid()),
                 };
                 Some(ManagedWebTransportConfig {
                     bind_address: webtransport_bind
@@ -391,6 +408,15 @@ fn spawn_managed_webtransport(
     transport_config.expected_authentication_scheme = AuthenticationScheme::Bearer;
     transport_config.origin_policy = match &managed_config.origin_policy {
         ManagedWebTransportOriginPolicy::Https => OriginPolicy::https(),
+        ManagedWebTransportOriginPolicy::HttpsWithAllowlist(origins) => {
+            OriginPolicy::https_with_allowed_origins(
+                origins
+                    .iter()
+                    .map(|origin| Arc::<str>::from(origin.as_str()))
+                    .collect(),
+            )
+            .map_err(|_| invalid())?
+        }
         ManagedWebTransportOriginPolicy::Allowlist(origins) => OriginPolicy::allowlisted(
             origins
                 .iter()

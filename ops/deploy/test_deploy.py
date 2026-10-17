@@ -35,7 +35,12 @@ class ValidationTests(unittest.TestCase):
             origin_lines,
             ["Environment=WOVEN_WEBTRANSPORT_ORIGIN_POLICY=https"],
         )
-        self.assertNotIn("WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=", unit)
+        self.assertEqual(
+            [line for line in unit.splitlines()
+             if line.startswith("Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS=")],
+            ["Environment=WOVEN_WEBTRANSPORT_ALLOWED_ORIGINS="
+             "http://127.0.0.1:8000,http://localhost:8000,https://jdharrison.com"],
+        )
         self.assertIn("Environment=WOVEN_MANAGEMENT_BIND=127.0.0.1:8080\n", unit)
         self.assertIn("Environment=WOVEN_ADMIN_BIND=127.0.0.1:8083\n", unit)
         self.assertIn("Environment=WOVEN_TLS_CERT_FILE=/etc/woven/tls/current/fullchain.pem\n", unit)

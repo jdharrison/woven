@@ -42,8 +42,8 @@ npm install @signalweave/woven-client
 
 ## Current release versions and publication order
 
-The next server candidate is `woven-server` `0.5.0`, with `woven-transport-quic`
-`0.4.1` for the additive HTTPS origin policy. `woven-core`, `woven-transport`, and
+The next server candidate is `woven-server` `0.6.0`, with `woven-transport-quic`
+`0.4.2` for the HTTPS origin policy with bounded exact exceptions. `woven-core`, `woven-transport`, and
 all four `woven-inference-*` crates remain `0.4.0`.
 `woven-protocol`, the native `woven-client`, and `@signalweave/woven-client` remain
 `0.3.0`. `woven-loadtest` is also `0.4.0` but remains workspace-only
@@ -65,9 +65,9 @@ The complete dependency-first sequential order for the current manifests is:
 | 6 | `woven-transport` `0.4.0` | `woven-core`, `woven-protocol` |
 | 7 | `woven-inference-test-provider` `0.4.0` | `woven-core` (dev), `woven-inference-core` |
 | 8 | `woven-inference-tools` `0.4.0` | `woven-core`, `woven-transport`, `woven-inference-core` |
-| 9 | `woven-transport-quic` `0.4.1` | `woven-core`, `woven-protocol`, `woven-transport` |
+| 9 | `woven-transport-quic` `0.4.2` | `woven-core`, `woven-protocol`, `woven-transport` |
 | 10 | `woven-inference-coordinator` `0.4.0` | `woven-core`, `woven-protocol`, `woven-transport`, `woven-inference-core`, `woven-inference-tools` |
-| 11 | `woven-server` `0.5.0` | every Rust crate above, including `woven-client` as a dev dependency |
+| 11 | `woven-server` `0.6.0` | every Rust crate above, including `woven-client` as a dev dependency |
 
 Before tagging each Rust artifact, run `cargo package --locked -p <crate> --list`
 after its prerequisites are visible on crates.io. Before tagging the npm artifact,
