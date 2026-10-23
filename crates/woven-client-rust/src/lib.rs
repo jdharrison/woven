@@ -373,6 +373,21 @@ pub struct Client {
 }
 
 impl Client {
+    /// Return the native QUIC transport's smoothed round-trip time to the server.
+    ///
+    /// This reads local transport state without I/O or probes. It is not one-way
+    /// latency and does not measure application/server processing time.
+    /// Returns `None` for closed QUIC connections and unsupported WebTransport.
+    #[must_use]
+    pub fn round_trip_time(&self) -> Option<std::time::Duration> {
+        match &self.transport {
+            Transport::Quic { connection, .. } if connection.close_reason().is_none() => {
+                Some(connection.rtt())
+            }
+            Transport::Quic { .. } | Transport::WebTransport { .. } => None,
+        }
+    }
+
     /// Connect to the server and complete the
     /// `Hello → Capabilities → Authenticate → Authenticated` handshake.
     ///

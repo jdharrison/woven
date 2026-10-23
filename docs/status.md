@@ -180,6 +180,10 @@ expanded one at a time after the two stable clients are hardened. Live transport
 exercised by the Rust client (QUIC + WebTransport) and by the TypeScript client in the bounded
 headless-Chromium WebTransport E2E that gates CI and release validation.
 
+The Rust client's read-only `Client::round_trip_time()` exposes smoothed native QUIC
+transport RTT to the server without probes or I/O. Closed QUIC and unsupported
+WebTransport connections return `None`; this is not one-way or application-processing latency.
+
 See [`docs/adr`](adr) for the architecture decisions behind these choices, and
 [`AGENTS.md`](../AGENTS.md) for exact public APIs.
 
