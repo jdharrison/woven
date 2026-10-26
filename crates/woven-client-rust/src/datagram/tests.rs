@@ -7,7 +7,7 @@ use woven_protocol::{
 };
 
 use super::*;
-use crate::{ClientConfig, UrlScheme, stream::StreamReadState};
+use crate::{ClientConfig, QuicCloseReason, QuicDiagnostics, UrlScheme, stream::StreamReadState};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_TIMEOUT: Duration = Duration::from_millis(5);
@@ -217,6 +217,86 @@ async fn fixture_with_capabilities(
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn quic_diagnostics_tracks_local_state_and_is_absent_for_webtransport() {
+    for (scheme, datagrams_enabled) in [
+        (UrlScheme::Quic, true),
+        (UrlScheme::Quic, false),
+        (UrlScheme::WebTransport, true),
+    ] {
+        let (client, _peer) =
+            fixture(scheme, ClientConfig::default(), 65_536, datagrams_enabled).await;
+        match &client.transport {
+            Transport::Quic { connection, .. } => {
+                let diagnostics = client.quic_diagnostics().unwrap();
+                assert_eq!(
+                    diagnostics,
+                    QuicDiagnostics {
+                        close_reason: None,
+                        max_datagram_bytes: connection.max_datagram_size(),
+                    }
+                );
+                assert_eq!(diagnostics.max_datagram_bytes.is_some(), datagrams_enabled);
+                connection.close(quinn::VarInt::from_u32(7), b"local reason\nnot diagnostic");
+                assert_eq!(
+                    client.quic_diagnostics().unwrap().close_reason,
+                    Some(QuicCloseReason::LocallyClosed)
+                );
+            }
+            Transport::WebTransport { .. } => assert_eq!(client.quic_diagnostics(), None),
+        }
+        client.close().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn quic_diagnostics_reports_peer_close_without_reason_text() {
+    let (client, peer) = fixture(UrlScheme::Quic, ClientConfig::default(), 65_536, true).await;
+    let Peer::Quic {
+        connection: peer_connection,
+        ..
+    } = &peer
+    else {
+        unreachable!();
+    };
+    let Transport::Quic { connection, .. } = &client.transport else {
+        unreachable!();
+    };
+    let code = 0x1_0000_0001;
+    peer_connection.close(
+        quinn::VarInt::from_u64(code).unwrap(),
+        b"token=ATTACKER_SECRET\nforged event\r\nendpoint=private.invalid payload=PRIVATE",
+    );
+    tokio::time::timeout(TEST_TIMEOUT, connection.closed())
+        .await
+        .unwrap();
+    let diagnostics = client.quic_diagnostics().unwrap();
+    assert_eq!(
+        diagnostics,
+        QuicDiagnostics {
+            close_reason: Some(QuicCloseReason::ApplicationClosed { code }),
+            max_datagram_bytes: connection.max_datagram_size(),
+        }
+    );
+    assert_eq!(
+        diagnostics.close_reason.unwrap().to_string(),
+        "application closed by peer (code 4294967297)"
+    );
+    let debug = format!("{diagnostics:?}");
+    for forbidden in [
+        "ATTACKER_SECRET",
+        "forged event",
+        "private.invalid",
+        "PRIVATE",
+        "fixture-token",
+        "\n",
+        "\r",
+    ] {
+        assert!(!debug.contains(forbidden));
+    }
+    client.close().unwrap();
 }
 
 fn state(payload: Vec<u8>) -> Envelope {

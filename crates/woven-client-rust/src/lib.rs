@@ -13,11 +13,13 @@
 mod admission;
 mod datagram;
 mod logging;
+mod quic_diagnostics;
 mod stream;
 pub use logging::ClientLogger;
 mod transform;
 pub use admission::ManagedAdmissionOutcome;
 pub use datagram::DatagramReceiver;
+pub use quic_diagnostics::{QuicCloseReason, QuicDiagnostics};
 pub use woven_protocol::RoutingPosition3D;
 
 pub use transform::Transform;

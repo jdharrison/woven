@@ -245,6 +245,62 @@ of peer receipt, server cleanup, `EntityLeft`, or pending application data.
 Connection close can discard buffered application data. Packet loss or an expired
 close budget can still leave the peer waiting for its normal idle timeout.
 
+## Safe native QUIC diagnostics
+
+After a successful connection, `Client::quic_diagnostics(&self)` reads local Quinn
+state without I/O, probes, retries, or changes to timing, keepalives, or the wire.
+It returns `Some` for native QUIC, including closed connections, and `None` for
+WebTransport. Exact public API (types exported from `woven_client`):
+
+```rust,ignore
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct QuicDiagnostics {
+    pub close_reason: Option<QuicCloseReason>,
+    pub max_datagram_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum QuicCloseReason {
+    TimedOut,
+    Reset,
+    LocallyClosed,
+    ApplicationClosed { code: u64 },
+    ConnectionClosed { code: u64 },
+    TransportError { code: u64 },
+    VersionMismatch,
+    CidsExhausted,
+}
+
+impl Client {
+    pub fn quic_diagnostics(&self) -> Option<QuicDiagnostics>;
+}
+// QuicCloseReason also implements std::fmt::Display.
+```
+
+- Classification matches typed Quinn errors, not their formatted text.
+  `ApplicationClosed` is a peer application close; `ConnectionClosed` is a peer
+  QUIC transport close; `TransportError` is detected by the local QUIC stack.
+  Their codes are numeric `u64` values in the respective application/transport
+  code spaces. `Debug` and the close reason's `Display` expose only the category
+  and numeric values: no peer/local reason text, endpoint, token, or payload is
+  retained in the snapshot or included in its formatting.
+- `close_reason: None` means no closure has been observed, **not** guaranteed
+  liveness. Fields are sampled independently and can change immediately afterward.
+- `max_datagram_bytes` is Quinn's current outgoing datagram budget; `None` means
+  unsupported by the peer or disabled locally. The **entire encoded Woven frame**
+  must fit, and existing protocol frame/payload limits still apply. This is not
+  an application payload allowance or a negotiated full-frame size guarantee.
+  The budget can vary with path MTU and may remain present after closure;
+  `Some` does not guarantee a send will succeed.
+- `ClientError` and existing operation behavior are unchanged. The reason-free
+  formatting guarantee applies to these diagnostic types, not to existing error
+  values or arbitrary application logs. No background monitor is added.
+
+CPU tests cover all native close variants, numeric codes, and secret/newline
+reason-text exclusion. Existing bounded loopback fixtures cover live/closed QUIC,
+local versus peer application close, disabled datagrams, and WebTransport `None`.
+They use disposable local listeners, not hosted services.
+
 ## Verified remote QUIC (Weaver integration API)
 
 Existing `ClientConfig` fields are unchanged. Use the additive verified-TLS entry point:
